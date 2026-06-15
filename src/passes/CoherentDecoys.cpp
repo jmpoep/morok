@@ -12,6 +12,8 @@
 
 #include "morok/passes/CoherentDecoys.hpp"
 
+#include "morok/ir/InstUtil.hpp"
+
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -54,6 +56,8 @@ bool isGeneratedBlock(const BasicBlock &BB) {
 }
 
 bool eligibleReturn(ReturnInst &RI) {
+    if (ir::isMustTailReturn(RI))
+        return false;
     Value *Ret = RI.getReturnValue();
     if (!Ret)
         return false;

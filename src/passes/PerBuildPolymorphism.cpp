@@ -11,6 +11,8 @@
 
 #include "morok/passes/PerBuildPolymorphism.hpp"
 
+#include "morok/ir/InstUtil.hpp"
+
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Attributes.h"
@@ -145,6 +147,8 @@ bool shuffleBlockOrder(Function &F, ir::IRRandom &Rng) {
 
 bool eligibleReturn(ReturnInst *RI) {
     if (!RI || RI->getNumOperands() == 0)
+        return false;
+    if (ir::isMustTailReturn(*RI))
         return false;
     auto *Ty = dyn_cast<IntegerType>(RI->getOperand(0)->getType());
     return Ty && Ty->getBitWidth() <= 64;

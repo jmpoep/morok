@@ -13,6 +13,8 @@
 
 #include "morok/passes/TraceKeying.hpp"
 
+#include "morok/ir/InstUtil.hpp"
+
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -164,6 +166,8 @@ void poisonTerminator(BasicBlock *Body, Value *Diff) {
     IRBuilder<NoFolder> B(Term);
 
     if (auto *RI = dyn_cast<ReturnInst>(Term)) {
+        if (ir::isMustTailReturn(*RI))
+            return;
         Value *Ret = RI->getReturnValue();
         if (!Ret)
             return;

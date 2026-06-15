@@ -121,6 +121,11 @@ bool canLaunderInteger(const Instruction &I) {
     if (I.isTerminator() || isa<PHINode>(I) || isa<AllocaInst>(I) ||
         isa<LandingPadInst>(I) || isa<IntrinsicInst>(I))
         return false;
+    // A `musttail` call must be immediately followed by the `ret`; inserting
+    // launder instructions after it would break that adjacency.
+    if (const auto *CI = dyn_cast<CallInst>(&I))
+        if (CI->isMustTailCall())
+            return false;
     if (isPassGenerated(&I))
         return false;
 

@@ -8,6 +8,7 @@
 
 add_library(morok_ir STATIC
   Annotations.cpp
+  InstUtil.cpp
   IRRandom.cpp
   Reg2Mem.cpp
   ControlFlowFlattener.cpp)
