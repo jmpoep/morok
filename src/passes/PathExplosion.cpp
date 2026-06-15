@@ -99,6 +99,10 @@ Value *buildInputSeed(IRBuilder<NoFolder> &B, Function &F, ir::IRRandom &rng) {
     auto *I64 = B.getInt64Ty();
     Value *Seed = ConstantInt::get(I64, rng.next());
     for (Argument &Arg : F.args()) {
+        // A swifterror pointer may only be loaded/stored or used in select/phi;
+        // ptrtoint on it (via asI64) fails the verifier.
+        if (Arg.hasSwiftErrorAttr())
+            continue;
         Value *Term = asI64(B, &Arg);
         if (!Term)
             continue;
