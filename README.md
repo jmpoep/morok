@@ -121,8 +121,8 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 | Per-build polymorphism | `morok-polymorph` | seed-driven function/block layout and neutral return anchors |
 | Data-flow integrity | `morok-dfi` | narrow and const-indexed lookup tables decoded from runtime integrity hashes |
 | Mutual guard graph | `morok-mutualguard` | overlapping checksum nodes whose aggregate diff poisons returns |
-| Table arithmetic | `morok-tablearith` | narrow integer arithmetic lowered to encrypted lookup tables |
-| Uniform primitive lowering | `morok-uniform` | narrow ops and direct branches lowered to table/memory dispatch |
+| Table arithmetic | `morok-tablearith` | narrow and const-indexed integer arithmetic lowered to encrypted lookup tables |
+| Uniform primitive lowering | `morok-uniform` | narrow/const-indexed ops and direct branches lowered to table/memory dispatch |
 | Virtualization | `morok-vm` | selected straight-line integer arithmetic/comparison functions lifted to encrypted threaded bytecode VMs |
 | Hash-gated self-decrypt | `morok-selfdecrypt` | VM bytecode payloads hash/context-gated and lazily decrypted |
 | Path explosion | `morok-pathexplode` | opaque-guarded input-derived decoy loops |

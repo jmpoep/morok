@@ -440,11 +440,13 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - This is the IR-level half of the roadmap's IR/MIR item.  It deliberately
   avoids target-specific MOV-only lowering, but pushes visible intent toward a
   small set of uniform primitives: table loads, GEPs, `select`, and `indirectbr`.
-- Selected narrow `i1` through `i8` `add/sub/mul/and/or/xor` operations,
-  constant in-range shifts, and integer comparisons reuse the encrypted lazy
-  table materialization from TableArithmetic, governed by `op_probability` and
-  `max_tables`.  This removes opcode/predicate intent from the function body
-  while keeping plaintext truth tables out of static initializers.
+- Selected `i1` through `i8` `add/sub/mul/and/or/xor` operations, constant
+  in-range shifts, and integer comparisons reuse the encrypted lazy table
+  materialization from TableArithmetic, governed by `op_probability` and
+  `max_tables`.  The same path covers `i9` through `i16` operations and
+  comparisons when exactly one operand is constant, preserving the
+  one-dimensional lookup shape.  This removes opcode/predicate intent from the
+  function body while keeping plaintext truth tables out of static initializers.
 - Selected direct branches and switches are collected up to `max_branches` with
   a hard ceiling of 16 branch sites and 32 successors per site, then lowered to
   a private per-function `morok.uniform.table` of `blockaddress` entries.
@@ -881,8 +883,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - DataFlowIntegrity: `i1..i8` and const-indexed `i9..i16` op tables decoded by runtime integrity hashes.
 - OptimizerAmplification: early branchless select lattice over equivalent integer op / integer compare / FP compare forms.
 - SubThresholdPersistence: volatile local-seed opaque-zero terms for scalar integer/FP ops under a small cap.
-- TableArithmetic: encrypted lazy `i1..i8` op lookup tables.
-- UniformPrimitiveLowering: `i1..i8` op tables plus memory-loaded indirectbr dispatch.
+- TableArithmetic: encrypted lazy `i1..i8` and const-indexed `i9..i16` op lookup tables.
+- UniformPrimitiveLowering: `i1..i8`/const-indexed `i9..i16` op tables plus memory-loaded indirectbr dispatch.
 - Virtualization: encrypted per-function bytecode plus threaded computed-goto VM helpers.
 - HashGatedSelfDecrypt: VM bytecode globals get hash/context-gated lazy outer decryptors.
 - MutualGuardGraph: overlapping checksum nodes whose combined diff poisons scalar integer/FP returns.

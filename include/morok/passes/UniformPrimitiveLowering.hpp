@@ -4,10 +4,11 @@
 //
 // morok/passes/UniformPrimitiveLowering.hpp — uniform primitive lowering.
 //
-// Lowers selected i1..i8 operations/constant shifts/comparisons to encrypted
-// table loads and selected branch/switch terminators to block-address table
-// loads feeding indirectbr.  This IR-level layer approximates the roadmap's
-// MOV-only-style uniformity without relying on target-specific MIR.
+// Lowers selected i1..i8 operations/comparisons and const-indexed i9..i16
+// operations/comparisons to encrypted table loads, plus selected branch/switch
+// terminators to block-address table loads feeding indirectbr.  This IR-level
+// layer approximates the roadmap's MOV-only-style uniformity without relying on
+// target-specific MIR.
 
 #ifndef MOROK_PASSES_UNIFORM_PRIMITIVE_LOWERING_HPP
 #define MOROK_PASSES_UNIFORM_PRIMITIVE_LOWERING_HPP
@@ -26,7 +27,7 @@ class Function;
 namespace morok::passes {
 
 struct UniformLowerParams {
-    std::uint32_t op_probability = 25;     ///< i1..i8 op/cmp table chance
+    std::uint32_t op_probability = 25;     ///< scalar op/cmp table chance
     std::uint32_t branch_probability = 35; ///< branch/switch lowering chance
     std::uint32_t max_tables = 4;          ///< per-function arithmetic tables
     std::uint32_t max_branches = 8;        ///< per-function branch sites
