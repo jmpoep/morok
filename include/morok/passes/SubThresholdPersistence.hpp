@@ -4,7 +4,7 @@
 //
 // morok/passes/SubThresholdPersistence.hpp — optimizer-threshold persistence.
 //
-// Wraps selected integer binary operations in small volatile-seeded neutral
+// Wraps selected scalar binary operations in small volatile-seeded neutral
 // expression webs.  The constructs are intentionally bounded by max_terms so
 // they sit below common simplifier thresholds while still resisting trivial
 // InstCombine/GVN folding.
@@ -30,7 +30,7 @@ struct SubThresholdParams {
     std::uint32_t max_terms = 1;    ///< opaque zero terms per selected op
 };
 
-/// Add bounded opaque-neutral terms to eligible integer ops in `F`.
+/// Add bounded opaque-neutral terms to eligible scalar ops in `F`.
 /// Returns true if anything changed.
 bool subThresholdPersistFunction(llvm::Function &F,
                                  const SubThresholdParams &params,

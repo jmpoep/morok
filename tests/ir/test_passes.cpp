@@ -992,6 +992,83 @@ entry:
     CHECK_FALSE(verifyModule(*M2, &errs()));
 }
 
+TEST_CASE("subThresholdPersistFunction preserves floating ops through bit carriers") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define float @threshold_float(float %a, float %b) {
+entry:
+  %sum = fadd float %a, %b
+  ret float %sum
+}
+
+define double @threshold_double(double %a, double %b) {
+entry:
+  %prod = fmul double %a, %b
+  ret double %prod
+}
+)ir");
+    Function *FloatF = M->getFunction("threshold_float");
+    Function *DoubleF = M->getFunction("threshold_double");
+    REQUIRE(FloatF);
+    REQUIRE(DoubleF);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(122);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::subThresholdPersistFunction(
+        *FloatF, {/*probability=*/100, /*max_terms=*/2}, rng));
+    CHECK(morok::passes::subThresholdPersistFunction(
+        *DoubleF, {/*probability=*/100, /*max_terms=*/2}, rng));
+
+    bool hasFloatKeep = false;
+    bool hasFloatCarrier = false;
+    for (Instruction &I : instructions(*FloatF)) {
+        hasFloatKeep |= I.getName().starts_with("morok.threshold.keep") &&
+                        I.getType()->isFloatTy();
+        if (auto *BC = dyn_cast<BitCastInst>(&I))
+            hasFloatCarrier |=
+                BC->getSrcTy()->isFloatTy() && BC->getDestTy()->isIntegerTy(32);
+    }
+    CHECK(hasFloatKeep);
+    CHECK(hasFloatCarrier);
+
+    bool hasDoubleKeep = false;
+    bool hasDoubleCarrier = false;
+    for (Instruction &I : instructions(*DoubleF)) {
+        hasDoubleKeep |= I.getName().starts_with("morok.threshold.keep") &&
+                         I.getType()->isDoubleTy();
+        if (auto *BC = dyn_cast<BitCastInst>(&I))
+            hasDoubleCarrier |= BC->getSrcTy()->isDoubleTy() &&
+                                BC->getDestTy()->isIntegerTy(64);
+    }
+    CHECK(hasDoubleKeep);
+    CHECK(hasDoubleCarrier);
+    CHECK(countNamedAllocas(*FloatF, "morok.threshold.seed") == 1u);
+    CHECK(countNamedAllocas(*DoubleF, "morok.threshold.seed") == 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("subThresholdPersistFunction skips fast-math floating ops") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define float @threshold_fast(float %a, float %b) {
+entry:
+  %sum = fadd nnan float %a, %b
+  ret float %sum
+}
+)ir");
+    Function *F = M->getFunction("threshold_fast");
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(123);
+    morok::ir::IRRandom rng(engine);
+    CHECK_FALSE(morok::passes::subThresholdPersistFunction(
+        *F, {/*probability=*/100, /*max_terms=*/2}, rng));
+    CHECK(countNamedAllocas(*F, "morok.threshold.seed") == 0u);
+    for (Instruction &I : instructions(*F))
+        CHECK_FALSE(I.getName().starts_with("morok.threshold"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("subThresholdPersistFunction supports sub-byte integer ops") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

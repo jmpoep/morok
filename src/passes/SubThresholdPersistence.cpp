@@ -29,9 +29,13 @@ using Builder = IRBuilder<NoFolder>;
 
 constexpr StringRef kSeedPrefix = "morok.threshold.seed";
 
-bool eligible(BinaryOperator *bo) {
-    auto *Ty = dyn_cast<IntegerType>(bo->getType());
-    if (!Ty || Ty->getBitWidth() == 0)
+bool supportedFloatType(Type *Ty) {
+    return Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+           Ty->isDoubleTy();
+}
+
+bool eligibleIntegerOp(BinaryOperator *bo, IntegerType *Ty) {
+    if (Ty->getBitWidth() == 0)
         return false;
     if (bo->getName().starts_with("morok.threshold"))
         return false;
@@ -52,6 +56,37 @@ bool eligible(BinaryOperator *bo) {
     default:
         return false;
     }
+}
+
+bool eligibleFloatOp(BinaryOperator *bo) {
+    if (!supportedFloatType(bo->getType()))
+        return false;
+    if (bo->getName().starts_with("morok.threshold"))
+        return false;
+    if (bo->getFastMathFlags().any())
+        return false;
+
+    switch (bo->getOpcode()) {
+    case Instruction::FAdd:
+    case Instruction::FSub:
+    case Instruction::FMul:
+    case Instruction::FDiv:
+    case Instruction::FRem:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool eligible(BinaryOperator *bo) {
+    if (auto *Ty = dyn_cast<IntegerType>(bo->getType()))
+        return eligibleIntegerOp(bo, Ty);
+    return eligibleFloatOp(bo);
+}
+
+IntegerType *integerCarrierFor(Type *Ty) {
+    const unsigned Bits = static_cast<unsigned>(Ty->getPrimitiveSizeInBits());
+    return IntegerType::get(Ty->getContext(), Bits);
 }
 
 AllocaInst *findSeed(Function &F) {
@@ -100,7 +135,9 @@ Value *cloneBaseOp(Builder &B, BinaryOperator *bo) {
 
 Value *wrap(BinaryOperator *bo, AllocaInst *Seed,
             const SubThresholdParams &params, ir::IRRandom &rng) {
-    auto *Ty = cast<IntegerType>(bo->getType());
+    Type *ResultTy = bo->getType();
+    auto *Ty = ResultTy->isIntegerTy() ? cast<IntegerType>(ResultTy)
+                                       : integerCarrierFor(ResultTy);
     Builder B(bo);
     Value *Result = cloneBaseOp(B, bo);
     const std::uint32_t Terms =
@@ -108,17 +145,33 @@ Value *wrap(BinaryOperator *bo, AllocaInst *Seed,
 
     for (std::uint32_t I = 0; I < Terms; ++I) {
         Value *Zero = opaqueZero(B, Seed, Ty);
+        Value *Bits = Result;
+        if (!ResultTy->isIntegerTy())
+            Bits = B.CreateBitCast(Result, Ty, "morok.threshold.bits");
         switch (rng.range(3)) {
         case 0:
-            Result = B.CreateAdd(Result, Zero, "morok.threshold.keep");
+            Bits = B.CreateAdd(Bits, Zero,
+                               ResultTy->isIntegerTy()
+                                   ? "morok.threshold.keep"
+                                   : "morok.threshold.keep.bits");
             break;
         case 1:
-            Result = B.CreateSub(Result, Zero, "morok.threshold.keep");
+            Bits = B.CreateSub(Bits, Zero,
+                               ResultTy->isIntegerTy()
+                                   ? "morok.threshold.keep"
+                                   : "morok.threshold.keep.bits");
             break;
         default:
-            Result = B.CreateXor(Result, Zero, "morok.threshold.keep");
+            Bits = B.CreateXor(Bits, Zero,
+                               ResultTy->isIntegerTy()
+                                   ? "morok.threshold.keep"
+                                   : "morok.threshold.keep.bits");
             break;
         }
+        if (ResultTy->isIntegerTy())
+            Result = Bits;
+        else
+            Result = B.CreateBitCast(Bits, ResultTy, "morok.threshold.keep");
     }
     return Result;
 }

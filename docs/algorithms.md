@@ -367,14 +367,19 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Sub-threshold persistence — IR structure
 - Eligible operations are scalar integer `add/sub/mul/and/or/xor` and
-  constant-agnostic shift binary operators from `i1` upward.  The pass skips
-  poison-generating flags (`nuw`/`nsw`/`exact`/disjoint forms) so it does not
+  constant-agnostic shift binary operators from `i1` upward, plus unflagged
+  scalar floating `fadd/fsub/fmul/fdiv/frem` over `half`, `bfloat`, `float`,
+  and `double`.  The pass skips poison-generating integer flags
+  (`nuw`/`nsw`/`exact`/disjoint forms) and fast-math FP flags so it does not
   weaken flagged semantics while cloning the base operation.
 - Each selected op is cloned as `morok.threshold.base`, then receives up to
   `max_terms` opaque-neutral combines.  A term is `zero = load volatile seed ^
   load volatile seed` from a private local seed slot, followed by
-  `base + zero`, `base - zero`, or `base ^ zero`.  Runtime value is unchanged,
-  while the two volatile loads remain separate side-effecting values for common
+  `base + zero`, `base - zero`, or `base ^ zero` for integer results.  Floating
+  results are bitcast to an equal-width integer carrier, combined with the same
+  zero term, then bitcast back to preserve the exact FP result bits without
+  relying on unsafe `+0.0` identities.  Runtime value is unchanged, while the
+  two volatile loads remain separate side-effecting values for common
   InstCombine/GVN folds.
 - The seed slot is a single per-function `morok.threshold.seed` alloca initialized
   in the entry block.  `max_terms` is clamped to a small bound, deliberately
@@ -829,7 +834,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - CoherentDecoys: opaque-dead alternate return computations, not junk blocks.
 - DataFlowIntegrity: `i1..i8` op tables decoded by runtime integrity hashes.
 - OptimizerAmplification: early branchless select lattice over equivalent integer op / integer compare / FP compare forms.
-- SubThresholdPersistence: volatile local-seed opaque-zero terms under a small cap.
+- SubThresholdPersistence: volatile local-seed opaque-zero terms for scalar integer/FP ops under a small cap.
 - TableArithmetic: encrypted lazy `i1..i8` op lookup tables.
 - UniformPrimitiveLowering: `i1..i8` op tables plus memory-loaded indirectbr dispatch.
 - Virtualization: encrypted per-function bytecode plus threaded computed-goto VM helpers.
