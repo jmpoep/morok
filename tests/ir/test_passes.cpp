@@ -7805,6 +7805,55 @@ define i32 @caller() {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("functionCallObfuscateModule redirects an external invoke via dlsym") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+declare i32 @may_throw()
+declare i32 @__gxx_personality_v0(...)
+
+define i32 @caller() personality ptr @__gxx_personality_v0 {
+entry:
+  %r = invoke i32 @may_throw()
+          to label %ok unwind label %lpad
+ok:
+  ret i32 %r
+lpad:
+  %lp = landingpad { ptr, i32 }
+          cleanup
+  ret i32 -1
+}
+)ir");
+    Function *F = M->getFunction("caller");
+    REQUIRE(F);
+    BasicBlock *Ok = nullptr;
+    BasicBlock *LPad = nullptr;
+    for (BasicBlock &BB : *F) {
+        if (BB.getName() == "ok")
+            Ok = &BB;
+        if (BB.getName() == "lpad")
+            LPad = &BB;
+    }
+    REQUIRE(Ok);
+    REQUIRE(LPad);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(272);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::functionCallObfuscateModule(*M, {/*prob=*/100}, rng));
+
+    InvokeInst *IndirectInvoke = nullptr;
+    for (Instruction &I : instructions(*F))
+        if (auto *II = dyn_cast<InvokeInst>(&I))
+            IndirectInvoke = II;
+
+    REQUIRE(IndirectInvoke);
+    CHECK(IndirectInvoke->getCalledFunction() == nullptr);
+    CHECK(IndirectInvoke->getNormalDest() == Ok);
+    CHECK(IndirectInvoke->getUnwindDest() == LPad);
+    CHECK(countCallsTo(*F, "may_throw") == 0u);
+    CHECK(countCallsTo(*F, "dlsym") == 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("functionCallObfuscateModule caps redirected call sites") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("fco-cap", ctx);

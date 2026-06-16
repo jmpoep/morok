@@ -4,7 +4,7 @@
 //
 // morok/passes/FunctionCallObfuscate.cpp
 //
-// Each eligible direct call to an external function `f(args)` becomes
+// Each eligible direct call/invoke to an external function `f(args)` becomes
 //   p = dlsym(RTLD_DEFAULT, "f"); p(args)
 // so the static import/call edge to `f` disappears.  Only declared (external)
 // symbols are redirected — locally-defined functions stay direct, since dlsym
@@ -32,16 +32,29 @@ namespace {
 
 constexpr std::uint32_t kMaxCallsPerModule = 256;
 
-bool eligible(CallInst *ci) {
-    if (ci->isInlineAsm() || ci->hasOperandBundles() || ci->isMustTailCall())
+bool eligible(CallBase *cb) {
+    if (!isa<CallInst>(cb) && !isa<InvokeInst>(cb))
         return false;
-    Function *callee = ci->getCalledFunction();
+    if (cb->isInlineAsm() || cb->hasOperandBundles())
+        return false;
+    if (auto *ci = dyn_cast<CallInst>(cb))
+        if (ci->isMustTailCall())
+            return false;
+    Function *callee = cb->getCalledFunction();
     if (!callee || !callee->isDeclaration() || callee->isIntrinsic())
         return false;
     if (callee->getName().starts_with("llvm.") ||
         callee->getName().starts_with("morok.") || callee->getName() == "dlsym")
         return false;
     return true;
+}
+
+std::vector<Value *> argsOf(CallBase &cb) {
+    std::vector<Value *> args;
+    args.reserve(cb.arg_size());
+    for (Use &arg : cb.args())
+        args.push_back(arg.get());
+    return args;
 }
 
 } // namespace
@@ -53,7 +66,7 @@ bool functionCallObfuscateModule(Module &M, const FcoParams &params,
 
     const std::uint32_t Limit = std::min(params.max_calls, kMaxCallsPerModule);
 
-    std::vector<CallInst *> targets;
+    std::vector<CallBase *> targets;
     targets.reserve(Limit);
     for (Function &F : M) {
         if (targets.size() >= Limit)
@@ -63,10 +76,10 @@ bool functionCallObfuscateModule(Module &M, const FcoParams &params,
         for (Instruction &inst : instructions(F)) {
             if (targets.size() >= Limit)
                 break;
-            if (auto *ci = dyn_cast<CallInst>(&inst))
-                if (eligible(ci))
+            if (auto *cb = dyn_cast<CallBase>(&inst))
+                if (eligible(cb))
                     if (rng.chance(params.probability))
-                        targets.push_back(ci);
+                        targets.push_back(cb);
         }
     }
     if (targets.empty())
@@ -82,23 +95,34 @@ bool functionCallObfuscateModule(Module &M, const FcoParams &params,
         "dlsym", FunctionType::get(ptr, {ptr, ptr}, false));
 
     bool changed = false;
-    for (CallInst *ci : targets) {
-        Function *callee = ci->getCalledFunction();
+    for (CallBase *cb : targets) {
+        Function *callee = cb->getCalledFunction();
 
-        IRBuilder<> B(ci);
+        IRBuilder<> B(cb);
         Constant *name = B.CreateGlobalString(callee->getName(), "morok.sym");
         Value *rtld =
             B.CreateIntToPtr(ConstantInt::getSigned(i64, rtldDefaultVal), ptr);
         Value *resolved = B.CreateCall(dlsym, {rtld, name});
 
-        std::vector<Value *> args(ci->arg_begin(), ci->arg_end());
-        CallInst *indirect =
-            B.CreateCall(callee->getFunctionType(), resolved, args);
-        indirect->setCallingConv(ci->getCallingConv());
-        indirect->setAttributes(ci->getAttributes());
+        std::vector<Value *> args = argsOf(*cb);
+        CallBase *indirect = nullptr;
+        if (auto *ci = dyn_cast<CallInst>(cb)) {
+            auto *call = B.CreateCall(callee->getFunctionType(), resolved, args);
+            call->setTailCallKind(ci->getTailCallKind());
+            indirect = call;
+        } else {
+            auto *ii = cast<InvokeInst>(cb);
+            indirect = B.CreateInvoke(callee->getFunctionType(), resolved,
+                                      ii->getNormalDest(), ii->getUnwindDest(),
+                                      args);
+        }
+        indirect->setCallingConv(cb->getCallingConv());
+        indirect->setAttributes(cb->getAttributes());
+        indirect->setDebugLoc(cb->getDebugLoc());
+        indirect->copyMetadata(*cb);
 
-        ci->replaceAllUsesWith(indirect);
-        ci->eraseFromParent();
+        cb->replaceAllUsesWith(indirect);
+        cb->eraseFromParent();
         changed = true;
     }
     return changed;

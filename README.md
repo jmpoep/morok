@@ -152,7 +152,7 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 | String encryption | `morok-strenc` | literals stored GF(2⁸)-encrypted, decrypted in a ctor |
 | Indirect branch | `morok-indbr` | conditional/switch edges → randomized `indirectbr` table |
 | Function wrapper | `morok-funcwrap` | call sites routed through forwarder proxies |
-| Function-call obfuscate | `morok-fco` | external calls resolved via `dlsym` |
+| Function-call obfuscate | `morok-fco` | external calls/invokes resolved via `dlsym` |
 | Anti-debugging | `morok-antidbg` | `ptrace`-based debugger denial at startup |
 | Anti-hooking | `morok-antihook` | startup check for resident hooking frameworks |
 | Anti-class-dump | `morok-antiacd` | scrambles Objective-C metadata (no-op without it) |
