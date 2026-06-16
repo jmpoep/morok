@@ -81,6 +81,45 @@ bool eligible(ICmpInst *CI) {
     }
 }
 
+bool supportedFloatType(Type *Ty) {
+    return Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+           Ty->isDoubleTy();
+}
+
+bool eligible(FCmpInst *FI) {
+    Type *Ty = FI->getOperand(0)->getType();
+    if (!supportedFloatType(Ty) || FI->getOperand(1)->getType() != Ty)
+        return false;
+    if (FI->getName().starts_with("morok.optamp"))
+        return false;
+    if (FI->getFastMathFlags().any())
+        return false;
+    switch (FI->getPredicate()) {
+    case CmpInst::FCMP_OEQ:
+    case CmpInst::FCMP_OGT:
+    case CmpInst::FCMP_OGE:
+    case CmpInst::FCMP_OLT:
+    case CmpInst::FCMP_OLE:
+    case CmpInst::FCMP_ONE:
+    case CmpInst::FCMP_ORD:
+    case CmpInst::FCMP_UNO:
+    case CmpInst::FCMP_UEQ:
+    case CmpInst::FCMP_UGT:
+    case CmpInst::FCMP_UGE:
+    case CmpInst::FCMP_ULT:
+    case CmpInst::FCMP_ULE:
+    case CmpInst::FCMP_UNE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+IntegerType *integerCarrierFor(Type *Ty) {
+    const unsigned Bits = static_cast<unsigned>(Ty->getPrimitiveSizeInBits());
+    return IntegerType::get(Ty->getContext(), Bits);
+}
+
 Value *one(IntegerType *Ty) { return ConstantInt::get(Ty, 1); }
 
 Value *two(Builder &B, Value *V, IntegerType *Ty) {
@@ -198,6 +237,32 @@ Value *equivalentCompareForm(Builder &B, ICmpInst *CI,
     }
 }
 
+Value *equivalentCompareForm(Builder &B, FCmpInst *FI,
+                             std::uint32_t Variant) {
+    Value *A = FI->getOperand(0);
+    Value *C = FI->getOperand(1);
+    CmpInst::Predicate Pred = FI->getPredicate();
+
+    switch (Variant & 3u) {
+    case 0:
+        return B.CreateFCmp(Pred, A, C, "morok.optamp.fcmp.form");
+    case 1:
+        return B.CreateFCmp(CmpInst::getSwappedPredicate(Pred), C, A,
+                            "morok.optamp.fcmp.form");
+    case 2:
+        return B.CreateNot(
+            B.CreateFCmp(CmpInst::getInversePredicate(Pred), A, C,
+                         "morok.optamp.fcmp.inverse"),
+            "morok.optamp.fcmp.form");
+    default:
+        CmpInst::Predicate Swapped = CmpInst::getSwappedPredicate(Pred);
+        return B.CreateNot(
+            B.CreateFCmp(CmpInst::getInversePredicate(Swapped), C, A,
+                         "morok.optamp.fcmp.inverse"),
+            "morok.optamp.fcmp.form");
+    }
+}
+
 Value *inputGuard(Builder &B, Value *A, Value *C, IntegerType *Ty,
                   std::uint32_t Index, ir::IRRandom &rng) {
     const unsigned Width = Ty->getBitWidth();
@@ -225,6 +290,17 @@ Value *inputGuard(Builder &B, ICmpInst *CI, std::uint32_t Index,
                   ir::IRRandom &rng) {
     auto *Ty = cast<IntegerType>(CI->getOperand(0)->getType());
     return inputGuard(B, CI->getOperand(0), CI->getOperand(1), Ty, Index, rng);
+}
+
+Value *inputGuard(Builder &B, FCmpInst *FI, std::uint32_t Index,
+                  ir::IRRandom &rng) {
+    Type *FloatTy = FI->getOperand(0)->getType();
+    IntegerType *CarrierTy = integerCarrierFor(FloatTy);
+    Value *A = B.CreateBitCast(FI->getOperand(0), CarrierTy,
+                               "morok.optamp.guard.bits");
+    Value *C = B.CreateBitCast(FI->getOperand(1), CarrierTy,
+                               "morok.optamp.guard.bits");
+    return inputGuard(B, A, C, CarrierTy, Index, rng);
 }
 
 Value *amplify(BinaryOperator *BO, const OptAmpParams &Params,
@@ -264,6 +340,24 @@ Value *amplify(ICmpInst *CI, const OptAmpParams &Params, ir::IRRandom &rng) {
     return Result;
 }
 
+Value *amplify(FCmpInst *FI, const OptAmpParams &Params, ir::IRRandom &rng) {
+    Builder B(FI);
+    Value *Result = B.CreateFCmp(FI->getPredicate(), FI->getOperand(0),
+                                 FI->getOperand(1), "morok.optamp.base");
+    const std::uint32_t Forms =
+        std::clamp<std::uint32_t>(Params.max_forms, 1, 4);
+    const std::uint32_t FirstVariant = rng.range(4);
+
+    for (std::uint32_t I = 0; I < Forms; ++I) {
+        Value *Alt = equivalentCompareForm(B, FI, FirstVariant + I);
+        if (!Alt)
+            return nullptr;
+        Value *Guard = inputGuard(B, FI, I + 1, rng);
+        Result = B.CreateSelect(Guard, Alt, Result, "morok.optamp.select");
+    }
+    return Result;
+}
+
 } // namespace
 
 bool optimizerAmplifyFunction(Function &F, const OptAmpParams &Params,
@@ -282,6 +376,9 @@ bool optimizerAmplifyFunction(Function &F, const OptAmpParams &Params,
             if (auto *CI = dyn_cast<ICmpInst>(&I))
                 if (eligible(CI))
                     Targets.push_back({CI});
+            if (auto *FI = dyn_cast<FCmpInst>(&I))
+                if (eligible(FI))
+                    Targets.push_back({FI});
         }
     }
 
@@ -294,6 +391,8 @@ bool optimizerAmplifyFunction(Function &F, const OptAmpParams &Params,
             Replacement = amplify(BO, Params, rng);
         else if (auto *CI = dyn_cast<ICmpInst>(T.inst))
             Replacement = amplify(CI, Params, rng);
+        else if (auto *FI = dyn_cast<FCmpInst>(T.inst))
+            Replacement = amplify(FI, Params, rng);
         if (Replacement) {
             T.inst->replaceAllUsesWith(Replacement);
             T.inst->eraseFromParent();

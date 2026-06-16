@@ -833,6 +833,93 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("optimizerAmplifyFunction builds equivalent floating comparisons") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i1 @optamp_fcmp_ordered(float %a, float %b) {
+entry:
+  %cmp = fcmp olt float %a, %b
+  ret i1 %cmp
+}
+
+define i1 @optamp_fcmp_unordered(double %a, double %b) {
+entry:
+  %cmp = fcmp uno double %a, %b
+  ret i1 %cmp
+}
+)ir");
+    Function *OrderedF = M->getFunction("optamp_fcmp_ordered");
+    Function *UnorderedF = M->getFunction("optamp_fcmp_unordered");
+    REQUIRE(OrderedF);
+    REQUIRE(UnorderedF);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(143);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::optimizerAmplifyFunction(
+        *OrderedF, {/*probability=*/100, /*max_forms=*/4}, rng));
+    CHECK(morok::passes::optimizerAmplifyFunction(
+        *UnorderedF, {/*probability=*/100, /*max_forms=*/4}, rng));
+
+    std::size_t orderedBases = 0;
+    std::size_t orderedSelects = 0;
+    bool hasOrderedInverse = false;
+    bool hasFloatGuardBits = false;
+    for (Instruction &I : instructions(*OrderedF)) {
+        if (I.getName().starts_with("morok.optamp.base") &&
+            I.getType()->isIntegerTy(1))
+            ++orderedBases;
+        if (auto *SI = dyn_cast<SelectInst>(&I))
+            if (SI->getName().starts_with("morok.optamp.select") &&
+                SI->getType()->isIntegerTy(1))
+                ++orderedSelects;
+        hasOrderedInverse |=
+            I.getName().starts_with("morok.optamp.fcmp.inverse");
+        if (auto *BC = dyn_cast<BitCastInst>(&I))
+            hasFloatGuardBits |=
+                BC->getSrcTy()->isFloatTy() && BC->getDestTy()->isIntegerTy(32);
+    }
+    CHECK(orderedBases == 1u);
+    CHECK(orderedSelects == 4u);
+    CHECK(hasOrderedInverse);
+    CHECK(hasFloatGuardBits);
+
+    std::size_t unorderedSelects = 0;
+    bool hasDoubleGuardBits = false;
+    for (Instruction &I : instructions(*UnorderedF)) {
+        if (auto *SI = dyn_cast<SelectInst>(&I))
+            if (SI->getName().starts_with("morok.optamp.select") &&
+                SI->getType()->isIntegerTy(1))
+                ++unorderedSelects;
+        if (auto *BC = dyn_cast<BitCastInst>(&I))
+            hasDoubleGuardBits |= BC->getSrcTy()->isDoubleTy() &&
+                                  BC->getDestTy()->isIntegerTy(64);
+    }
+    CHECK(unorderedSelects == 4u);
+    CHECK(hasDoubleGuardBits);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("optimizerAmplifyFunction skips fast-math floating comparisons") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i1 @optamp_fcmp_fast(float %a, float %b) {
+entry:
+  %cmp = fcmp nnan olt float %a, %b
+  ret i1 %cmp
+}
+)ir");
+    Function *F = M->getFunction("optamp_fcmp_fast");
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(144);
+    morok::ir::IRRandom rng(engine);
+    CHECK_FALSE(morok::passes::optimizerAmplifyFunction(
+        *F, {/*probability=*/100, /*max_forms=*/4}, rng));
+    for (Instruction &I : instructions(*F))
+        CHECK_FALSE(I.getName().starts_with("morok.optamp"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("subThresholdPersistFunction adds bounded volatile zero terms") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

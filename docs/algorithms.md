@@ -339,18 +339,22 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Optimizer amplification — IR structure
 - Eligible operations are unflagged scalar integer `add/sub/mul/and/or/xor`
-  binary operators and scalar integer `icmp` predicates from `i1` upward.  The
-  pass skips poison-generating arithmetic flags and generated
-  `morok.optamp.*` expressions, because it clones the base operation and cannot
-  legally erase `nuw`/`nsw`/disjoint semantics.
+  binary operators, scalar integer `icmp` predicates from `i1` upward, and
+  unflagged scalar floating `fcmp` predicates over `half`, `bfloat`, `float`,
+  and `double`.  The pass skips poison-generating arithmetic flags, fast-math
+  comparison flags, and generated `morok.optamp.*` expressions, because it
+  clones the base operation and cannot legally erase `nuw`/`nsw`/disjoint or
+  `nnan`-style semantics.
 - Each selected op is cloned as `morok.optamp.base`, then expanded into up to
   `max_forms` mathematically equivalent forms: carry-split addition,
   borrow-split subtraction, De Morgan forms, xor-as-or-minus-and, and wrapping
   multiplication variants.  `icmp` forms use swapped predicates, inverted
-  predicates wrapped in `not`, and xor-zero equality/inequality forms.  One-bit
-  add/sub avoid the carry/borrow forms whose shift-by-one would be poison at
-  width 1.  The result is a chain of `select` instructions whose guards are
-  derived from shifted/xored operand bits plus a per-build salt.
+  predicates wrapped in `not`, and xor-zero equality/inequality forms.  `fcmp`
+  forms use only exact predicate rewrites: swapped predicates and inverse
+  predicates wrapped in `not`, preserving ordered/unordered NaN behavior.  The
+  FP guards are derived from bitcast operand bits plus a per-build salt; one-bit
+  integer add/sub avoid the carry/borrow forms whose shift-by-one would be
+  poison at width 1.  The result is a chain of `select` instructions.
 - All arms are equivalent, so runtime semantics do not depend on the guard.  The
   guard is still input-derived, so InstCombine cannot collapse the select chain
   with a local constant proof.  There are no volatile loads, allocas, globals, or
@@ -824,7 +828,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - ExternalOpaquePredicates: IPO-blocked volatile context helper guards with scratch decoy edges.
 - CoherentDecoys: opaque-dead alternate return computations, not junk blocks.
 - DataFlowIntegrity: `i1..i8` op tables decoded by runtime integrity hashes.
-- OptimizerAmplification: early branchless select lattice over equivalent forms.
+- OptimizerAmplification: early branchless select lattice over equivalent integer op / integer compare / FP compare forms.
 - SubThresholdPersistence: volatile local-seed opaque-zero terms under a small cap.
 - TableArithmetic: encrypted lazy `i1..i8` op lookup tables.
 - UniformPrimitiveLowering: `i1..i8` op tables plus memory-loaded indirectbr dispatch.
