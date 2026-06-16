@@ -2,13 +2,25 @@
 # End-to-end differential tests.
 #
 # Each test compiles the workload clean and obfuscated (via the built plugin)
-# and requires identical runtime output.  Requires a C compiler matching the
-# plugin's LLVM (the build compiler) and, on Apple platforms, the macOS SDK.
+# and requires identical runtime output. Requires a C/C++ compiler matching the
+# plugin's LLVM (the build compiler). On Apple platforms the macOS SDK sysroot
+# is passed explicitly; elsewhere the compiler's default sysroot is used (the
+# driver scripts treat an empty sysroot argument as "use the default").
 #==============================================================================
 
-if(NOT APPLE)
-  message(STATUS "e2e differential tests currently target Apple toolchains; skipping.")
+# Loading a New-PM pass plugin into clang via -fpass-plugin is well supported on
+# ELF/Mach-O hosts. On Windows the mechanism is far more fragile, so the
+# behavioural e2e suite is gated to non-Windows hosts; Windows coverage comes
+# from the in-process core/config/ir unit suites, which exercise the same passes
+# without dlopen.
+if(WIN32)
+  message(STATUS "e2e differential tests skipped on Windows (plugin dlopen path).")
   return()
+endif()
+
+set(_sysroot "")
+if(APPLE)
+  set(_sysroot "${CMAKE_OSX_SYSROOT}")
 endif()
 
 set(_workload "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/workload.c")
@@ -21,7 +33,7 @@ foreach(preset low mid high max)
     COMMAND bash "${_driver}"
             "${CMAKE_C_COMPILER}"
             "$<TARGET_FILE:morok_plugin>"
-            "${CMAKE_OSX_SYSROOT}"
+            "${_sysroot}"
             "${_workload}"
             "${preset}"
             4242)
@@ -37,7 +49,7 @@ add_test(NAME "e2e/differential_maxtoml"
   COMMAND bash "${_driver}"
           "${CMAKE_C_COMPILER}"
           "$<TARGET_FILE:morok_plugin>"
-          "${CMAKE_OSX_SYSROOT}"
+          "${_sysroot}"
           "${_workload}"
           "${_max_config}"
           4242)
@@ -45,46 +57,54 @@ set_tests_properties("e2e/differential_maxtoml" PROPERTIES
   LABELS "e2e;max"
   REQUIRED_FILES "$<TARGET_FILE:morok_plugin>;${_max_config}")
 
-add_test(NAME "e2e/programs_high_compile"
-  COMMAND bash "${_program_sweep}"
-          "${CMAKE_C_COMPILER}"
-          "${CMAKE_CXX_COMPILER}"
-          "$<TARGET_FILE:morok_plugin>"
-          "${CMAKE_OSX_SYSROOT}"
-          "${PROJECT_SOURCE_DIR}/programs"
-          "high"
-          4242)
-set_tests_properties("e2e/programs_high_compile" PROPERTIES
-  LABELS "e2e;programs;max"
-  REQUIRED_FILES "$<TARGET_FILE:morok_plugin>"
-  TIMEOUT 600)
+# The full sample-program compile sweep runs only when the corpus is present.
+# `programs/` lives outside version control (it carries arch/OS-specific
+# workloads — aarch64 inline asm, raw syscalls — that do not compile on every
+# target), so a clean CI checkout simply skips it rather than failing.
+if(EXISTS "${PROJECT_SOURCE_DIR}/programs")
+  add_test(NAME "e2e/programs_high_compile"
+    COMMAND bash "${_program_sweep}"
+            "${CMAKE_C_COMPILER}"
+            "${CMAKE_CXX_COMPILER}"
+            "$<TARGET_FILE:morok_plugin>"
+            "${_sysroot}"
+            "${PROJECT_SOURCE_DIR}/programs"
+            "high"
+            4242)
+  set_tests_properties("e2e/programs_high_compile" PROPERTIES
+    LABELS "e2e;programs;max"
+    REQUIRED_FILES "$<TARGET_FILE:morok_plugin>"
+    TIMEOUT 600)
 
-add_test(NAME "e2e/programs_max_compile"
-  COMMAND bash "${_program_sweep}"
-          "${CMAKE_C_COMPILER}"
-          "${CMAKE_CXX_COMPILER}"
-          "$<TARGET_FILE:morok_plugin>"
-          "${CMAKE_OSX_SYSROOT}"
-          "${PROJECT_SOURCE_DIR}/programs"
-          "${_max_config}"
-          4242)
-set_tests_properties("e2e/programs_max_compile" PROPERTIES
-  LABELS "e2e;programs;max"
-  REQUIRED_FILES "$<TARGET_FILE:morok_plugin>;${_max_config}"
-  TIMEOUT 900)
+  add_test(NAME "e2e/programs_max_compile"
+    COMMAND bash "${_program_sweep}"
+            "${CMAKE_C_COMPILER}"
+            "${CMAKE_CXX_COMPILER}"
+            "$<TARGET_FILE:morok_plugin>"
+            "${_sysroot}"
+            "${PROJECT_SOURCE_DIR}/programs"
+            "${_max_config}"
+            4242)
+  set_tests_properties("e2e/programs_max_compile" PROPERTIES
+    LABELS "e2e;programs;max"
+    REQUIRED_FILES "$<TARGET_FILE:morok_plugin>;${_max_config}"
+    TIMEOUT 900)
 
-# The canonical "maximum settings" gate: every sample program must compile
-# clean and through the plugin at the built-in `max` preset.
-add_test(NAME "e2e/programs_maxpreset_compile"
-  COMMAND bash "${_program_sweep}"
-          "${CMAKE_C_COMPILER}"
-          "${CMAKE_CXX_COMPILER}"
-          "$<TARGET_FILE:morok_plugin>"
-          "${CMAKE_OSX_SYSROOT}"
-          "${PROJECT_SOURCE_DIR}/programs"
-          "max"
-          4242)
-set_tests_properties("e2e/programs_maxpreset_compile" PROPERTIES
-  LABELS "e2e;programs;max"
-  REQUIRED_FILES "$<TARGET_FILE:morok_plugin>"
-  TIMEOUT 900)
+  # The canonical "maximum settings" gate: every sample program must compile
+  # clean and through the plugin at the built-in `max` preset.
+  add_test(NAME "e2e/programs_maxpreset_compile"
+    COMMAND bash "${_program_sweep}"
+            "${CMAKE_C_COMPILER}"
+            "${CMAKE_CXX_COMPILER}"
+            "$<TARGET_FILE:morok_plugin>"
+            "${_sysroot}"
+            "${PROJECT_SOURCE_DIR}/programs"
+            "max"
+            4242)
+  set_tests_properties("e2e/programs_maxpreset_compile" PROPERTIES
+    LABELS "e2e;programs;max"
+    REQUIRED_FILES "$<TARGET_FILE:morok_plugin>"
+    TIMEOUT 900)
+else()
+  message(STATUS "e2e programs sweep skipped (no programs/ corpus in this tree).")
+endif()

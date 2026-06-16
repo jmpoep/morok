@@ -1,0 +1,153 @@
+name: "Setup LLVM trunk"
+description: >
+  Restore (or build + install, then cache) an upstream LLVM trunk toolchain
+  (clang + opt + the cmake package) pinned to a specific commit. The install
+  directory is cached keyed by the commit SHA, so normal runs never rebuild
+  LLVM; sccache (GitHub Actions backend) makes the rare cold/bumped build
+  incremental as well.
+
+inputs:
+  llvm-ref:
+    description: "Upstream llvm/llvm-project commit SHA to build."
+    required: true
+  cache-version:
+    description: "Bump to invalidate every LLVM cache (recipe changes)."
+    required: false
+    default: "v1"
+
+outputs:
+  install-prefix:
+    description: "Absolute path to the LLVM install prefix."
+    value: ${{ steps.vars.outputs.prefix }}
+  llvm-dir:
+    description: "Path to lib/cmake/llvm (for -DLLVM_DIR)."
+    value: ${{ steps.vars.outputs.llvm_dir }}
+  clang:
+    description: "Path to the built clang driver."
+    value: ${{ steps.vars.outputs.clang }}
+  clangxx:
+    description: "Path to the built clang++ driver."
+    value: ${{ steps.vars.outputs.clangxx }}
+  cache-hit:
+    description: "Whether the LLVM install was restored from cache."
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve paths
+      id: vars
+      shell: bash
+      run: |
+        set -euo pipefail
+        prefix="${RUNNER_TEMP//\\//}/llvm-install"
+        echo "prefix=$prefix"                 >> "$GITHUB_OUTPUT"
+        echo "llvm_dir=$prefix/lib/cmake/llvm" >> "$GITHUB_OUTPUT"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          echo "clang=$prefix/bin/clang.exe"     >> "$GITHUB_OUTPUT"
+          echo "clangxx=$prefix/bin/clang++.exe"  >> "$GITHUB_OUTPUT"
+        else
+          echo "clang=$prefix/bin/clang"          >> "$GITHUB_OUTPUT"
+          echo "clangxx=$prefix/bin/clang++"      >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Restore LLVM install cache
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.vars.outputs.prefix }}
+        key: llvm-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-version }}-${{ inputs.llvm-ref }}
+
+    - name: Build + install LLVM trunk (cache miss)
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        LLVM_REF: ${{ inputs.llvm-ref }}
+        PREFIX: ${{ steps.vars.outputs.prefix }}
+        SCCACHE_GHA_ENABLED: "true"
+        CMAKE_C_COMPILER_LAUNCHER: sccache
+        CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      run: |
+        set -euo pipefail
+        SRC="${RUNNER_TEMP//\\//}/llvm-project"
+        BUILD="${RUNNER_TEMP//\\//}/llvm-build"
+
+        echo "::group::Fetch llvm-project @ ${LLVM_REF}"
+        rm -rf "$SRC" "$BUILD"
+        mkdir -p "$SRC"
+        git -C "$SRC" init -q
+        git -C "$SRC" remote add origin https://github.com/llvm/llvm-project.git
+        # GitHub allows fetching any commit reachable from a ref; the pin is on
+        # main's history, so a single-commit shallow fetch is enough.
+        git -C "$SRC" -c protocol.version=2 fetch --depth 1 --no-tags origin "$LLVM_REF"
+        git -C "$SRC" checkout -q --detach FETCH_HEAD
+        echo "::endgroup::"
+
+        COMMON=(
+          -G Ninja
+          -S "$SRC/llvm" -B "$BUILD"
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_INSTALL_PREFIX="$PREFIX"
+          -DLLVM_ENABLE_PROJECTS=clang
+          -DLLVM_TARGETS_TO_BUILD="X86;AArch64"
+          -DLLVM_ENABLE_ASSERTIONS=OFF
+          -DLLVM_INCLUDE_TESTS=OFF
+          -DLLVM_INCLUDE_EXAMPLES=OFF
+          -DLLVM_INCLUDE_BENCHMARKS=OFF
+          -DLLVM_INCLUDE_DOCS=OFF
+          -DLLVM_ENABLE_TERMINFO=OFF
+          -DLLVM_ENABLE_LIBXML2=OFF
+          -DLLVM_ENABLE_LIBEDIT=OFF
+          -DLLVM_ENABLE_ZLIB=OFF
+          -DLLVM_ENABLE_ZSTD=OFF
+          -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON
+          -DLLVM_OPTIMIZED_TABLEGEN=ON
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+        )
+
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          # MSVC env is set up by the caller (msvc-dev-cmd). Release has no debug
+          # info, which keeps sccache happy (it cannot cache /Zi PDB writes).
+          EXTRA=(
+            -DCMAKE_C_COMPILER=cl
+            -DCMAKE_CXX_COMPILER=cl
+            -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=
+          )
+        else
+          # Static LLVM libraries, matching the known-good local toolchain that
+          # loads the plugin (a libLLVM dylib build resolves plugin symbols
+          # differently and is not what this project is validated against). Just
+          # pick a fast linker when one is present.
+          EXTRA=()
+          if command -v ld.lld >/dev/null 2>&1; then
+            EXTRA+=( -DLLVM_USE_LINKER=lld )
+          fi
+        fi
+
+        echo "::group::Configure LLVM"
+        cmake "${COMMON[@]}" "${EXTRA[@]}"
+        echo "::endgroup::"
+
+        echo "::group::Build + install LLVM (this is the slow, cached step)"
+        cmake --build "$BUILD" --target install
+        echo "::endgroup::"
+
+        # Reclaim disk before the post-job cache save (Windows runners are tight).
+        rm -rf "$BUILD" "$SRC"
+        sccache --show-stats || true
+
+    - name: Export toolchain to environment
+      shell: bash
+      run: |
+        set -euo pipefail
+        prefix="${{ steps.vars.outputs.prefix }}"
+        if [ ! -x "${{ steps.vars.outputs.clang }}" ] && [ ! -f "${{ steps.vars.outputs.clang }}" ]; then
+          echo "::error::LLVM install missing clang at ${{ steps.vars.outputs.clang }}"
+          ls -la "$prefix/bin" || true
+          exit 1
+        fi
+        echo "$prefix/bin" >> "$GITHUB_PATH"
+        echo "LLVM_DIR=${{ steps.vars.outputs.llvm_dir }}" >> "$GITHUB_ENV"
+        "${{ steps.vars.outputs.clang }}" --version

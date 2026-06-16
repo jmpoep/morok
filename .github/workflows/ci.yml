@@ -1,0 +1,171 @@
+name: CI
+
+# Build + test the Morok LLVM-IR obfuscator against upstream LLVM trunk on every
+# platform, and publish per-platform release archives for tags.
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+    paths-ignore: ["docs/**", "web/**", "**/*.md", "LICENSE"]
+  pull_request:
+    paths-ignore: ["docs/**", "web/**", "**/*.md", "LICENSE"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on PR branches; never cancel pushes to master/tags
+# (a half-finished cached LLVM build is wasteful to abandon).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Single source of truth for the pinned LLVM trunk commit.
+  prep:
+    runs-on: ubuntu-latest
+    outputs:
+      llvm_ref: ${{ steps.read.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/llvm-trunk.env
+          echo "ref=${LLVM_REF}" >> "$GITHUB_OUTPUT"
+          echo "Pinned LLVM trunk: ${LLVM_REF}"
+
+  build:
+    needs: prep
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # Cold LLVM builds are long; cached runs are minutes. Bound generously.
+    timeout-minutes: 360
+    permissions:
+      contents: write # attach archives to the release on tags
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-24.04, arch: x86_64 }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, arch: arm64 }
+          - { name: macos-arm64, os: macos-15, arch: arm64 }
+          - { name: windows-x86_64, os: windows-2022, arch: x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build lld
+
+      - name: Install CMake + Ninja
+        if: runner.os != 'Linux'
+        uses: lukka/get-cmake@latest
+
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up sccache
+        uses: mozilla/sccache-action@v0.0.6
+
+      - name: Setup LLVM trunk
+        id: llvm
+        uses: ./.github/actions/setup-llvm
+        with:
+          llvm-ref: ${{ needs.prep.outputs.llvm_ref }}
+
+      - name: Configure Morok
+        shell: bash
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER="${{ steps.llvm.outputs.clang }}" \
+            -DCMAKE_CXX_COMPILER="${{ steps.llvm.outputs.clangxx }}" \
+            -DLLVM_DIR="${{ steps.llvm.outputs.llvm-dir }}" \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Build Morok
+        shell: bash
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
+        run: cmake --build build --parallel
+
+      - name: sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats || true
+
+      - name: Run tests
+        shell: bash
+        run: ctest --test-dir build -j --output-on-failure --timeout 1200
+
+      - name: Package artifacts
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse --short HEAD)"
+          stage="morok-${{ matrix.name }}-${sha}"
+          mkdir -p "dist/$stage"
+          cp LICENSE README.md "dist/$stage/" 2>/dev/null || true
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # No loadable plugin on Windows (see src/pipeline/CMakeLists.txt):
+            # ship the static obfuscator libraries + public headers so Morok can
+            # be embedded into a host LLVM tool.
+            mkdir -p "dist/$stage/lib" "dist/$stage/include"
+            found=0
+            while IFS= read -r lib; do
+              cp "$lib" "dist/$stage/lib/"; found=1
+            done < <(find build/src -type f \( -name '*.lib' -o -name '*.a' \) 2>/dev/null)
+            if [ "$found" -ne 1 ]; then
+              echo "::error::no Morok static libraries found under build/src"
+              find build/src -type f \( -name '*.lib' -o -name '*.a' \) || true
+              exit 1
+            fi
+            cp -R include/. "dist/$stage/include/"
+            ( cd dist && 7z a -tzip "${stage}.zip" "$stage" >/dev/null )
+            echo "archive=dist/${stage}.zip" >> "$GITHUB_OUTPUT"
+          else
+            # The loadable New-PM plugin (name varies by platform).
+            found=0
+            for f in build/src/pipeline/*Morok*.dylib \
+                     build/src/pipeline/*Morok*.so; do
+              if [ -f "$f" ]; then cp "$f" "dist/$stage/"; found=1; fi
+            done
+            if [ "$found" -ne 1 ]; then
+              echo "::error::no Morok plugin found under build/src/pipeline"
+              ls -la build/src/pipeline || true
+              exit 1
+            fi
+            tar -C dist -czf "dist/${stage}.tar.gz" "$stage"
+            echo "archive=dist/${stage}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: morok-${{ matrix.name }}
+          path: ${{ steps.pkg.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.archive }}
+          fail_on_unmatched_files: true
