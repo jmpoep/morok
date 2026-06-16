@@ -515,7 +515,7 @@ TEST_CASE("MorokPass stops per-function growth on oversized modules") {
     CHECK(countFunctions(*M, "morok.") == 0u);
     CHECK(M->getFunction("dlsym") == nullptr);
     CHECK(countGlobals(*M, "morok.k1") == 0u);
-    CHECK(countGlobals(*M, "morok.sym") == 0u);
+    CHECK(countGlobals(*M, "morok.fco") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -8249,8 +8249,54 @@ TEST_CASE("functionCallObfuscateModule caps redirected call sites") {
     CHECK(morok::passes::functionCallObfuscateModule(
         *M, {/*probability=*/100, /*max_calls=*/1000}, rng));
 
-    CHECK(countGlobals(*M, "morok.sym") == 256u);
+    CHECK(countGlobals(*M, "morok.fco.c") == 256u);
     CHECK(countCallsTo(*Caller, "dlsym") == 256u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("functionCallObfuscateModule never leaves the symbol name readable") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+declare i32 @puts(ptr)
+@.s = private constant [3 x i8] c"hi\00"
+define i32 @caller() {
+  %r = call i32 @puts(ptr @.s)
+  ret i32 %r
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(4242);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::functionCallObfuscateModule(*M, {/*prob=*/100}, rng));
+
+    // No byte-array global may carry the readable symbol name "puts".
+    for (GlobalVariable &GV : M->globals()) {
+        if (!GV.hasInitializer())
+            continue;
+        if (auto *CDA = dyn_cast<ConstantDataArray>(GV.getInitializer()))
+            if (CDA->getElementType()->isIntegerTy(8))
+                CHECK(CDA->getRawDataValues().find("puts") == StringRef::npos);
+    }
+    // A per-site cipher global and the volatile module seed exist.
+    CHECK(countGlobals(*M, "morok.fco.c") == 1u);
+    CHECK(countGlobals(*M, "morok.fco.s") == 1u);
+
+    // The seed is read with a volatile load, and the symbol passed to dlsym is
+    // a computed stack pointer (an alloca), not a direct global string.
+    Function *Caller = M->getFunction("caller");
+    REQUIRE(Caller);
+    bool hasVolatileLoad = false;
+    bool dlsymTakesAlloca = false;
+    for (Instruction &I : instructions(*Caller)) {
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+            hasVolatileLoad |= LI->isVolatile();
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            if (Function *Cee = CI->getCalledFunction())
+                if (Cee->getName() == "dlsym")
+                    dlsymTakesAlloca |= isa<AllocaInst>(
+                        CI->getArgOperand(1)->stripInBoundsOffsets());
+    }
+    CHECK(hasVolatileLoad);
+    CHECK(dlsymTakesAlloca);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
