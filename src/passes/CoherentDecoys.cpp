@@ -68,6 +68,21 @@ bool eligibleReturn(ReturnInst &RI) {
            Ty->isDoubleTy();
 }
 
+bool isSupportedFp(Type *Ty) {
+    return Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+           Ty->isDoubleTy();
+}
+
+IntegerType *integerCarrierForFp(Type *Ty) {
+    if (Ty->isHalfTy() || Ty->isBFloatTy())
+        return IntegerType::get(Ty->getContext(), 16);
+    if (Ty->isFloatTy())
+        return IntegerType::get(Ty->getContext(), 32);
+    if (Ty->isDoubleTy())
+        return IntegerType::get(Ty->getContext(), 64);
+    return nullptr;
+}
+
 std::vector<ReturnInst *> collectReturns(Function &F) {
     std::vector<ReturnInst *> Returns;
     for (Instruction &I : instructions(F)) {
@@ -88,15 +103,21 @@ void shuffleReturns(std::vector<ReturnInst *> &Returns, ir::IRRandom &rng) {
 
 bool isCompatibleTerm(Type *RetTy, Type *TermTy) {
     if (RetTy->isIntegerTy())
-        return TermTy->isIntegerTy();
-    return TermTy->isIntegerTy() || TermTy->isHalfTy() ||
-           TermTy->isBFloatTy() || TermTy->isFloatTy() ||
-           TermTy->isDoubleTy();
+        return TermTy->isIntegerTy() || isSupportedFp(TermTy);
+    return TermTy->isIntegerTy() || isSupportedFp(TermTy);
 }
 
 Value *asIntegerReturnType(IRBuilder<NoFolder> &B, Value *V,
                            IntegerType *RetTy) {
-    if (!V || !V->getType()->isIntegerTy())
+    if (!V)
+        return nullptr;
+    if (isSupportedFp(V->getType())) {
+        auto *CarrierTy = integerCarrierForFp(V->getType());
+        if (!CarrierTy)
+            return nullptr;
+        V = B.CreateBitCast(V, CarrierTy, "morok.decoy.alt.fpbits");
+    }
+    if (!V->getType()->isIntegerTy())
         return nullptr;
     if (V->getType() == RetTy)
         return V;

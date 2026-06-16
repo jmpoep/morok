@@ -341,10 +341,11 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - The false arm does not rejoin and does not contain arbitrary junk.  It returns
   a type-correct alternate value computed from the real return value, function
   arguments, and live values visible at the split point.  Integer returns use
-  plausible `xor`/`add`/odd `mul` folds.  Floating returns (`half`, `bfloat`,
-  `float`, `double`) fold compatible FP terms and integer terms converted into
-  the return type through ordinary `fadd`/`fsub`/`fmul` arithmetic, so static
-  triage cannot discard the arm by spotting meaningless noise.
+  plausible `xor`/`add`/odd `mul` folds over integer terms and raw-bit carriers
+  for compatible FP terms.  Floating returns (`half`, `bfloat`, `float`,
+  `double`) fold compatible FP terms and integer terms converted into the return
+  type through ordinary `fadd`/`fsub`/`fmul` arithmetic, so static triage cannot
+  discard the arm by spotting meaningless noise.
 - Runtime semantics are preserved because the volatile predicate is true for
   the private global at execution, while LLVM may not fold the volatile loads.
   The pass skips void, aggregate/vector, and generated `morok.decoy.*` blocks.

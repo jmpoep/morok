@@ -2522,6 +2522,54 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("coherentDecoysFunction mixes floating terms into integer returns") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @score_mixed(float %a, double %b, i32 %salt) {
+entry:
+  %b32 = fptrunc double %b to float
+  %sum = fadd float %a, %b32
+  %bits = bitcast float %sum to i32
+  %out = xor i32 %bits, %salt
+  ret i32 %out
+}
+)ir");
+    Function *F = M->getFunction("score_mixed");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1313);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::coherentDecoysFunction(
+        *F, {/*probability=*/100, /*max_blocks=*/4, /*depth=*/16}, rng));
+
+    bool hasFloatBits = false;
+    bool hasDoubleBits = false;
+    bool hasIntAlt = false;
+    for (BasicBlock &BB : *F) {
+        if (!BB.getName().starts_with("morok.decoy.alt"))
+            continue;
+        if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+            hasIntAlt |= RI->getReturnValue()->getType()->isIntegerTy(32);
+        for (Instruction &I : BB) {
+            if (auto *BC = dyn_cast<BitCastInst>(&I)) {
+                hasFloatBits |= BC->getName().starts_with(
+                                    "morok.decoy.alt.fpbits") &&
+                                BC->getSrcTy()->isFloatTy() &&
+                                BC->getDestTy()->isIntegerTy(32);
+                hasDoubleBits |= BC->getName().starts_with(
+                                     "morok.decoy.alt.fpbits") &&
+                                 BC->getSrcTy()->isDoubleTy() &&
+                                 BC->getDestTy()->isIntegerTy(64);
+            }
+        }
+    }
+
+    CHECK(hasFloatBits);
+    CHECK(hasDoubleBits);
+    CHECK(hasIntAlt);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("coherentDecoysFunction adds floating scalar return alternatives") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
