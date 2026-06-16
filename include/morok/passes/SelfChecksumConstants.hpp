@@ -26,7 +26,7 @@ struct SelfChecksumParams {
     std::uint32_t region_bytes = 32;    ///< bytes hashed by the runtime stub
 };
 
-/// Fuse selected constant operands, including PHI incoming values,
+/// Fuse selected scalar constant operands, including PHI incoming values,
 /// branch/switch conditions, and store values, with a runtime checksum diff.
 /// The valid checksum reconstructs the original constant; tampering silently
 /// corrupts data flow.

@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -46,9 +47,15 @@ constexpr std::uint64_t kPostlinkMagic = 0x4D4F524F4B534331ULL; // MOROKSC1
 struct Target {
     Instruction *user = nullptr;
     unsigned index = 0;
-    ConstantInt *value = nullptr;
+    Constant *value = nullptr;
     bool phi_incoming = false;
     BasicBlock *incoming_block = nullptr;
+};
+
+struct EncodedConstant {
+    IntegerType *carrier_ty = nullptr;
+    Type *result_ty = nullptr;
+    std::uint64_t raw = 0;
 };
 
 struct Runtime {
@@ -72,7 +79,7 @@ std::uint64_t widthMask(unsigned Bits) {
 }
 
 bool isRewritableUser(const Instruction &I) {
-    return isa<BinaryOperator>(I) || isa<ICmpInst>(I) ||
+    return isa<BinaryOperator>(I) || isa<ICmpInst>(I) || isa<FCmpInst>(I) ||
            isa<SelectInst>(I) || isa<CastInst>(I) || isa<ReturnInst>(I);
 }
 
@@ -85,12 +92,39 @@ bool safeCallArgs(const CallBase &CB) {
     return true;
 }
 
-ConstantInt *eligibleStoreValue(StoreInst &SI) {
-    auto *C = dyn_cast<ConstantInt>(SI.getValueOperand());
+bool supportedFloatType(Type *Ty) {
+    return Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+           Ty->isDoubleTy();
+}
+
+std::optional<EncodedConstant> encodeConstant(Constant *C) {
     if (!C)
-        return nullptr;
-    auto *Ty = dyn_cast<IntegerType>(C->getType());
-    if (!Ty || !eligibleWidth(Ty->getBitWidth()))
+        return std::nullopt;
+
+    if (auto *CI = dyn_cast<ConstantInt>(C)) {
+        auto *Ty = dyn_cast<IntegerType>(CI->getType());
+        if (!Ty || !eligibleWidth(Ty->getBitWidth()))
+            return std::nullopt;
+        return EncodedConstant{Ty, Ty, CI->getZExtValue()};
+    }
+
+    auto *CFP = dyn_cast<ConstantFP>(C);
+    if (!CFP || !supportedFloatType(CFP->getType()))
+        return std::nullopt;
+
+    APInt Bits = CFP->getValueAPF().bitcastToAPInt();
+    if (!eligibleWidth(Bits.getBitWidth()))
+        return std::nullopt;
+
+    return EncodedConstant{IntegerType::get(C->getContext(), Bits.getBitWidth()),
+                           C->getType(), Bits.getZExtValue()};
+}
+
+bool eligibleConstant(Constant *C) { return encodeConstant(C).has_value(); }
+
+Constant *eligibleStoreValue(StoreInst &SI) {
+    auto *C = dyn_cast<Constant>(SI.getValueOperand());
+    if (!eligibleConstant(C))
         return nullptr;
     return C;
 }
@@ -118,11 +152,8 @@ ConstantInt *eligibleSwitchCondition(SwitchInst &SI) {
 }
 
 bool eligiblePhiIncoming(PHINode &PN, unsigned Incoming) {
-    auto *C = dyn_cast<ConstantInt>(PN.getIncomingValue(Incoming));
-    if (!C)
-        return false;
-    auto *Ty = dyn_cast<IntegerType>(C->getType());
-    if (!Ty || !eligibleWidth(Ty->getBitWidth()))
+    auto *C = dyn_cast<Constant>(PN.getIncomingValue(Incoming));
+    if (!eligibleConstant(C))
         return false;
     BasicBlock *Pred = PN.getIncomingBlock(Incoming);
     Instruction *Term = Pred ? Pred->getTerminator() : nullptr;
@@ -180,19 +211,16 @@ std::vector<Target> collectTargets(Function &F) {
                 for (unsigned Op = 0; Op < PN->getNumIncomingValues(); ++Op) {
                     if (!eligiblePhiIncoming(*PN, Op))
                         continue;
-                    Targets.push_back(
-                        {&I, Op, cast<ConstantInt>(PN->getIncomingValue(Op)),
-                         true, PN->getIncomingBlock(Op)});
+                    Targets.push_back({&I, Op,
+                                       cast<Constant>(PN->getIncomingValue(Op)),
+                                       true, PN->getIncomingBlock(Op)});
                 }
             } else if (auto *CB = dyn_cast<CallBase>(&I)) {
                 if (!safeCallArgs(*CB))
                     continue;
                 for (unsigned Op = 0; Op < CB->arg_size(); ++Op) {
-                    auto *C = dyn_cast<ConstantInt>(CB->getArgOperand(Op));
-                    if (!C)
-                        continue;
-                    auto *Ty = dyn_cast<IntegerType>(C->getType());
-                    if (!Ty || !eligibleWidth(Ty->getBitWidth()))
+                    auto *C = dyn_cast<Constant>(CB->getArgOperand(Op));
+                    if (!eligibleConstant(C))
                         continue;
                     Targets.push_back({&I, Op, C});
                 }
@@ -209,11 +237,8 @@ std::vector<Target> collectTargets(Function &F) {
                 if (!isRewritableUser(I))
                     continue;
                 for (unsigned Op = 0; Op < I.getNumOperands(); ++Op) {
-                    auto *C = dyn_cast<ConstantInt>(I.getOperand(Op));
-                    if (!C)
-                        continue;
-                    auto *Ty = dyn_cast<IntegerType>(C->getType());
-                    if (!Ty || !eligibleWidth(Ty->getBitWidth()))
+                    auto *C = dyn_cast<Constant>(I.getOperand(Op));
+                    if (!eligibleConstant(C))
                         continue;
                     Targets.push_back({&I, Op, C});
                 }
@@ -402,12 +427,16 @@ GlobalVariable *createMask(Module &M, Function &F, IntegerType *Ty,
 }
 
 Value *emitFusedConstant(Function &F, Runtime &R, Instruction &User,
-                         ConstantInt *C, ir::IRRandom &Rng) {
+                         Constant *C, ir::IRRandom &Rng) {
+    auto Encoded = encodeConstant(C);
+    if (!Encoded)
+        return C;
+
     Module &M = *F.getParent();
-    auto *Ty = cast<IntegerType>(C->getType());
+    auto *Ty = Encoded->carrier_ty;
     const unsigned Bits = Ty->getBitWidth();
     const std::uint64_t MaskLimit = widthMask(Bits);
-    const std::uint64_t Original = C->getZExtValue() & MaskLimit;
+    const std::uint64_t Original = Encoded->raw & MaskLimit;
     const std::uint64_t Mask = Rng.next() & MaskLimit;
     const std::uint64_t Enc = (Original ^ Mask) & MaskLimit;
 
@@ -424,7 +453,10 @@ Value *emitFusedConstant(Function &F, Runtime &R, Instruction &User,
     MaskLoad->setAlignment(MaskGV->getAlign().valueOrOne());
     Value *Base =
         B.CreateXor(ConstantInt::get(Ty, Enc), MaskLoad, "morok.sc.base");
-    return B.CreateXor(Base, Diff, "morok.sc.const");
+    Value *Raw = B.CreateXor(Base, Diff, "morok.sc.const");
+    if (Encoded->result_ty == Ty)
+        return Raw;
+    return B.CreateBitCast(Raw, Encoded->result_ty, "morok.sc.const.fp");
 }
 
 } // namespace

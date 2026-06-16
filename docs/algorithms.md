@@ -498,16 +498,19 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   runtime/data-flow contract over private `morok.sc.region.*` byte regions and
   `morok.sc.expected.*` hash globals; a post-link rewriter can replace those
   regions and expected hashes with final native code slices.
-- Each selected `i1` through `i64` integer constant in binary, comparison,
+- Each selected `i1` through `i64` integer constant, and each scalar
+  half/bfloat/float/double constant via its raw integer bit pattern, is
+  reconstructed as
+  `encoded ^ volatile_mask ^ (runtime_hash(region) ^ expected_hash)`.
+  Supported sites are binary/FP-binary operations, integer/FP comparisons,
   `select`, cast, PHI incoming, conditional branch/switch conditions, return,
-  store-value, and ordinary call-argument operands is reconstructed as
-  `encoded ^ volatile_mask ^ (runtime_hash(region) ^ expected_hash)`.  PHI
-  incoming constants are materialized on their predecessor edge, splitting
-  conditional predecessors before inserting volatile loads/calls.  When the
-  region matches the
-  expected hash, the diff is zero and the original constant appears.  If bytes
-  change without updating the expected hash, the diff flows into the program
-  value and silently corrupts output.
+  store-value, and ordinary call-argument operands.  PHI incoming constants are
+  materialized on their predecessor edge, splitting conditional predecessors
+  before inserting volatile loads/calls.  Floating-point values are bitcast
+  back after reconstruction, preserving payloads such as NaNs and signed zero.
+  When the region matches the expected hash, the diff is zero and the original
+  constant appears.  If bytes change without updating the expected hash, the
+  diff flows into the program value and silently corrupts output.
 - The pass deliberately emits no trap and no check branch.  The integrity value
   is data, so there is no separable success/failure edge to patch out.
 - Runtime hash helpers are internal `morok.sc.diff.*` functions with volatile
@@ -850,7 +853,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - PathExplosion: opaque-guarded input-derived loops with volatile symbolic stores and indirectbr dispatch.
 - MqGate: planted GF(2) quadratic opaque gates over volatile argument-derived bits.
 - TraceKeying: edge-carried rolling trace accumulator with guards and neutral poisoning.
-- SelfChecksumConstants: constants XORed with runtime checksum diffs for data-only tamper corruption.
+- SelfChecksumConstants: scalar constants XORed with runtime checksum diffs for data-only tamper corruption.
 - ShamirShare: selected scalar literals reconstructed from volatile GF(2^8) threshold shares.
 - VectorObfuscation: scalar→SIMD lifting; width 128/256/512, shuffle, lift_comparisons.
 - FunctionWrapper: polymorphic proxies; prob/times/max_wrappers/hard cap 256.

@@ -5013,6 +5013,58 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("selfChecksumConstantsFunction fuses floating value literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+declare void @selfcheck_fp_arg(float)
+
+define float @selfcheck_fp_values(float %a, double %d, ptr %p) {
+entry:
+  %x = fadd float %a, 1.500000e+00
+  %cmp = fcmp olt double %d, 2.500000e+00
+  store float 3.500000e+00, ptr %p, align 4
+  call void @selfcheck_fp_arg(float 4.500000e+00)
+  ret float 5.500000e+00
+}
+)ir");
+    Function *F = M->getFunction("selfcheck_fp_values");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(18141);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::selfChecksumConstantsFunction(
+        *F, {/*probability=*/100, /*max_constants=*/8, /*region_bytes=*/32},
+        rng));
+
+    bool hasFpConst = false;
+    unsigned fpConstBitcasts = 0;
+    for (Instruction &I : instructions(*F)) {
+        if (auto *BO = dyn_cast<BinaryOperator>(&I))
+            for (Value *Op : BO->operands())
+                hasFpConst |= isa<ConstantFP>(Op);
+        if (auto *FC = dyn_cast<FCmpInst>(&I))
+            for (Value *Op : FC->operands())
+                hasFpConst |= isa<ConstantFP>(Op);
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+            hasFpConst |= isa<ConstantFP>(SI->getValueOperand());
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            if (CI->getCalledFunction() &&
+                CI->getCalledFunction()->getName() == "selfcheck_fp_arg")
+                for (Value *Arg : CI->args())
+                    hasFpConst |= isa<ConstantFP>(Arg);
+        if (auto *RI = dyn_cast<ReturnInst>(&I))
+            hasFpConst |= isa<ConstantFP>(RI->getReturnValue());
+        if (I.getName().starts_with("morok.sc.const.fp"))
+            ++fpConstBitcasts;
+    }
+
+    CHECK_FALSE(hasFpConst);
+    CHECK(fpConstBitcasts >= 5u);
+    CHECK(countGlobals(*M, "morok.sc.mask") == 5u);
+    CHECK(M->getFunction("morok.sc.diff.selfcheck_fp_values") != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("selfChecksumConstantsFunction fuses store value literals") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -5164,6 +5216,49 @@ join:
     CHECK(countGlobals(*M, "morok.sc.mask") == 2u);
     CHECK(countGlobals(*M, "morok.postlink.sc") == 1u);
     CHECK(M->getFunction("morok.sc.diff.selfcheck_phi") != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("selfChecksumConstantsFunction fuses floating PHI incoming literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define float @selfcheck_fp_phi(i1 %flag) {
+entry:
+  br i1 %flag, label %join, label %right
+right:
+  br label %join
+join:
+  %p = phi float [ 1.250000e+00, %entry ], [ 2.750000e+00, %right ]
+  ret float %p
+}
+)ir");
+    Function *F = M->getFunction("selfcheck_fp_phi");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(18181);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::selfChecksumConstantsFunction(
+        *F, {/*probability=*/100, /*max_constants=*/2, /*region_bytes=*/32},
+        rng));
+
+    PHINode *Phi = nullptr;
+    bool hasSplitEdge = false;
+    for (BasicBlock &BB : *F) {
+        hasSplitEdge |= BB.getName().starts_with("morok.sc.phi.edge");
+        for (Instruction &I : BB)
+            if (auto *PN = dyn_cast<PHINode>(&I))
+                Phi = PN;
+    }
+    REQUIRE(Phi);
+    for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+        CHECK_FALSE(isa<ConstantFP>(Phi->getIncomingValue(I)));
+        CHECK(Phi->getIncomingValue(I)
+                  ->getName()
+                  .starts_with("morok.sc.const"));
+    }
+    CHECK(hasSplitEdge);
+    CHECK(countGlobals(*M, "morok.sc.mask") == 2u);
+    CHECK(M->getFunction("morok.sc.diff.selfcheck_fp_phi") != nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
