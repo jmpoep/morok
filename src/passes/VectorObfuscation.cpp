@@ -65,9 +65,9 @@ bool liftable(BinaryOperator *bo) {
     if (!(Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
           Ty->isDoubleTy()))
         return false;
-    if (auto *FPO = dyn_cast<FPMathOperator>(bo))
-        if (FPO->getFastMathFlags().any())
-            return false;
+    // Fast-math flags are copied onto the lifted vector op, so the real lane
+    // computes the identical flagged result; any junk lane that violates a
+    // flag merely poisons that (unused) lane.
     switch (bo->getOpcode()) {
     case Instruction::FAdd:
     case Instruction::FSub:
@@ -90,7 +90,7 @@ bool liftableCompare(CmpInst *cmp) {
             return false;
         if (FCmp->getOperand(1)->getType() != Ty)
             return false;
-        return FCmp->getFastMathFlags().none();
+        return true;
     }
     return false;
 }
@@ -217,6 +217,8 @@ bool liftBinary(BinaryOperator *bo, const VecParams &params,
         }
         if (auto *OldExact = dyn_cast<PossiblyExactOperator>(bo))
             VecBO->setIsExact(OldExact->isExact());
+        if (isa<FPMathOperator>(bo))
+            VecBO->copyFastMathFlags(bo);
     }
     Value *r = extractRealLane(B, vr, lanes, realLane, params.shuffle, rng,
                                "morok.vec.value");
@@ -268,6 +270,9 @@ bool liftCompare(CmpInst *cmp, const VecParams &params, ir::IRRandom &rng) {
         isa<ICmpInst>(cmp)
             ? B.CreateICmp(cmp->getPredicate(), va, vb, "morok.vec.cmp")
             : B.CreateFCmp(cmp->getPredicate(), va, vb, "morok.vec.cmp");
+    if (isa<FCmpInst>(cmp))
+        if (auto *VecCmp = dyn_cast<Instruction>(vcmp))
+            VecCmp->copyFastMathFlags(cmp);
     Value *r = extractRealLane(B, vcmp, lanes, realLane, params.shuffle, rng,
                                "morok.vec.cmp.value");
 

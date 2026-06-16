@@ -742,13 +742,15 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   stages.
 
 ## Vector obfuscation — IR structure
-- Eligible scalar integer binary ops and unflagged scalar floating binary ops
+- Eligible scalar integer binary ops and scalar floating binary ops
   (`half`, `bfloat`, `float`, `double`) are lifted to `<N x T>` operations,
   where `N = floor(width / bitwidth(T))` for configured widths 128, 256, or 512
   bits.  Lane `realLane` holds the original operands and all other lanes are
   per-build junk constants, so per-lane vector semantics preserve the scalar
-  value.  Floating ops with fast-math flags are skipped so the pass does not
-  change the source operation's NaN/Inf/signed-zero optimization contract.
+  value.  Floating ops/compares carrying fast-math flags are lifted too: the
+  flags (and the integer `nuw`/`nsw`/`exact` flags) are copied onto the vector
+  op, so `realLane` computes the identical flagged result while any junk lane
+  that violates a flag only poisons that unused lane.
 - With `shuffle=false`, the pass extracts `realLane` directly.  With
   `shuffle=true`, `shufflevector` first moves `realLane` to lane 0 and fills the
   rest of the result with randomized lane references before extraction.  This

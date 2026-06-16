@@ -4161,6 +4161,47 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("vectorObfuscateFunction lifts fast-math floating ops and compares") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define float @vecfast(float %a, float %b) {
+entry:
+  %sum = fadd fast float %a, %b
+  %mul = fmul nnan ninf float %sum, %b
+  %cmp = fcmp nnan olt float %mul, %a
+  %sel = select i1 %cmp, float %mul, float %b
+  ret float %sel
+}
+)ir");
+    Function *F = M->getFunction("vecfast");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(2122);
+    morok::ir::IRRandom rng(engine);
+    // Fast-math FP ops/compares used to be skipped (liftable returned false);
+    // they must now lift and carry their fast-math flags onto the vector op.
+    CHECK(morok::passes::vectorObfuscateFunction(
+        *F,
+        {/*probability=*/100, /*width=*/128, /*shuffle=*/false,
+         /*lift_comparisons=*/true},
+        rng));
+
+    bool hasFastVectorFP = false;
+    bool hasFastVectorFCmp = false;
+    for (Instruction &I : instructions(*F)) {
+        if (auto *BO = dyn_cast<BinaryOperator>(&I))
+            if (BO->getType()->isVectorTy() &&
+                (BO->getOpcode() == Instruction::FAdd ||
+                 BO->getOpcode() == Instruction::FMul))
+                hasFastVectorFP |= BO->getFastMathFlags().any();
+        if (auto *Cmp = dyn_cast<FCmpInst>(&I))
+            if (Cmp->getType()->isVectorTy())
+                hasFastVectorFCmp |= Cmp->getFastMathFlags().any();
+    }
+    CHECK(hasFastVectorFP);
+    CHECK(hasFastVectorFCmp);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("vectorObfuscateFunction lifts scalar casts") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
