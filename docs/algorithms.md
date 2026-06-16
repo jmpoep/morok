@@ -56,15 +56,17 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Pipeline: `origC ─[Feistel if feistel && bits>=16]→ workC ─[k-share XOR or single XOR]→ shares`.
   Runtime reverses: XOR-fold shares → workC → inverse Feistel → origC.
 - k-share when `k>=3` (k clamp 2..8), else classic single-XOR for selected
-  `i1` through `i64` integer constants in binary, comparison, `select`, cast,
-  PHI incoming, conditional branch/switch conditions, return, store-value, and
-  ordinary call-argument operands.  Branch destinations, store pointers,
-  callees, GEP indices, switch cases, intrinsic immediates, and operand bundles
-  remain structural and are never rewritten.  Shares: private non-const
-  `morok.share` globals loaded volatilely at each rewritten use.  PHI incoming
-  constants are reconstructed on the corresponding predecessor edge; conditional
-  predecessors are split first so volatile reconstruction does not execute on an
-  untaken edge.
+  `i1` through `i64` integer constants and scalar `half`/`bfloat`/`float`/
+  `double` constants in binary, comparison, `select`, cast, PHI incoming,
+  conditional branch/switch conditions, return, store-value, and ordinary
+  call-argument operands.  Floating constants are shared as their raw integer
+  bit pattern and bitcast back at the use, preserving NaN payloads and signed
+  zero exactly.  Branch destinations, store pointers, callees, GEP indices,
+  switch cases, intrinsic immediates, and operand bundles remain structural and
+  are never rewritten.  Shares: private non-const `morok.share` globals loaded
+  volatilely at each rewritten use.  PHI incoming constants are reconstructed on
+  the corresponding predecessor edge; conditional predecessors are split first
+  so volatile reconstruction does not execute on an untaken edge.
 - Feistel: balanced, 4 rounds, per-round odd multiplier + xor key (random, masked to
   half width). `feistelEncrypt/Decrypt(value, bits, keys)`.
 - Flags: `constenc_times` 1, `constenc_kshare` 2, `constenc_feistel` off,

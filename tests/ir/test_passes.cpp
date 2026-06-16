@@ -1248,6 +1248,78 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("constantEncryptFunction rewrites floating value literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+declare void @const_fp_arg(float)
+
+define float @const_fp_values(float %a, double %d, ptr %p) {
+entry:
+  %x = fadd float %a, 1.500000e+00
+  %cmp = fcmp olt double %d, 2.500000e+00
+  store float 3.500000e+00, ptr %p, align 4
+  call void @const_fp_arg(float 4.500000e+00)
+  ret float 5.500000e+00
+}
+)ir");
+    Function *F = M->getFunction("const_fp_values");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(508);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::constantEncryptFunction(
+        *F, {/*prob=*/100, /*k=*/3, /*iterations=*/1}, rng));
+
+    std::size_t fpBitcasts = 0;
+    for (Instruction &I : instructions(*F)) {
+        if (auto *BC = dyn_cast<BitCastInst>(&I))
+            if (BC->getName().starts_with("morok.share.fp"))
+                ++fpBitcasts;
+        if (isa<BinaryOperator>(I) || isa<FCmpInst>(I) ||
+            isa<ReturnInst>(I) || isa<StoreInst>(I) || isa<CallInst>(I)) {
+            for (Use &Op : I.operands())
+                CHECK_FALSE(isa<ConstantFP>(Op.get()));
+        }
+    }
+    CHECK(fpBitcasts >= 5u);
+    CHECK(countGlobals(*M, "morok.share") == 15u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("constantEncryptFunction rewrites floating PHI incoming literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define float @const_fp_phi(i1 %flag) {
+entry:
+  br i1 %flag, label %left, label %right
+left:
+  br label %merge
+right:
+  br label %merge
+merge:
+  %p = phi float [ 1.250000e+00, %left ], [ 2.750000e+00, %right ]
+  ret float %p
+}
+)ir");
+    Function *F = M->getFunction("const_fp_phi");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(509);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::constantEncryptFunction(
+        *F, {/*prob=*/100, /*k=*/3, /*iterations=*/1}, rng));
+
+    PHINode *Phi = nullptr;
+    for (Instruction &I : instructions(*F))
+        if (auto *PN = dyn_cast<PHINode>(&I))
+            Phi = PN;
+    REQUIRE(Phi);
+    for (Value *Incoming : Phi->incoming_values())
+        CHECK_FALSE(isa<ConstantFP>(Incoming));
+    CHECK(countGlobals(*M, "morok.share") == 6u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("constantEncryptFunction rewrites ordinary call argument literals") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

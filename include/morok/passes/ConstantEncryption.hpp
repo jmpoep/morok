@@ -4,11 +4,12 @@
 //
 // morok/passes/ConstantEncryption.hpp — constant hiding via XOR secret sharing.
 //
-// Each eligible integer literal operand, including PHI incoming values,
-// branch/switch conditions, and store values, is replaced by the XOR of k
-// private global "shares" (see morok/core/XorShare.hpp): the value never
-// appears verbatim in the binary and is reconstructed at run time.  The shares
-// are loaded volatilely so later optimisation passes cannot fold the
+// Each eligible scalar integer or floating literal operand, including PHI
+// incoming values, branch/switch conditions, and store values, is replaced by
+// the XOR of k private global "shares" (see morok/core/XorShare.hpp): the value
+// never appears verbatim in the binary and is reconstructed at run time.
+// Floating literals are shared by raw bit pattern and bitcast back exactly.  The
+// shares are loaded volatilely so later optimisation passes cannot fold the
 // reconstruction back to the original constant.
 
 #ifndef MOROK_PASSES_CONSTANT_ENCRYPTION_HPP
@@ -33,7 +34,7 @@ struct ConstEncParams {
     std::uint32_t iterations = 1;    ///< sweeps over the function (>=1)
 };
 
-/// Encrypt eligible integer constants in `F`.  Returns true if any changed.
+/// Encrypt eligible scalar constants in `F`.  Returns true if any changed.
 bool constantEncryptFunction(llvm::Function &F, const ConstEncParams &params,
                              morok::ir::IRRandom &rng);
 

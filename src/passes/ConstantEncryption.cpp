@@ -4,12 +4,12 @@
 //
 // morok/passes/ConstantEncryption.cpp
 //
-// Only operands of integer arithmetic, comparison, select, cast, PHI incoming
-// values, conditional branch/switch conditions, return, store values, and
-// ordinary call-argument instructions are rewritten — never branch destinations,
-// switch cases, GEP indices, store pointers, intrinsic immediate arguments,
-// callees, or operand bundles, which must remain literal — so the output is
-// always valid IR. The XOR-share split is the verified one from
+// Only operands of scalar integer/FP arithmetic, comparison, select, cast, PHI
+// incoming values, conditional branch/switch conditions, return, store values,
+// and ordinary call-argument instructions are rewritten — never branch
+// destinations, switch cases, GEP indices, store pointers, intrinsic immediate
+// arguments, callees, or operand bundles, which must remain literal — so the
+// output is always valid IR. The XOR-share split is the verified one from
 // morok/core/XorShare.hpp; the shares live in private mutable globals and are
 // read with volatile loads so the reconstruction survives optimisation.
 
@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <map>
+#include <optional>
 #include <vector>
 
 using namespace llvm;
@@ -42,9 +43,14 @@ bool eligibleWidth(unsigned bits) {
     return bits >= 1 && bits <= 64;
 }
 
+bool supportedFloatType(Type *Ty) {
+    return Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+           Ty->isDoubleTy();
+}
+
 // Only the operands of these instructions are safe to turn into runtime values.
 bool isRewritableUser(const Instruction &I) {
-    return isa<BinaryOperator>(I) || isa<ICmpInst>(I) ||
+    return isa<BinaryOperator>(I) || isa<ICmpInst>(I) || isa<FCmpInst>(I) ||
            isa<SelectInst>(I) || isa<CastInst>(I) || isa<ReturnInst>(I);
 }
 
@@ -57,9 +63,18 @@ bool safeCallArgs(const CallBase &CB) {
     return true;
 }
 
-ConstantInt *eligibleStoreValue(StoreInst &SI) {
-    auto *C = dyn_cast<ConstantInt>(SI.getValueOperand());
-    if (!C || !eligibleWidth(C->getType()->getIntegerBitWidth()))
+bool eligibleConstant(Constant *C) {
+    if (auto *CI = dyn_cast<ConstantInt>(C))
+        return eligibleWidth(CI->getType()->getIntegerBitWidth());
+    auto *CFP = dyn_cast<ConstantFP>(C);
+    if (!CFP || !supportedFloatType(CFP->getType()))
+        return false;
+    return eligibleWidth(CFP->getValueAPF().bitcastToAPInt().getBitWidth());
+}
+
+Constant *eligibleStoreValue(StoreInst &SI) {
+    auto *C = dyn_cast<Constant>(SI.getValueOperand());
+    if (!C || !eligibleConstant(C))
         return nullptr;
     return C;
 }
@@ -81,8 +96,8 @@ ConstantInt *eligibleSwitchCondition(SwitchInst &SI) {
 }
 
 bool eligiblePhiIncoming(PHINode &PN, unsigned Incoming) {
-    auto *C = dyn_cast<ConstantInt>(PN.getIncomingValue(Incoming));
-    if (!C || !eligibleWidth(C->getType()->getIntegerBitWidth()))
+    auto *C = dyn_cast<Constant>(PN.getIncomingValue(Incoming));
+    if (!C || !eligibleConstant(C))
         return false;
     BasicBlock *Pred = PN.getIncomingBlock(Incoming);
     Instruction *Term = Pred ? Pred->getTerminator() : nullptr;
@@ -92,12 +107,39 @@ bool eligiblePhiIncoming(PHINode &PN, unsigned Incoming) {
            isa<SwitchInst>(Term);
 }
 
-Value *reconstruct(Module &M, Instruction &user, ConstantInt *c,
+struct EncodedConstant {
+    IntegerType *carrier_ty = nullptr;
+    Type *result_ty = nullptr;
+    std::uint64_t raw = 0;
+};
+
+std::optional<EncodedConstant> encodeConstant(Constant *C) {
+    if (auto *CI = dyn_cast<ConstantInt>(C)) {
+        auto *Ty = cast<IntegerType>(CI->getType());
+        if (!eligibleWidth(Ty->getIntegerBitWidth()))
+            return std::nullopt;
+        return EncodedConstant{Ty, Ty, CI->getZExtValue()};
+    }
+
+    auto *CFP = dyn_cast<ConstantFP>(C);
+    if (!CFP || !supportedFloatType(CFP->getType()))
+        return std::nullopt;
+    APInt Bits = CFP->getValueAPF().bitcastToAPInt();
+    if (!eligibleWidth(Bits.getBitWidth()))
+        return std::nullopt;
+    auto *CarrierTy = IntegerType::get(C->getContext(), Bits.getBitWidth());
+    return EncodedConstant{CarrierTy, C->getType(), Bits.getZExtValue()};
+}
+
+Value *reconstruct(Module &M, Instruction &user, Constant *c,
                    unsigned shareCount, ir::IRRandom &rng) {
-    auto *ty = cast<IntegerType>(c->getType());
+    std::optional<EncodedConstant> Enc = encodeConstant(c);
+    if (!Enc)
+        return c;
+    auto *ty = Enc->carrier_ty;
     const unsigned bits = ty->getBitWidth();
     const auto shares =
-        core::splitXorShares(c->getZExtValue(), shareCount, bits, rng.engine());
+        core::splitXorShares(Enc->raw, shareCount, bits, rng.engine());
 
     IRBuilder<NoFolder> B(&user);
     Value *acc = nullptr;
@@ -108,6 +150,8 @@ Value *reconstruct(Module &M, Instruction &user, ConstantInt *c,
         Value *loaded = B.CreateLoad(ty, gv, /*isVolatile=*/true);
         acc = acc ? B.CreateXor(acc, loaded) : loaded;
     }
+    if (Enc->result_ty != Enc->carrier_ty)
+        return B.CreateBitCast(acc, Enc->result_ty, "morok.share.fp");
     return acc;
 }
 
@@ -127,7 +171,7 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
         struct Target {
             Instruction *user;
             unsigned index;
-            ConstantInt *value;
+            Constant *value;
             bool phi_incoming = false;
             BasicBlock *incoming_block = nullptr;
         };
@@ -141,17 +185,15 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
                         if (!eligiblePhiIncoming(*PN, I))
                             continue;
                         targets.push_back(
-                            {&inst, I, cast<ConstantInt>(PN->getIncomingValue(I)),
+                            {&inst, I, cast<Constant>(PN->getIncomingValue(I)),
                              true, PN->getIncomingBlock(I)});
                     }
                 } else if (auto *CB = dyn_cast<CallBase>(&inst)) {
                     if (!safeCallArgs(*CB))
                         continue;
                     for (unsigned I = 0; I < CB->arg_size(); ++I) {
-                        if (auto *C =
-                                dyn_cast<ConstantInt>(CB->getArgOperand(I)))
-                            if (eligibleWidth(
-                                    C->getType()->getIntegerBitWidth()))
+                        if (auto *C = dyn_cast<Constant>(CB->getArgOperand(I)))
+                            if (eligibleConstant(C))
                                 targets.push_back({&inst, I, C});
                     }
                 } else if (auto *SI = dyn_cast<StoreInst>(&inst)) {
@@ -167,9 +209,8 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
                     if (!isRewritableUser(inst))
                         continue;
                     for (unsigned i = 0; i < inst.getNumOperands(); ++i)
-                        if (auto *c = dyn_cast<ConstantInt>(inst.getOperand(i)))
-                            if (eligibleWidth(
-                                    c->getType()->getIntegerBitWidth()))
+                        if (auto *c = dyn_cast<Constant>(inst.getOperand(i)))
+                            if (eligibleConstant(c))
                                 targets.push_back({&inst, i, c});
                 }
             }
