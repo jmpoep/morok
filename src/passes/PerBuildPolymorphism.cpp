@@ -150,8 +150,18 @@ bool eligibleReturn(ReturnInst *RI) {
         return false;
     if (ir::isMustTailReturn(*RI))
         return false;
-    auto *Ty = dyn_cast<IntegerType>(RI->getOperand(0)->getType());
-    return Ty && Ty->getBitWidth() <= 64;
+    Type *Ty = RI->getOperand(0)->getType();
+    if (auto *IntTy = dyn_cast<IntegerType>(Ty))
+        return IntTy->getBitWidth() <= 64;
+    return Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+           Ty->isDoubleTy();
+}
+
+IntegerType *integerCarrierFor(Type *Ty) {
+    if (auto *IntTy = dyn_cast<IntegerType>(Ty))
+        return IntTy;
+    const unsigned Bits = static_cast<unsigned>(Ty->getPrimitiveSizeInBits());
+    return IntegerType::get(Ty->getContext(), Bits);
 }
 
 GlobalVariable *createSalt(Module &M, Function &F, std::uint64_t Salt) {
@@ -174,7 +184,8 @@ Value *castZero(Builder &B, Value *Zero64, IntegerType *Ty) {
 
 void anchorReturn(Module &M, ReturnInst &RI, ir::IRRandom &Rng) {
     Function &F = *RI.getFunction();
-    auto *Ty = cast<IntegerType>(RI.getOperand(0)->getType());
+    Type *ReturnTy = RI.getOperand(0)->getType();
+    IntegerType *CarrierTy = integerCarrierFor(ReturnTy);
     GlobalVariable *Salt = createSalt(M, F, Rng.next());
 
     Builder B(&RI);
@@ -186,8 +197,19 @@ void anchorReturn(Module &M, ReturnInst &RI, ir::IRRandom &Rng) {
     Bv->setVolatile(true);
     Bv->setAlignment(Align(8));
     Value *Zero64 = B.CreateXor(A, Bv, "morok.poly.zero64");
-    Value *Zero = castZero(B, Zero64, Ty);
-    RI.setOperand(0, B.CreateXor(RI.getOperand(0), Zero, "morok.poly.value"));
+    Value *Zero = castZero(B, Zero64, CarrierTy);
+    Value *ValueBits = RI.getOperand(0);
+    if (!ReturnTy->isIntegerTy())
+        ValueBits = B.CreateBitCast(ValueBits, CarrierTy, "morok.poly.bits");
+    Value *AnchoredBits =
+        B.CreateXor(ValueBits, Zero,
+                    ReturnTy->isIntegerTy() ? "morok.poly.value"
+                                            : "morok.poly.bits.value");
+    Value *AnchoredValue = AnchoredBits;
+    if (!ReturnTy->isIntegerTy())
+        AnchoredValue =
+            B.CreateBitCast(AnchoredBits, ReturnTy, "morok.poly.value");
+    RI.setOperand(0, AnchoredValue);
     relaxFunctionEffects(F);
     invalidateCallerEffects(F);
 }

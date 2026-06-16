@@ -6047,6 +6047,62 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("perBuildPolymorphismModule anchors floating scalar returns") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define float @poly_float(float %a, float %b) {
+entry:
+  %x = fadd float %a, %b
+  ret float %x
+}
+
+define double @poly_double(double %a, double %b) {
+entry:
+  %x = fmul double %a, %b
+  ret double %x
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(306);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::perBuildPolymorphismModule(
+        *M,
+        {/*function_order=*/false, /*block_order=*/false,
+         /*anchor_probability=*/100, /*max_anchors=*/4},
+        rng));
+
+    Function *FloatFn = M->getFunction("poly_float");
+    Function *DoubleFn = M->getFunction("poly_double");
+    REQUIRE(FloatFn);
+    REQUIRE(DoubleFn);
+
+    bool hasFloatAnchor = false;
+    bool hasDoubleAnchor = false;
+    bool hasFloatCarrier = false;
+    bool hasDoubleCarrier = false;
+    for (Instruction &I : instructions(*FloatFn)) {
+        hasFloatAnchor |= I.getName().starts_with("morok.poly.value") &&
+                          I.getType()->isFloatTy();
+        if (auto *BC = dyn_cast<BitCastInst>(&I))
+            hasFloatCarrier |=
+                BC->getSrcTy()->isFloatTy() && BC->getDestTy()->isIntegerTy(32);
+    }
+    for (Instruction &I : instructions(*DoubleFn)) {
+        hasDoubleAnchor |= I.getName().starts_with("morok.poly.value") &&
+                           I.getType()->isDoubleTy();
+        if (auto *BC = dyn_cast<BitCastInst>(&I))
+            hasDoubleCarrier |= BC->getSrcTy()->isDoubleTy() &&
+                                BC->getDestTy()->isIntegerTy(64);
+    }
+
+    CHECK(hasFloatAnchor);
+    CHECK(hasDoubleAnchor);
+    CHECK(hasFloatCarrier);
+    CHECK(hasDoubleCarrier);
+    CHECK(countGlobals(*M, "morok.poly.salt") == 2u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("perBuildPolymorphismModule is reproducible and seed-diverse") {
     constexpr const char *IR = R"ir(
 define i32 @poly_seed_a(i32 %x) {

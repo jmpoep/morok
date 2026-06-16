@@ -662,11 +662,14 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   function's non-entry basic blocks using LLVM list operations.  Entry blocks
   stay first, and no CFG edge is retargeted, so PHI and branch semantics are
   preserved while textual IR and backend layout inputs vary per build.
-- Selected integer returns receive a neutral volatile anchor:
+- Selected scalar integer and floating-point returns receive a neutral volatile anchor:
   two volatile loads from the same private mutable `morok.poly.salt.*` global
   are xored to zero, truncated to the return width, and xored into the returned
-  value as `morok.poly.value`.  The salt initializer is seed-dependent and the
-  volatile loads keep the zero term visible to later analysis.
+  value as `morok.poly.value`.  Floating returns (`half`, `bfloat`, `float`,
+  `double`) are bitcast to an equal-width integer carrier for the xor and
+  bitcast back, preserving the exact returned bit pattern.  The salt initializer
+  is seed-dependent and the volatile loads keep the zero term visible to later
+  analysis.
 - The pass is idempotent once any `morok.poly.*` global exists.  It also relaxes
   memory-effect attributes on anchored functions and their callers, because the
   inserted volatile loads make previous readnone/readonly/nosync summaries too
@@ -826,7 +829,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - MutualGuardGraph: overlapping checksum nodes whose combined diff poisons `i1..i64` returns.
 - AdversarialFunctionMerging: same-signature functions routed through shared selector dispatchers plus outlined integer scalar operation/comparison helpers (`i1..i64` operands, `i1` comparison results).
 - AdversarialSelfTuning: cloned-candidate search over hardness metrics with best verified bundle replay.
-- PerBuildPolymorphism: seed-driven function/block order and volatile-zero `i1..i64` return anchors.
+- PerBuildPolymorphism: seed-driven function/block order and volatile-zero scalar integer/FP return anchors.
 - PathExplosion: opaque-guarded input-derived loops with volatile symbolic stores and indirectbr dispatch.
 - MqGate: planted GF(2) quadratic opaque gates over volatile argument-derived bits.
 - TraceKeying: edge-carried rolling trace accumulator with guards and neutral poisoning.

@@ -23,7 +23,7 @@ namespace morok::passes {
 struct PerBuildPolymorphismParams {
     bool function_order = true;              ///< shuffle defined function order
     bool block_order = true;                 ///< shuffle non-entry block order
-    std::uint32_t anchor_probability = 25;   ///< per integer return, 0..100
+    std::uint32_t anchor_probability = 25;   ///< per scalar return, 0..100
     std::uint32_t max_anchors = 16;          ///< semantic-zero return anchors
 };
 
