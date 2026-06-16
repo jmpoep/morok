@@ -1002,23 +1002,37 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("subThresholdPersistFunction honors probability and skips flags") {
+TEST_CASE("subThresholdPersistFunction wraps poison-flagged ops via a "
+          "flag-free base") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
-define i32 @threshold_skip(i32 %a, i32 %b) {
+define i32 @threshold_flagged(i32 %a, i32 %b) {
 entry:
   %sum = add nuw i32 %a, %b
   ret i32 %sum
 }
 )ir");
-    Function *F = M->getFunction("threshold_skip");
+    Function *F = M->getFunction("threshold_flagged");
     REQUIRE(F);
 
     auto engine = morok::core::Xoshiro256pp::fromSeed(12);
     morok::ir::IRRandom rng(engine);
-    CHECK_FALSE(morok::passes::subThresholdPersistFunction(
+    // `add nuw` used to be skipped; it must now wrap through a flag-free base
+    // op (cloneBaseOp drops the nuw, a sound refinement).
+    CHECK(morok::passes::subThresholdPersistFunction(
         *F, {/*probability=*/100, /*max_terms=*/2}, rng));
-    CHECK(countNamedAllocas(*F, "morok.threshold.seed") == 0u);
+    CHECK(countNamedAllocas(*F, "morok.threshold.seed") == 1u);
+    bool hasBase = false;
+    for (Instruction &I : instructions(*F)) {
+        if (!I.getName().starts_with("morok.threshold.base"))
+            continue;
+        hasBase = true;
+        if (auto *OBO = dyn_cast<OverflowingBinaryOperator>(&I)) {
+            CHECK_FALSE(OBO->hasNoSignedWrap());
+            CHECK_FALSE(OBO->hasNoUnsignedWrap());
+        }
+    }
+    CHECK(hasBase);
     CHECK_FALSE(verifyModule(*M, &errs()));
 
     auto M2 = parse(ctx, R"ir(

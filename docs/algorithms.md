@@ -394,9 +394,10 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Eligible operations are scalar integer `add/sub/mul/and/or/xor` and
   constant-agnostic shift binary operators from `i1` upward, plus unflagged
   scalar floating `fadd/fsub/fmul/fdiv/frem` over `half`, `bfloat`, `float`,
-  and `double`.  The pass skips poison-generating integer flags
-  (`nuw`/`nsw`/`exact`/disjoint forms) and fast-math FP flags so it does not
-  weaken flagged semantics while cloning the base operation.
+  and `double`.  Poison-generating integer flags (`nuw`/`nsw`/`exact`/disjoint)
+  are accepted — `cloneBaseOp` re-emits the operation without them and the
+  original is replaced, a sound refinement — so the pass fires on the flagged
+  arithmetic that `-O2` produces.  Fast-math FP flags are still skipped.
 - Each selected op is cloned as `morok.threshold.base`, then receives up to
   `max_terms` opaque-neutral combines.  A term is `zero = load volatile seed ^
   load volatile seed` from a private local seed slot, followed by

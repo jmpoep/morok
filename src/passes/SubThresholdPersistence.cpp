@@ -39,8 +39,10 @@ bool eligibleIntegerOp(BinaryOperator *bo, IntegerType *Ty) {
         return false;
     if (bo->getName().starts_with("morok.threshold"))
         return false;
-    if (bo->hasPoisonGeneratingFlags())
-        return false;
+    // Poison-generating flags (nsw/nuw/exact/disjoint) are accepted: cloneBaseOp
+    // re-emits the operation WITHOUT flags and the original is replaced, so the
+    // wrapped value is a sound refinement of the flagged op.  This matters
+    // because -O2 stamps these flags onto essentially all integer arithmetic.
 
     switch (bo->getOpcode()) {
     case Instruction::Add:
