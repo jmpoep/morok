@@ -10,6 +10,8 @@
 
 #include "morok/config/TomlLoader.hpp"
 
+#include "morok/config/Resolver.hpp"
+
 #define TOML_IMPLEMENTATION
 #include "toml.hpp"
 
@@ -474,9 +476,17 @@ Config buildConfig(const toml::table &tbl) {
     if (cfg.preset != Preset::None)
         cfg.passes = presetConfig(cfg.preset);
 
-    // [passes.*] overrides on top of the preset.
-    if (const auto *passes = tbl["passes"].as_table())
-        parsePasses(*passes, cfg.passes);
+    // [passes.*] overrides on top of the preset.  Parse the file's sections
+    // into a fresh overlay (every field the file does not mention stays unset)
+    // and merge it onto the preset base.  Parsing directly into `cfg.passes`
+    // would clobber preset-provided fields the section omits back to unset —
+    // most damagingly `enabled`, silently disabling a pass whose section only
+    // tunes a parameter (e.g. probability).
+    if (const auto *passes = tbl["passes"].as_table()) {
+        PassConfig overlay;
+        parsePasses(*passes, overlay);
+        merge(cfg.passes, overlay);
+    }
 
     // Ordered [[policy]] rules.
     if (const auto *arr = tbl["policy"].as_array())

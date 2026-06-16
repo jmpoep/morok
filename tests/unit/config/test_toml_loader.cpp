@@ -33,6 +33,30 @@ TEST_CASE("global section is parsed") {
     CHECK(r.config.demangle_names == false);
 }
 
+TEST_CASE("a tuning section does not disable a preset-enabled pass") {
+    // Regression: a [passes.X] section that only tunes a parameter must NOT
+    // reset the pass's other preset-provided fields (notably `enabled`).  The
+    // "high" preset enables BCF and substitution; a probability-only override
+    // must keep them enabled while changing the probability.
+    const auto r = loadFromString(R"(
+    [global]
+    preset = "high"
+    [passes.bcf]
+    probability = 50
+    [passes.substitution]
+    probability = 33
+  )");
+    REQUIRE(r.ok);
+    const auto base = presetConfig(Preset::High);
+    REQUIRE(base.bcf.enabled.has_value());
+    CHECK(r.config.passes.bcf.enabled == base.bcf.enabled);
+    CHECK(r.config.passes.bcf.probability == 50u);
+    CHECK(r.config.passes.sub.enabled == base.sub.enabled);
+    CHECK(r.config.passes.sub.probability == 33u);
+    // Fields the section never mentioned keep their preset values.
+    CHECK(r.config.passes.bcf.iterations == base.bcf.iterations);
+}
+
 TEST_CASE("preset is the base and [passes.*] overrides it") {
     const auto r = loadFromString(R"(
     [global]
