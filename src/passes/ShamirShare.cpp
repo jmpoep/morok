@@ -70,6 +70,13 @@ ConstantInt *eligibleBranchCondition(BranchInst &BI) {
     return C;
 }
 
+ConstantInt *eligibleSwitchCondition(SwitchInst &SI) {
+    auto *C = dyn_cast<ConstantInt>(SI.getCondition());
+    if (!C || !eligibleWidth(C->getType()->getIntegerBitWidth()))
+        return nullptr;
+    return C;
+}
+
 std::uint8_t lagrangeBasisAtZero(ArrayRef<core::shamir::Share> Shares,
                                  std::size_t J) {
     const std::uint8_t Xj = Shares[J].first;
@@ -264,6 +271,9 @@ bool shamirShareFunction(Function &F, const ShamirShareParams &Params,
                     Targets.push_back({&I, 0, C});
             } else if (auto *BI = dyn_cast<BranchInst>(&I)) {
                 if (auto *C = eligibleBranchCondition(*BI))
+                    Targets.push_back({&I, 0, C});
+            } else if (auto *SW = dyn_cast<SwitchInst>(&I)) {
+                if (auto *C = eligibleSwitchCondition(*SW))
                     Targets.push_back({&I, 0, C});
             } else {
                 if (!isRewritableUser(I))

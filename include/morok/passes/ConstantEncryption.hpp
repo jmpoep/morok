@@ -4,8 +4,8 @@
 //
 // morok/passes/ConstantEncryption.hpp — constant hiding via XOR secret sharing.
 //
-// Each eligible integer literal operand, including branch conditions and store
-// values, is replaced by the XOR of k private global "shares" (see
+// Each eligible integer literal operand, including branch/switch conditions and
+// store values, is replaced by the XOR of k private global "shares" (see
 // morok/core/XorShare.hpp): the value never appears verbatim in the binary and
 // is reconstructed at run time.  The shares are loaded volatilely so later
 // optimisation passes cannot fold the reconstruction back to the original

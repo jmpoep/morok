@@ -1113,6 +1113,40 @@ right:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("constantEncryptFunction rewrites switch condition literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define void @const_switch() {
+entry:
+  switch i32 7, label %default [
+    i32 7, label %hit
+    i32 9, label %miss
+  ]
+hit:
+  ret void
+miss:
+  ret void
+default:
+  ret void
+}
+)ir");
+    Function *F = M->getFunction("const_switch");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(507);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::constantEncryptFunction(
+        *F, {/*prob=*/100, /*k=*/3, /*iterations=*/1}, rng));
+
+    auto *SW = dyn_cast<SwitchInst>(F->getEntryBlock().getTerminator());
+    REQUIRE(SW);
+    CHECK_FALSE(isa<ConstantInt>(SW->getCondition()));
+    for (auto &Case : SW->cases())
+        CHECK(isa<ConstantInt>(Case.getCaseValue()));
+    CHECK(countGlobals(*M, "morok.share") == 3u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("constantEncryptFunction caps literal rewrites") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("const-cap", ctx);
@@ -1406,6 +1440,45 @@ right:
     REQUIRE(BI);
     REQUIRE(BI->isConditional());
     CHECK_FALSE(isa<ConstantInt>(BI->getCondition()));
+    CHECK(countGlobals(*M, "morok.shamir.share") == 2u);
+    CHECK(countGlobals(*M, "morok.shamir.cell") == 2u);
+    CHECK(countCallsTo(*F, "morok.gf8mul") == 2u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("shamirShareFunction reconstructs switch condition literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define void @shamir_switch() {
+entry:
+  switch i8 5, label %default [
+    i8 5, label %hit
+    i8 7, label %miss
+  ]
+hit:
+  ret void
+miss:
+  ret void
+default:
+  ret void
+}
+)ir");
+    Function *F = M->getFunction("shamir_switch");
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x5356);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::shamirShareFunction(
+        *F,
+        {/*probability=*/100, /*threshold=*/2, /*shares=*/3,
+         /*max_secrets=*/1},
+        rng));
+
+    auto *SW = dyn_cast<SwitchInst>(F->getEntryBlock().getTerminator());
+    REQUIRE(SW);
+    CHECK_FALSE(isa<ConstantInt>(SW->getCondition()));
+    for (auto &Case : SW->cases())
+        CHECK(isa<ConstantInt>(Case.getCaseValue()));
     CHECK(countGlobals(*M, "morok.shamir.share") == 2u);
     CHECK(countGlobals(*M, "morok.shamir.cell") == 2u);
     CHECK(countCallsTo(*F, "morok.gf8mul") == 2u);
@@ -4345,6 +4418,46 @@ right:
     CHECK(countGlobals(*M, "morok.sc.mask") == 1u);
     CHECK(countGlobals(*M, "morok.postlink.sc") == 1u);
     CHECK(M->getFunction("morok.sc.diff.selfcheck_branch") != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("selfChecksumConstantsFunction fuses switch condition literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define void @selfcheck_switch() {
+entry:
+  switch i8 5, label %default [
+    i8 5, label %hit
+    i8 7, label %miss
+  ]
+hit:
+  ret void
+miss:
+  ret void
+default:
+  ret void
+}
+)ir");
+    Function *F = M->getFunction("selfcheck_switch");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1817);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::selfChecksumConstantsFunction(
+        *F, {/*probability=*/100, /*max_constants=*/1, /*region_bytes=*/32},
+        rng));
+
+    auto *SW = dyn_cast<SwitchInst>(F->getEntryBlock().getTerminator());
+    REQUIRE(SW);
+    CHECK_FALSE(isa<ConstantInt>(SW->getCondition()));
+    CHECK(SW->getCondition()->getName().starts_with("morok.sc.const"));
+    for (auto &Case : SW->cases())
+        CHECK(isa<ConstantInt>(Case.getCaseValue()));
+    CHECK(countGlobals(*M, "morok.sc.region") == 1u);
+    CHECK(countGlobals(*M, "morok.sc.expected") == 1u);
+    CHECK(countGlobals(*M, "morok.sc.mask") == 1u);
+    CHECK(countGlobals(*M, "morok.postlink.sc") == 1u);
+    CHECK(M->getFunction("morok.sc.diff.selfcheck_switch") != nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

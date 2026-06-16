@@ -5,7 +5,7 @@
 // morok/passes/ConstantEncryption.cpp
 //
 // Only operands of integer arithmetic, comparison, select, cast, conditional
-// branch conditions, return, store values, and ordinary call-argument
+// branch/switch conditions, return, store values, and ordinary call-argument
 // instructions are rewritten — never branch destinations, switch cases, GEP
 // indices, store pointers, intrinsic immediate arguments, callees, or operand
 // bundles, which must remain literal — so the output is always valid IR. The
@@ -71,6 +71,13 @@ ConstantInt *eligibleBranchCondition(BranchInst &BI) {
     return C;
 }
 
+ConstantInt *eligibleSwitchCondition(SwitchInst &SI) {
+    auto *C = dyn_cast<ConstantInt>(SI.getCondition());
+    if (!C || !eligibleWidth(C->getType()->getIntegerBitWidth()))
+        return nullptr;
+    return C;
+}
+
 Value *reconstruct(Module &M, Instruction &user, ConstantInt *c,
                    unsigned shareCount, ir::IRRandom &rng) {
     auto *ty = cast<IntegerType>(c->getType());
@@ -128,6 +135,9 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
                         targets.push_back({&inst, 0, C});
                 } else if (auto *BI = dyn_cast<BranchInst>(&inst)) {
                     if (auto *C = eligibleBranchCondition(*BI))
+                        targets.push_back({&inst, 0, C});
+                } else if (auto *SW = dyn_cast<SwitchInst>(&inst)) {
+                    if (auto *C = eligibleSwitchCondition(*SW))
                         targets.push_back({&inst, 0, C});
                 } else {
                     if (!isRewritableUser(inst))
