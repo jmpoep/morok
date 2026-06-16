@@ -7488,6 +7488,54 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("adversarialFunctionMergingModule outlines shift and division ops") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @divshift_a(i32 %a, i32 %b) {
+entry:
+  %q = udiv i32 %a, %b
+  %r = srem i32 %a, %b
+  %s = shl i32 %q, 3
+  %t = lshr i32 %r, 2
+  %u = xor i32 %s, %t
+  ret i32 %u
+}
+
+define i32 @divshift_b(i32 %a, i32 %b) {
+entry:
+  %q = sdiv i32 %a, %b
+  %r = urem i32 %a, %b
+  %s = ashr i32 %q, 1
+  %t = add i32 %r, %s
+  ret i32 %t
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(224);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::adversarialFunctionMergingModule(
+        *M,
+        {/*probability=*/100, /*max_groups=*/1, /*max_functions=*/2,
+         /*outline_probability=*/100, /*max_outlines=*/8},
+        rng));
+
+    // Shift and division fragments are now outline-eligible: helper calls must
+    // have been planted in the merged implementations, and the module stays
+    // well-formed.
+    unsigned implOutlineCalls = 0;
+    for (Function &F : *M) {
+        if (!F.getName().starts_with("morok.afm.impl"))
+            continue;
+        for (Instruction &I : instructions(F))
+            if (auto *CI = dyn_cast<CallInst>(&I))
+                if (Function *Callee = CI->getCalledFunction())
+                    if (Callee->getName().starts_with("morok.afm.outline"))
+                        ++implOutlineCalls;
+    }
+    CHECK(implOutlineCalls >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("adversarialFunctionMergingModule outlines integer comparisons") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

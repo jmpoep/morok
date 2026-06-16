@@ -110,6 +110,18 @@ bool supportedOpcode(unsigned Opcode) {
     case Instruction::And:
     case Instruction::Or:
     case Instruction::Xor:
+    // Shifts and division/remainder are outlined verbatim into the shared
+    // helper (CreateBinOp reproduces the exact opcode), so the operation is
+    // identical to the original.  Poison-flagged forms (nsw/nuw/exact) are
+    // already rejected by eligibleOutline, so the unflagged op carries no
+    // extra UB.
+    case Instruction::Shl:
+    case Instruction::LShr:
+    case Instruction::AShr:
+    case Instruction::UDiv:
+    case Instruction::SDiv:
+    case Instruction::URem:
+    case Instruction::SRem:
         return true;
     default:
         return false;

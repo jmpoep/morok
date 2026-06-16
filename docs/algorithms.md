@@ -656,9 +656,10 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   call the shared dispatcher, whose switch calls the selected implementation.
   Function identity is preserved for external callers while call-graph recovery
   sees unrelated functions converge through one hidden selector surface.
-- Selected scalar integer `add/sub/mul/and/or/xor`, unflagged scalar floating
-  `fadd/fsub/fmul/fdiv/frem`, integer comparison, and unflagged floating
-  comparison fragments inside the cloned implementations are outlined into
+- Selected scalar integer `add/sub/mul/and/or/xor/shl/lshr/ashr/udiv/sdiv/
+  urem/srem`, unflagged scalar floating `fadd/fsub/fmul/fdiv/frem`, integer
+  comparison, and unflagged floating comparison fragments inside the cloned
+  implementations are outlined into
   shared noinline/optnone `morok.afm.outline.*` helpers.  Helpers include
   volatile key loads whose xor contributes a semantic zero, so they remain
   side-effecting to the optimizer while returning the original operation
