@@ -4,10 +4,11 @@
 //
 // morok/passes/PathExplosion.hpp — anti-DSE decoy path injection.
 //
-// Inserts opaque-guarded decoy paths containing input-derived bounded loops,
-// per-iteration volatile stores, and computed indirect jumps. Runtime execution
-// takes the original edge, while static and symbolic engines must account for a
-// plausible, input-dependent alternate execution region.
+// Inserts opaque-guarded decoy paths containing integer/pointer/FP
+// input-derived bounded loops, per-iteration volatile stores, and computed
+// indirect jumps. Runtime execution takes the original edge, while static and
+// symbolic engines must account for a plausible, input-dependent alternate
+// execution region.
 
 #ifndef MOROK_PASSES_PATH_EXPLOSION_HPP
 #define MOROK_PASSES_PATH_EXPLOSION_HPP

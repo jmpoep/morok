@@ -81,6 +81,21 @@ AllocaInst *ensureScratch(Function &F) {
     return Scratch;
 }
 
+bool isSupportedScalarFp(Type *Ty) {
+    return Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+           Ty->isDoubleTy();
+}
+
+IntegerType *integerCarrierForFp(Type *Ty) {
+    if (Ty->isHalfTy() || Ty->isBFloatTy())
+        return IntegerType::get(Ty->getContext(), 16);
+    if (Ty->isFloatTy())
+        return IntegerType::get(Ty->getContext(), 32);
+    if (Ty->isDoubleTy())
+        return IntegerType::get(Ty->getContext(), 64);
+    return nullptr;
+}
+
 Value *asI64(IRBuilder<NoFolder> &B, Value *V) {
     auto *I64 = B.getInt64Ty();
     if (V->getType() == I64)
@@ -92,6 +107,15 @@ Value *asI64(IRBuilder<NoFolder> &B, Value *V) {
     }
     if (V->getType()->isPointerTy())
         return B.CreatePtrToInt(V, I64, "morok.path.seed.ptr");
+    if (isSupportedScalarFp(V->getType())) {
+        auto *CarrierTy = integerCarrierForFp(V->getType());
+        if (!CarrierTy)
+            return nullptr;
+        Value *Bits = B.CreateBitCast(V, CarrierTy, "morok.path.seed.fp");
+        if (CarrierTy->getBitWidth() < 64)
+            return B.CreateZExt(Bits, I64, "morok.path.seed.zext");
+        return Bits;
+    }
     return nullptr;
 }
 

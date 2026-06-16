@@ -758,7 +758,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   The original body remains the true edge; the false edge enters a decoy region
   that rejoins the body after a bounded loop.  Runtime semantics are preserved,
   while DSE engines that cannot discharge the guard must explore the decoy.
-- The decoy loop derives its trip bound and dispatch tag from function inputs,
+- The decoy loop derives its trip bound and dispatch tag from function inputs
+  (integer, pointer, and scalar FP inputs folded through raw-bit carriers),
   stores a symbolic accumulator to `morok.path.scratch` on every iteration with
   volatile stores, and dispatches through an `indirectbr` over several case
   blocks using `blockaddress` values selected from the symbolic tag.

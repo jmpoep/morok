@@ -6070,6 +6070,52 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("pathExplosionFunction mixes floating inputs into decoy seed") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @guarded_fp(float %a, double %b, i32 %salt) {
+entry:
+  %b32 = fptrunc double %b to float
+  %sum = fadd float %a, %b32
+  %bits = bitcast float %sum to i32
+  %y = xor i32 %bits, %salt
+  ret i32 %y
+}
+)ir");
+    Function *F = M->getFunction("guarded_fp");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(93);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::pathExplosionFunction(
+        *F, {/*probability=*/100, /*max_blocks=*/1, /*max_iterations=*/8},
+        rng));
+
+    bool hasFloatTerm = false;
+    bool hasDoubleTerm = false;
+    bool hasSeedMix = false;
+    bool hasIndirectBr = false;
+    for (Instruction &I : instructions(*F)) {
+        if (auto *BC = dyn_cast<BitCastInst>(&I)) {
+            hasFloatTerm |= BC->getName().starts_with("morok.path.seed.fp") &&
+                            BC->getSrcTy()->isFloatTy() &&
+                            BC->getDestTy()->isIntegerTy(32);
+            hasDoubleTerm |= BC->getName().starts_with("morok.path.seed.fp") &&
+                             BC->getSrcTy()->isDoubleTy() &&
+                             BC->getDestTy()->isIntegerTy(64);
+        }
+        hasSeedMix |= I.getName().starts_with("morok.path.seed.mix");
+        hasIndirectBr |= isa<IndirectBrInst>(&I);
+    }
+
+    CHECK(hasFloatTerm);
+    CHECK(hasDoubleTerm);
+    CHECK(hasSeedMix);
+    CHECK(hasIndirectBr);
+    CHECK(countNamedAllocas(*F, "morok.path.scratch") == 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("pathExplosionFunction honors zero probability") {
     LLVMContext ctx;
     auto M = parse(ctx, kArith);
