@@ -337,16 +337,18 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Optimizer amplification — IR structure
 - Eligible operations are unflagged scalar integer `add/sub/mul/and/or/xor`
-  binary operators from `i1` upward.  The pass skips poison-generating flags and
-  generated `morok.optamp.*` expressions, because it clones the base operation
-  and cannot legally erase `nuw`/`nsw`/disjoint semantics.
+  binary operators and scalar integer `icmp` predicates from `i1` upward.  The
+  pass skips poison-generating arithmetic flags and generated
+  `morok.optamp.*` expressions, because it clones the base operation and cannot
+  legally erase `nuw`/`nsw`/disjoint semantics.
 - Each selected op is cloned as `morok.optamp.base`, then expanded into up to
   `max_forms` mathematically equivalent forms: carry-split addition,
   borrow-split subtraction, De Morgan forms, xor-as-or-minus-and, and wrapping
-  multiplication variants.  One-bit add/sub avoid the carry/borrow forms whose
-  shift-by-one would be poison at width 1.  The result is a chain of `select`
-  instructions whose guards are derived from shifted/xored operand bits plus a
-  per-build salt.
+  multiplication variants.  `icmp` forms use swapped predicates, inverted
+  predicates wrapped in `not`, and xor-zero equality/inequality forms.  One-bit
+  add/sub avoid the carry/borrow forms whose shift-by-one would be poison at
+  width 1.  The result is a chain of `select` instructions whose guards are
+  derived from shifted/xored operand bits plus a per-build salt.
 - All arms are equivalent, so runtime semantics do not depend on the guard.  The
   guard is still input-derived, so InstCombine cannot collapse the select chain
   with a local constant proof.  There are no volatile loads, allocas, globals, or

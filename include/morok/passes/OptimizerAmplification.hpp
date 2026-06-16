@@ -4,10 +4,10 @@
 //
 // morok/passes/OptimizerAmplification.hpp — optimizer-amplified arithmetic.
 //
-// Builds branchless, input-selected lattices of equivalent integer expressions.
-// The pass is intended to run early, before vectorization and late scalar
-// cleanups, so the backend sees ordinary optimized arithmetic rather than a
-// runtime stub or volatile obfuscation signature.
+// Builds branchless, input-selected lattices of equivalent integer arithmetic
+// and comparison expressions.  The pass is intended to run early, before
+// vectorization and late scalar cleanups, so the backend sees ordinary
+// optimized IR rather than a runtime stub or volatile obfuscation signature.
 
 #ifndef MOROK_PASSES_OPTIMIZER_AMPLIFICATION_HPP
 #define MOROK_PASSES_OPTIMIZER_AMPLIFICATION_HPP
@@ -30,8 +30,8 @@ struct OptAmpParams {
     std::uint32_t max_forms = 2;    ///< selected equivalent forms per op
 };
 
-/// Add optimizer-amplified branchless equivalent forms to eligible integer ops.
-/// Returns true if anything changed.
+/// Add optimizer-amplified branchless equivalent forms to eligible integer
+/// arithmetic and comparison ops.  Returns true if anything changed.
 bool optimizerAmplifyFunction(llvm::Function &F, const OptAmpParams &params,
                               morok::ir::IRRandom &rng);
 

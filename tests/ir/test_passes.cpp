@@ -774,6 +774,65 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("optimizerAmplifyFunction builds equivalent integer comparisons") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i1 @optamp_cmp_eq(i8 %a, i8 %b) {
+entry:
+  %cmp = icmp eq i8 %a, %b
+  ret i1 %cmp
+}
+
+define i1 @optamp_cmp_signed(i8 %a, i8 %b) {
+entry:
+  %cmp = icmp sge i8 %a, %b
+  ret i1 %cmp
+}
+)ir");
+    Function *EqF = M->getFunction("optamp_cmp_eq");
+    Function *SignedF = M->getFunction("optamp_cmp_signed");
+    REQUIRE(EqF);
+    REQUIRE(SignedF);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(142);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::optimizerAmplifyFunction(
+        *EqF, {/*probability=*/100, /*max_forms=*/4}, rng));
+    CHECK(morok::passes::optimizerAmplifyFunction(
+        *SignedF, {/*probability=*/100, /*max_forms=*/4}, rng));
+
+    std::size_t eqBases = 0;
+    std::size_t eqSelects = 0;
+    bool hasEqXorZeroForm = false;
+    for (Instruction &I : instructions(*EqF)) {
+        if (I.getName().starts_with("morok.optamp.base") &&
+            I.getType()->isIntegerTy(1))
+            ++eqBases;
+        if (auto *SI = dyn_cast<SelectInst>(&I))
+            if (SI->getName().starts_with("morok.optamp.select") &&
+                SI->getType()->isIntegerTy(1))
+                ++eqSelects;
+        hasEqXorZeroForm |= I.getName().starts_with("morok.optamp.cmp.xor");
+    }
+    CHECK(eqBases == 1u);
+    CHECK(eqSelects == 4u);
+    CHECK(hasEqXorZeroForm);
+
+    std::size_t signedSelects = 0;
+    bool hasSignedInverse = false;
+    for (Instruction &I : instructions(*SignedF)) {
+        if (auto *SI = dyn_cast<SelectInst>(&I))
+            if (SI->getName().starts_with("morok.optamp.select") &&
+                SI->getType()->isIntegerTy(1))
+                ++signedSelects;
+        hasSignedInverse |=
+            I.getName().starts_with("morok.optamp.cmp.inverse");
+    }
+    CHECK(signedSelects == 4u);
+    CHECK(hasSignedInverse);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("subThresholdPersistFunction adds bounded volatile zero terms") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

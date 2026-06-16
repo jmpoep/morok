@@ -5,10 +5,11 @@
 // morok/passes/OptimizerAmplification.cpp
 //
 // This pass deliberately avoids volatile state and helper calls.  It emits
-// ordinary branchless arithmetic: several equivalent forms of the same operation
-// are selected by input-derived guards.  Placing the pass before the vectorizers
-// gives LLVM a larger arithmetic graph to reassociate and lower into normal
-// optimized code without carrying a distinctive runtime obfuscation scaffold.
+// ordinary branchless arithmetic/comparisons: several equivalent forms of the
+// same operation are selected by input-derived guards.  Placing the pass before
+// the vectorizers gives LLVM a larger arithmetic graph to reassociate and lower
+// into normal optimized code without carrying a distinctive runtime
+// obfuscation scaffold.
 
 #include "morok/passes/OptimizerAmplification.hpp"
 
@@ -29,6 +30,10 @@ namespace {
 
 using Builder = IRBuilder<NoFolder>;
 
+struct Target {
+    Instruction *inst = nullptr;
+};
+
 bool eligible(BinaryOperator *BO) {
     auto *Ty = dyn_cast<IntegerType>(BO->getType());
     if (!Ty || Ty->getBitWidth() == 0)
@@ -45,6 +50,31 @@ bool eligible(BinaryOperator *BO) {
     case Instruction::And:
     case Instruction::Or:
     case Instruction::Xor:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool eligible(ICmpInst *CI) {
+    auto *Ty = dyn_cast<IntegerType>(CI->getOperand(0)->getType());
+    if (!Ty || Ty->getBitWidth() == 0)
+        return false;
+    if (CI->getOperand(1)->getType() != Ty)
+        return false;
+    if (CI->getName().starts_with("morok.optamp"))
+        return false;
+    switch (CI->getPredicate()) {
+    case CmpInst::ICMP_EQ:
+    case CmpInst::ICMP_NE:
+    case CmpInst::ICMP_UGT:
+    case CmpInst::ICMP_UGE:
+    case CmpInst::ICMP_ULT:
+    case CmpInst::ICMP_ULE:
+    case CmpInst::ICMP_SGT:
+    case CmpInst::ICMP_SGE:
+    case CmpInst::ICMP_SLT:
+    case CmpInst::ICMP_SLE:
         return true;
     default:
         return false;
@@ -133,15 +163,47 @@ Value *equivalentForm(Builder &B, BinaryOperator *BO, std::uint32_t Variant) {
     }
 }
 
-Value *inputGuard(Builder &B, BinaryOperator *BO, std::uint32_t Index,
-                  ir::IRRandom &rng) {
-    auto *Ty = cast<IntegerType>(BO->getType());
+Value *equivalentCompareForm(Builder &B, ICmpInst *CI,
+                             std::uint32_t Variant) {
+    Value *A = CI->getOperand(0);
+    Value *C = CI->getOperand(1);
+    auto *Ty = cast<IntegerType>(A->getType());
+    CmpInst::Predicate Pred = CI->getPredicate();
+
+    switch (Variant & 3u) {
+    case 0:
+        return B.CreateICmp(Pred, A, C, "morok.optamp.cmp.form");
+    case 1:
+        return B.CreateICmp(CmpInst::getSwappedPredicate(Pred), C, A,
+                            "morok.optamp.cmp.form");
+    case 2:
+        return B.CreateNot(
+            B.CreateICmp(CmpInst::getInversePredicate(Pred), A, C,
+                         "morok.optamp.cmp.inverse"),
+            "morok.optamp.cmp.form");
+    default:
+        if (Pred == CmpInst::ICMP_EQ || Pred == CmpInst::ICMP_NE) {
+            Value *Diff = B.CreateXor(A, C, "morok.optamp.cmp.xor");
+            CmpInst::Predicate ZeroPred =
+                Pred == CmpInst::ICMP_EQ ? CmpInst::ICMP_EQ
+                                         : CmpInst::ICMP_NE;
+            return B.CreateICmp(ZeroPred, Diff, ConstantInt::get(Ty, 0),
+                                "morok.optamp.cmp.form");
+        }
+        CmpInst::Predicate Swapped = CmpInst::getSwappedPredicate(Pred);
+        return B.CreateNot(
+            B.CreateICmp(CmpInst::getInversePredicate(Swapped), C, A,
+                         "morok.optamp.cmp.inverse"),
+            "morok.optamp.cmp.form");
+    }
+}
+
+Value *inputGuard(Builder &B, Value *A, Value *C, IntegerType *Ty,
+                  std::uint32_t Index, ir::IRRandom &rng) {
     const unsigned Width = Ty->getBitWidth();
     const unsigned ShiftA = static_cast<unsigned>((Index * 5u) % Width);
     const unsigned ShiftB = static_cast<unsigned>((Index * 7u + 3u) % Width);
 
-    Value *A = BO->getOperand(0);
-    Value *C = BO->getOperand(1);
     Value *SA = ShiftA == 0 ? A : B.CreateLShr(A, ConstantInt::get(Ty, ShiftA),
                                                "morok.optamp.guard.sa");
     Value *SB = ShiftB == 0 ? C : B.CreateLShr(C, ConstantInt::get(Ty, ShiftB),
@@ -151,6 +213,18 @@ Value *inputGuard(Builder &B, BinaryOperator *BO, std::uint32_t Index,
                              Salt, "morok.optamp.guard.salt");
     Value *Bit = B.CreateAnd(Mix, one(Ty), "morok.optamp.guard.bit");
     return B.CreateICmpNE(Bit, ConstantInt::get(Ty, 0), "morok.optamp.guard");
+}
+
+Value *inputGuard(Builder &B, BinaryOperator *BO, std::uint32_t Index,
+                  ir::IRRandom &rng) {
+    auto *Ty = cast<IntegerType>(BO->getType());
+    return inputGuard(B, BO->getOperand(0), BO->getOperand(1), Ty, Index, rng);
+}
+
+Value *inputGuard(Builder &B, ICmpInst *CI, std::uint32_t Index,
+                  ir::IRRandom &rng) {
+    auto *Ty = cast<IntegerType>(CI->getOperand(0)->getType());
+    return inputGuard(B, CI->getOperand(0), CI->getOperand(1), Ty, Index, rng);
 }
 
 Value *amplify(BinaryOperator *BO, const OptAmpParams &Params,
@@ -172,6 +246,24 @@ Value *amplify(BinaryOperator *BO, const OptAmpParams &Params,
     return Result;
 }
 
+Value *amplify(ICmpInst *CI, const OptAmpParams &Params, ir::IRRandom &rng) {
+    Builder B(CI);
+    Value *Result = B.CreateICmp(CI->getPredicate(), CI->getOperand(0),
+                                 CI->getOperand(1), "morok.optamp.base");
+    const std::uint32_t Forms =
+        std::clamp<std::uint32_t>(Params.max_forms, 1, 4);
+    const std::uint32_t FirstVariant = rng.range(4);
+
+    for (std::uint32_t I = 0; I < Forms; ++I) {
+        Value *Alt = equivalentCompareForm(B, CI, FirstVariant + I);
+        if (!Alt)
+            return nullptr;
+        Value *Guard = inputGuard(B, CI, I + 1, rng);
+        Result = B.CreateSelect(Guard, Alt, Result, "morok.optamp.select");
+    }
+    return Result;
+}
+
 } // namespace
 
 bool optimizerAmplifyFunction(Function &F, const OptAmpParams &Params,
@@ -179,20 +271,32 @@ bool optimizerAmplifyFunction(Function &F, const OptAmpParams &Params,
     if (F.isDeclaration() || Params.probability == 0 || Params.max_forms == 0)
         return false;
 
-    std::vector<BinaryOperator *> Targets;
-    for (BasicBlock &BB : F)
-        for (Instruction &I : BB)
-            if (auto *BO = dyn_cast<BinaryOperator>(&I))
+    std::vector<Target> Targets;
+    for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+            if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
                 if (eligible(BO))
-                    Targets.push_back(BO);
+                    Targets.push_back({BO});
+                continue;
+            }
+            if (auto *CI = dyn_cast<ICmpInst>(&I))
+                if (eligible(CI))
+                    Targets.push_back({CI});
+        }
+    }
 
     bool Changed = false;
-    for (BinaryOperator *BO : Targets) {
+    for (const Target &T : Targets) {
         if (!rng.chance(Params.probability))
             continue;
-        if (Value *Replacement = amplify(BO, Params, rng)) {
-            BO->replaceAllUsesWith(Replacement);
-            BO->eraseFromParent();
+        Value *Replacement = nullptr;
+        if (auto *BO = dyn_cast<BinaryOperator>(T.inst))
+            Replacement = amplify(BO, Params, rng);
+        else if (auto *CI = dyn_cast<ICmpInst>(T.inst))
+            Replacement = amplify(CI, Params, rng);
+        if (Replacement) {
+            T.inst->replaceAllUsesWith(Replacement);
+            T.inst->eraseFromParent();
             Changed = true;
         }
     }
