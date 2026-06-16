@@ -62,7 +62,7 @@ bool eligibleReturn(ReturnInst &RI) {
     if (!Ret)
         return false;
     auto *IT = dyn_cast<IntegerType>(Ret->getType());
-    return IT && IT->getBitWidth() >= 8;
+    return IT && IT->getBitWidth() > 0;
 }
 
 std::vector<ReturnInst *> collectReturns(Function &F) {

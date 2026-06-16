@@ -41,7 +41,7 @@ bool eligiblePhi(const PHINode &PN) {
     auto *Ty = dyn_cast<IntegerType>(PN.getType());
     if (!Ty)
         return false;
-    if (Ty->getBitWidth() < 8 || isPassGenerated(&PN))
+    if (Ty->getBitWidth() == 0 || isPassGenerated(&PN))
         return false;
     if (PN.getNumIncomingValues() < 2)
         return false;

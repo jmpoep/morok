@@ -52,8 +52,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 ## Constant encryption — `core/XorShare`, `core/Feistel`
 - Pipeline: `origC ─[Feistel if feistel && bits>=16]→ workC ─[k-share XOR or single XOR]→ shares`.
   Runtime reverses: XOR-fold shares → workC → inverse Feistel → origC.
-- k-share when `k>=3` (k clamp 2..8), else classic single-XOR (i1/i8/i16/i32/i64 only).
-  Shares: private non-const GVs `constenc.share`, in `llvm.compiler.used`.
+- k-share when `k>=3` (k clamp 2..8), else classic single-XOR for selected
+  `i1` through `i64` integer constants.  Shares: private non-const
+  `morok.share` globals loaded volatilely at each rewritten use.
 - Feistel: balanced, 4 rounds, per-round odd multiplier + xor key (random, masked to
   half width). `feistelEncrypt/Decrypt(value, bits, keys)`.
 - Flags: `constenc_times` 1, `constenc_kshare` 2, `constenc_feistel` off,
@@ -220,19 +221,25 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Runtime shape: `ptr -> ptrtoint -> xor volatile-key -> xor same-key ->
   inttoptr -> gep i8, computed-zero`.  The value is unchanged, but LLVM AA and
   downstream type recovery must cross an explicit integer/pointer boundary.
-- Integer SSA values with byte-sized scalar widths are laundered as
-  `iN -> <N/8 x i8> -> shufflevector identity -> iN`, giving decompilers a
-  conflicting byte-vector view of scalar values without changing bits.
+- Integer SSA values from `i1` through `i1024` are laundered through a
+  byte-vector view.  Byte-multiple widths use
+  `iN -> <N/8 x i8> -> shufflevector identity -> iN`; sub-byte and odd widths
+  first zero-extend to the smallest covering byte width, then truncate back
+  after the identity shuffle.  The extra high bits are never observed, while
+  decompilers still have to reconcile the conflicting scalar/vector views.
 - Direct memory caps: each invocation launders at most 128 pointer operands and
   at most 128 integer SSA values.
 
 ## Type punning — IR structure
-- Eligible scalar-producing instructions (`iN`, `half`, `bfloat`, `float`,
-  `double`) are stored into a local `alloca [N x i8]` union buffer with a
-  volatile typed store, then reloaded volatilely through a conflicting view.
-- Integer scalars reload as `<N x i8>` byte vectors and bitcast back; floating
-  scalars reload as same-width integers and bitcast back.  The bit pattern is
-  unchanged while the IR exposes contradictory scalar/vector/integer views.
+- Eligible scalar-producing instructions (`i1` through `i1024`, `half`,
+  `bfloat`, `float`, `double`) are stored into a local store-size
+  `alloca [N x i8]` union buffer with a volatile typed store, then reloaded
+  volatilely through a conflicting view.
+- Byte-multiple integer scalars reload as `<N x i8>` byte vectors and bitcast
+  back.  Non-byte-multiple integers are zero-extended to the covering byte-sized
+  integer, reloaded, and truncated back to the exact source width.  Floating
+  scalars reload as same-width integers and bitcast back.  The value/bit pattern
+  is unchanged while the IR exposes contradictory scalar/vector/integer views.
 - `max_targets` caps per-function punning after a per-build shuffle.  This is
   the same guardrail class as substitution/MBA throttles: high-value type noise
   without unbounded compile-time growth after MBA/substitution expansion.
@@ -240,10 +247,10 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   can be folded into the single opaque frame and then pointer-laundered.
 
 ## PHI tangling — IR structure
-- Eligible values are integer PHIs with at least two normal predecessor edges.
-  EH pads, landing pads, invoke predecessors, and generated Morok PHIs are
-  skipped so the inserted edge copies have legal placement and do not reprocess
-  the pass's own scaffolding.
+- Eligible values are integer PHIs of any bit width with at least two normal
+  predecessor edges.  EH pads, landing pads, invoke predecessors, and generated
+  Morok PHIs are skipped so the inserted edge copies have legal placement and
+  do not reprocess the pass's own scaffolding.
 - For each selected PHI incoming edge, the pass materializes an edge-local copy
   `x ^ k ^ k`.  It then builds a copied edge PHI and a direct PHI over the same
   incoming values, xors those together to form a zero cross-term, and xors that
@@ -298,10 +305,10 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   alias-invariant predicates before later CFG passes absorb the extra edges.
 
 ## Coherent decoy dead paths — IR structure
-- The pass selects integer-return blocks, splits the return into a real return
-  block and a `morok.decoy.alt` false arm, then guards the real path with an
-  opaque-true predicate from two volatile loads of private global
-  `morok.decoy.opaque`.
+- The pass selects integer-return blocks of any bit width, splits the return
+  into a real return block and a `morok.decoy.alt` false arm, then guards the
+  real path with an opaque-true predicate from two volatile loads of private
+  global `morok.decoy.opaque`.
 - The false arm does not rejoin and does not contain arbitrary junk.  It returns
   a type-correct alternate value computed from the real return value, integer
   function arguments, and live integer values visible at the split point.  The
@@ -354,14 +361,15 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   without wrapping later indirect-branch or helper scaffolding.
 
 ## Table arithmetic — IR structure
-- Eligible operations are wrapping scalar `i8` `add/sub/mul/and/or/xor` binary
-  operators.  `nuw`/`nsw` arithmetic is skipped because replacing a potentially
-  poison-producing operation with a total table load would change LLVM
-  semantics.
+- Eligible operations are wrapping scalar `i1` through `i8`
+  `add/sub/mul/and/or/xor` binary operators.  `nuw`/`nsw` arithmetic is skipped
+  because replacing a potentially poison-producing operation with a total table
+  load would change LLVM semantics.
 - Each selected operator gets a private mutable `[65536 x i8]` table indexed as
-  `(zext(lhs) << 8) | zext(rhs)`.  The table initializer is encrypted with a
-  per-table affine/xor byte stream, so the module does not contain the plaintext
-  opcode truth table.
+  `(zext(lhs) << 8) | zext(rhs)`.  Sub-byte operands are zero-extended for the
+  lookup and the decoded byte is truncated back to the source width.  The table
+  initializer is encrypted with a per-table affine/xor byte stream, so the
+  module does not contain the plaintext opcode truth table.
 - A private `morok.tablearith.ensure` decoder materializes the table lazily on
   first use.  It loops over the table, decrypts in place, and sets a volatile
   readiness flag.  Function bodies call the decoder, compute the byte-pair
@@ -375,10 +383,10 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - This is the IR-level half of the roadmap's IR/MIR item.  It deliberately
   avoids target-specific MOV-only lowering, but pushes visible intent toward a
   small set of uniform primitives: table loads, GEPs, `select`, and `indirectbr`.
-- Selected byte-width `add/sub/mul/and/or/xor` operations reuse the encrypted
-  lazy table materialization from TableArithmetic, governed by `op_probability`
-  and `max_tables`.  This removes opcode intent from the function body while
-  keeping plaintext truth tables out of static initializers.
+- Selected narrow `i1` through `i8` `add/sub/mul/and/or/xor` operations reuse
+  the encrypted lazy table materialization from TableArithmetic, governed by
+  `op_probability` and `max_tables`.  This removes opcode intent from the
+  function body while keeping plaintext truth tables out of static initializers.
 - Selected direct branches and switches are collected up to `max_branches` with
   a hard ceiling of 16 branch sites and 32 successors per site, then lowered to
   a private per-function `morok.uniform.table` of `blockaddress` entries.
@@ -394,9 +402,12 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Virtualization — threaded bytecode VM
 - Selected functions are lifted only when the pass can prove a strict
-  straight-line integer subset: same-width integer arguments/return, one basic
-  block, no calls or memory, and unflagged modular arithmetic/bitwise/constant
-  shifts.  Unsupported IR is left untouched rather than approximated.
+  straight-line integer subset: 1- to 64-bit same-width integer arguments/return, one basic
+  block, no calls or memory, unflagged modular arithmetic/bitwise/constant
+  shifts, integer comparisons, and zero-extension of narrower integer results
+  such as `icmp` booleans.  Branchless `select` over a one-bit condition and
+  same-width integer values is also supported.  Unsupported IR is left untouched
+  rather than approximated.
 - The lifted function becomes a native wrapper that calls an internal
   `morok.vm.<function>.exec` helper.  The original computation is encoded as a
   private `morok.vm.bytecode.*` byte array; bytecode fields are first randomized
@@ -451,7 +462,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   runtime/data-flow contract over private `morok.sc.region.*` byte regions and
   `morok.sc.expected.*` hash globals; a post-link rewriter can replace those
   regions and expected hashes with final native code slices.
-- Each selected integer constant is reconstructed as
+- Each selected `i1` through `i64` integer constant is reconstructed as
   `encoded ^ volatile_mask ^ (runtime_hash(region) ^ expected_hash)`.  When the
   region matches the expected hash, the diff is zero and the original constant
   appears.  If bytes change without updating the expected hash, the diff flows
@@ -474,16 +485,17 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Data-flow-entangled integrity — IR structure
 - The pass generalizes checksum-fused constants from scalars to live lookup
-  tables.  Selected `i8 a OP b` operations are replaced by volatile loads from
-  private `morok.dfi.table.*` globals.
+  tables.  Selected `i1` through `i8` `a OP b` operations are replaced by
+  volatile loads from private `morok.dfi.table.*` globals.
 - Table entries are encoded with a stream key derived from the expected hash of
   a private `morok.dfi.region.*` byte region.  The runtime helper
   `morok.dfi.hash.*` hashes that region with volatile loads, volatile-loads
   `morok.dfi.expected.*`, and returns `actual_hash ^ expected_hash`.
 - Each lookup derives its decode seed as `expected_hash_const ^ runtime_diff`.
   On the valid region the diff is zero and the loaded table byte decodes to the
-  original operation result.  Region or expected-hash tampering changes the key
-  and corrupts the value in data flow.
+  original operation result.  Sub-byte operands are zero-extended for the table
+  index and the decoded byte is truncated back to the source width.  Region or
+  expected-hash tampering changes the key and corrupts the value in data flow.
 - The table stays encoded at rest; unlike generic TableArithmetic, there is no
   lazy plaintext materialization pass.  There is also no trap or integrity
   branch, only data poisoning.
@@ -491,8 +503,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   function, so standalone runs cannot emit one integrity table per eligible
   byte op in a huge function.
 - Scheduler placement is before generic TableArithmetic, so this pass claims a
-  configurable subset of byte operations for integrity-bound tables and leaves
-  the remaining byte ops to ordinary encrypted table lowering.
+  configurable subset of narrow operations for integrity-bound tables and
+  leaves the remaining narrow ops to ordinary encrypted table lowering.
 
 ## Mutual guard graph — IR structure
 - True overlapping code-byte checkers need post-link ranges.  The IR pass emits
@@ -524,10 +536,10 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   and Lagrange reconstruction at zero.  Tests cover a fixed reference vector,
   every 3-of-5 subset for all 256 byte secrets, invalid-parameter clamps, and
   constexpr reconstruction.
-- The pass targets safe `i8`/`i16`/`i32`/`i64` constant operands of integer
-  binary ops and `icmp`, then caps selected secrets by `max_secrets` after the
-  per-operand probability gate.  Wider literals are split bytewise and
-  recomposed little-endian.
+- The pass targets safe `i1` through `i64` constant operands of integer binary
+  ops and `icmp`, then caps selected secrets by `max_secrets` after the
+  per-operand probability gate.  Values are split into the covering little-endian
+  bytes and truncated back to the exact source width after reconstruction.
 - Current IR is dominator-deposited fixed-quorum reconstruction: each byte
   secret is split into `n` build-time shares, the first `k` shares are loaded
   volatilely from private mutable `morok.shamir.share.*` globals in the entry
@@ -630,9 +642,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Vector obfuscation — IR structure
 - Eligible scalar integer binary ops are lifted to `<N x iM>` operations, where
-  `N = width / M` for configured widths 128, 256, or 512 bits.  Lane `realLane`
-  holds the original operands and all other lanes are per-build junk constants,
-  so per-lane vector semantics preserve the scalar value.
+  `N = floor(width / M)` for configured widths 128, 256, or 512 bits.  Lane
+  `realLane` holds the original operands and all other lanes are per-build junk
+  constants, so per-lane vector semantics preserve the scalar value.
 - With `shuffle=false`, the pass extracts `realLane` directly.  With
   `shuffle=true`, `shufflevector` first moves `realLane` to lane 0 and fills the
   rest of the result with randomized lane references before extraction.  This
@@ -641,8 +653,12 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - With `lift_comparisons=true`, scalar integer `icmp` instructions are lifted in
   the same way and extracted back to `i1`.  This lets select/branch conditions
   acquire vector provenance without changing control semantics.
-- Direct memory caps: each invocation lifts at most 128 binary operators and at
-  most 128 compares.
+- Scalar integer `select i1 cond, iM t, iM f` instructions lift the true/false
+  values into junk-filled vectors, perform a scalar-conditioned vector select,
+  then extract the original lane.  The condition remains scalar, but the chosen
+  value inherits SIMD provenance.
+- Direct memory caps: each invocation lifts at most 128 binary operators, at
+  most 128 compares, and at most 128 selects.
 - The scheduler runs this after table arithmetic and before path explosion:
   arithmetic and dispatcher values can be lifted, while later indirectbr-heavy
   anti-DSE regions are left intact.
@@ -799,12 +815,12 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - IR-stage post-link contracts are emitted as retained `morok.postlink.*`
   manifests rather than implicit placeholder globals; downstream patchers should
   consume those records and update the referenced region/expected globals.
-- The high preset intentionally leaves VM lifting, hash self-decrypt, late
-  self-check/DFI/mutual-guard integrity, MQ, MicrocodeStress,
-  AdversarialSelfTuning, AdversarialFunctionMerging, and FunctionWrapper
-  disabled by default.  They remain available through explicit config or
-  standalone pass names, with their own local caps where they clone or generate
-  dense IR.
+- The high preset is bounded-aggressive by default: it enables small capped
+  slices of VM lifting/hash self-decrypt, self-check constants, DFI, MQ,
+  MicrocodeStress, and FunctionWrapper while keeping MutualGuardGraph,
+  AdversarialSelfTuning, and AdversarialFunctionMerging disabled unless
+  explicitly configured.  The enabled heavyweight slices use local caps before
+  they can clone or generate dense IR.
 
 ## Scheduler order (to preserve semantics)
 AntiHook → AntiClassDump → FCO(fn) → AntiDebug → StringEnc → Virtualization → HashSelfDecrypt → per-fn{ Split, BCF, OptAmp, Sub,

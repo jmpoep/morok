@@ -37,7 +37,7 @@ namespace {
 using Builder = IRBuilder<NoFolder>;
 
 bool eligibleWidth(unsigned Bits) {
-    return Bits == 8 || Bits == 16 || Bits == 32 || Bits == 64;
+    return Bits >= 1 && Bits <= 64;
 }
 
 bool isRewritableUser(const Instruction &I) {
@@ -172,7 +172,9 @@ Value *reconstructInteger(Module &M, Instruction &User, ConstantInt *C,
                           ir::IRRandom &Rng) {
     auto *Ty = cast<IntegerType>(C->getType());
     const unsigned Bits = Ty->getBitWidth();
-    const unsigned Bytes = Bits / 8;
+    const unsigned Bytes = (Bits + 7u) / 8u;
+    auto *WorkTy = Bytes == 1 ? Type::getInt8Ty(M.getContext())
+                              : IntegerType::get(M.getContext(), Bytes * 8u);
     const std::uint64_t Raw = C->getZExtValue();
 
     Builder B(&User);
@@ -184,15 +186,19 @@ Value *reconstructInteger(Module &M, Instruction &User, ConstantInt *C,
         Value *Part8 =
             reconstructByte(*User.getFunction(), M, B, Gf8Mul, Secret,
                             Threshold, Shares, Rng);
-        Value *Part = Bits == 8 ? Part8
-                                : B.CreateZExt(Part8, Ty,
-                                               "morok.shamir.value.byte");
+        Value *Part = Bytes == 1 ? Part8
+                                 : B.CreateZExt(Part8, WorkTy,
+                                                "morok.shamir.value.byte");
         if (Byte != 0)
-            Part = B.CreateShl(Part, ConstantInt::get(Ty, Byte * 8u),
+            Part = B.CreateShl(Part, ConstantInt::get(WorkTy, Byte * 8u),
                                "morok.shamir.value.shift");
         Wide = Wide ? B.CreateOr(Wide, Part, "morok.shamir.value") : Part;
     }
-    return Wide ? Wide : C;
+    if (!Wide)
+        return C;
+    if (Wide->getType() == Ty)
+        return Wide;
+    return B.CreateTrunc(Wide, Ty, "morok.shamir.value.trunc");
 }
 
 } // namespace

@@ -19,7 +19,7 @@ std::uint64_t widthMask(unsigned bits) {
 
 TEST_CASE("xor shares reconstruct the original value for k in [2,8]") {
     auto g = Xoshiro256pp::fromSeed(0x5A4E);
-    for (unsigned bits : {8u, 16u, 32u, 64u}) {
+    for (unsigned bits : {1u, 4u, 8u, 12u, 16u, 32u, 63u, 64u}) {
         const std::uint64_t m = widthMask(bits);
         for (std::size_t k = 2; k <= 8; ++k)
             for (int i = 0; i < 2000; ++i) {

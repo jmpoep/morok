@@ -5,7 +5,7 @@
 // morok/passes/TypePunning.cpp
 //
 // Type-punning chains: value V is stored into a local byte-array "union" and
-// loaded through a conflicting type view before being bitcast back to V's type.
+// loaded through a conflicting type view before being restored to V's type.
 // Volatile memory operations keep the punning surface visible to the optimizer
 // and to decompiler type recovery.
 
@@ -54,7 +54,7 @@ bool isPassGenerated(const Value *V) {
 bool eligibleType(Type *Ty, const TypePunParams &params) {
     if (auto *IT = dyn_cast<IntegerType>(Ty)) {
         const unsigned bits = IT->getBitWidth();
-        return bits >= 8 && bits <= 1024 && bits % 8 == 0;
+        return bits >= 1 && bits <= 1024;
     }
     if (!params.include_floating)
         return false;
@@ -93,10 +93,18 @@ Type *integerViewType(LLVMContext &Ctx, std::uint64_t bytes) {
 
 Type *alternateLoadType(Type *OriginalTy, std::uint64_t bytes) {
     LLVMContext &Ctx = OriginalTy->getContext();
-    if (OriginalTy->isIntegerTy())
+    if (auto *IT = dyn_cast<IntegerType>(OriginalTy)) {
+        if (IT->getBitWidth() % 8u != 0)
+            return integerViewType(Ctx, bytes);
         return FixedVectorType::get(Type::getInt8Ty(Ctx),
                                     static_cast<unsigned>(bytes));
+    }
     return integerViewType(Ctx, bytes);
+}
+
+bool needsCoveringInteger(Type *Ty) {
+    auto *IT = dyn_cast<IntegerType>(Ty);
+    return IT && IT->getBitWidth() % 8u != 0;
 }
 
 AllocaInst *createPunBuffer(Function &F, const Target &target) {
@@ -116,18 +124,27 @@ PunResult createPunChain(Function &F, const Target &target) {
     Type *altTy = alternateLoadType(Ty, target.bytes);
 
     IRBuilder<NoFolder> B(I.getNextNode());
-    auto *store = B.CreateStore(&I, buffer, /*isVolatile=*/true);
+    Value *Stored = &I;
+    if (needsCoveringInteger(Ty))
+        Stored = B.CreateZExt(&I, altTy, "morok.pun.widen");
+
+    auto *store = B.CreateStore(Stored, buffer, /*isVolatile=*/true);
     store->setAlignment(target.align);
 
     auto *loaded =
         B.CreateLoad(altTy, buffer, /*isVolatile=*/true, "morok.pun.view");
     loaded->setAlignment(target.align);
 
-    Value *replacement = B.CreateBitCast(loaded, Ty, "morok.pun.value");
+    Value *replacement = needsCoveringInteger(Ty)
+                             ? B.CreateTrunc(loaded, Ty, "morok.pun.value")
+                             : B.CreateBitCast(loaded, Ty, "morok.pun.value");
 
     PunResult result;
     result.replacement = replacement;
     result.generated.push_back(buffer);
+    if (Stored != &I)
+        if (auto *Widen = dyn_cast<Instruction>(Stored))
+            result.generated.push_back(Widen);
     result.generated.push_back(store);
     result.generated.push_back(loaded);
     result.generated.push_back(cast<Instruction>(replacement));

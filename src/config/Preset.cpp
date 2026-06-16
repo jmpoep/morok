@@ -552,43 +552,43 @@ PassConfig makeHigh() {
     c.interprocedural_fsm.max_terms = 5;
 
     c.opt_amplify.enabled = true;
-    c.opt_amplify.probability = 20;
+    c.opt_amplify.probability = 30;
     c.opt_amplify.max_forms = 2;
 
     c.table_arith.enabled = true;
-    c.table_arith.probability = 35;
-    c.table_arith.max_tables = 4;
+    c.table_arith.probability = 50;
+    c.table_arith.max_tables = 6;
 
     c.sub_threshold.enabled = true;
-    c.sub_threshold.probability = 15;
-    c.sub_threshold.max_terms = 1;
+    c.sub_threshold.probability = 25;
+    c.sub_threshold.max_terms = 2;
 
     c.uniform_lower.enabled = true;
-    c.uniform_lower.op_probability = 15;
-    c.uniform_lower.branch_probability = 10;
-    c.uniform_lower.max_tables = 2;
-    c.uniform_lower.max_branches = 1;
+    c.uniform_lower.op_probability = 25;
+    c.uniform_lower.branch_probability = 25;
+    c.uniform_lower.max_tables = 3;
+    c.uniform_lower.max_branches = 3;
 
-    c.virtualization.enabled = false;
-    c.virtualization.probability = 0;
-    c.virtualization.max_functions = 0;
-    c.virtualization.max_instructions = 0;
-    c.virtualization.max_registers = 0;
+    c.virtualization.enabled = true;
+    c.virtualization.probability = 25;
+    c.virtualization.max_functions = 1;
+    c.virtualization.max_instructions = 48;
+    c.virtualization.max_registers = 48;
 
-    c.hash_self_decrypt.enabled = false;
-    c.hash_self_decrypt.probability = 0;
-    c.hash_self_decrypt.max_payloads = 0;
-    c.hash_self_decrypt.context_keying = false;
+    c.hash_self_decrypt.enabled = true;
+    c.hash_self_decrypt.probability = 100;
+    c.hash_self_decrypt.max_payloads = 1;
+    c.hash_self_decrypt.context_keying = true;
 
-    c.self_checksum.enabled = false;
-    c.self_checksum.probability = 0;
-    c.self_checksum.max_constants = 0;
-    c.self_checksum.region_bytes = 0;
+    c.self_checksum.enabled = true;
+    c.self_checksum.probability = 20;
+    c.self_checksum.max_constants = 4;
+    c.self_checksum.region_bytes = 16;
 
-    c.data_flow_integrity.enabled = false;
-    c.data_flow_integrity.probability = 0;
-    c.data_flow_integrity.max_tables = 0;
-    c.data_flow_integrity.region_bytes = 0;
+    c.data_flow_integrity.enabled = true;
+    c.data_flow_integrity.probability = 25;
+    c.data_flow_integrity.max_tables = 1;
+    c.data_flow_integrity.region_bytes = 16;
 
     c.mutual_guard.enabled = false;
     c.mutual_guard.probability = 0;
@@ -597,18 +597,18 @@ PassConfig makeHigh() {
     c.mutual_guard.max_returns = 0;
 
     c.shamir_share.enabled = true;
-    c.shamir_share.probability = 30;
+    c.shamir_share.probability = 40;
     c.shamir_share.threshold = 3;
     c.shamir_share.shares = 5;
-    c.shamir_share.max_secrets = 8;
+    c.shamir_share.max_secrets = 12;
 
-    c.mq_gate.enabled = false;
-    c.mq_gate.probability = 0;
-    c.mq_gate.vars = 0;
-    c.mq_gate.eqs = 0;
-    c.mq_gate.density = 0;
-    c.mq_gate.max_gates = 0;
-    c.mq_gate.fold_diff = false;
+    c.mq_gate.enabled = true;
+    c.mq_gate.probability = 15;
+    c.mq_gate.vars = 16;
+    c.mq_gate.eqs = 16;
+    c.mq_gate.density = 35;
+    c.mq_gate.max_gates = 1;
+    c.mq_gate.fold_diff = true;
 
     c.adversarial_merge.enabled = false;
     c.adversarial_merge.probability = 0;
@@ -626,32 +626,32 @@ PassConfig makeHigh() {
     c.per_build_polymorphism.enabled = true;
     c.per_build_polymorphism.function_order = true;
     c.per_build_polymorphism.block_order = true;
-    c.per_build_polymorphism.anchor_probability = 25;
-    c.per_build_polymorphism.max_anchors = 16;
+    c.per_build_polymorphism.anchor_probability = 35;
+    c.per_build_polymorphism.max_anchors = 24;
 
     c.path_explosion.enabled = true;
-    c.path_explosion.probability = 15;
-    c.path_explosion.max_blocks = 2;
-    c.path_explosion.max_iterations = 8;
+    c.path_explosion.probability = 25;
+    c.path_explosion.max_blocks = 3;
+    c.path_explosion.max_iterations = 12;
 
     c.trace_keying.enabled = true;
-    c.trace_keying.probability = 10;
-    c.trace_keying.max_blocks = 2;
+    c.trace_keying.probability = 20;
+    c.trace_keying.max_blocks = 4;
 
     c.dispatcherless.enabled = true;
-    c.dispatcherless.probability = 35;
-    c.dispatcherless.max_routes = 8;
-    c.dispatcherless.max_terms = 3;
+    c.dispatcherless.probability = 50;
+    c.dispatcherless.max_routes = 12;
+    c.dispatcherless.max_terms = 4;
 
-    c.microcode_stress.enabled = false;
-    c.microcode_stress.probability = 0;
-    c.microcode_stress.max_sites = 0;
-    c.microcode_stress.table_entries = 0;
-    c.microcode_stress.decoy_blocks = 0;
-    c.microcode_stress.alias_stores = 0;
+    c.microcode_stress.enabled = true;
+    c.microcode_stress.probability = 15;
+    c.microcode_stress.max_sites = 1;
+    c.microcode_stress.table_entries = 16;
+    c.microcode_stress.decoy_blocks = 4;
+    c.microcode_stress.alias_stores = 1;
 
     c.vec.enabled = true;
-    c.vec.probability = 65;
+    c.vec.probability = 75;
     c.vec.width = 256;
     c.vec.shuffle = true;
     c.vec.lift_comparisons = true;
@@ -665,9 +665,9 @@ PassConfig makeHigh() {
 
     c.indir_branch.enabled = true;
 
-    c.func_wrap.enabled = false;
-    c.func_wrap.probability = 0;
-    c.func_wrap.times = 0;
+    c.func_wrap.enabled = true;
+    c.func_wrap.probability = 20;
+    c.func_wrap.times = 1;
 
     c.fco.enabled = true;
 

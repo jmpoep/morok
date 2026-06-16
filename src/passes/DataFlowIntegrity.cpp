@@ -4,7 +4,7 @@
 //
 // morok/passes/DataFlowIntegrity.cpp
 //
-// Data-flow-entangled integrity.  Selected `i8 a OP b` operations become
+// Data-flow-entangled integrity.  Selected `i1..i8 a OP b` operations become
 // volatile loads from encoded lookup tables.  The decode key is derived from a
 // runtime hash of a private byte region plus the expected hash; if the region
 // or expected value changes, the operation result is corrupted as data rather
@@ -77,7 +77,7 @@ bool supportedOpcode(unsigned Opcode) {
 
 bool eligible(BinaryOperator &BO) {
     auto *Ty = dyn_cast<IntegerType>(BO.getType());
-    if (!Ty || Ty->getBitWidth() != 8)
+    if (!Ty || Ty->getBitWidth() == 0 || Ty->getBitWidth() > 8)
         return false;
     if (!supportedOpcode(BO.getOpcode()))
         return false;
@@ -89,23 +89,40 @@ bool eligible(BinaryOperator &BO) {
     return true;
 }
 
-std::uint8_t eval(unsigned Opcode, std::uint8_t Lhs, std::uint8_t Rhs) {
+std::uint8_t bitMask(unsigned Width) {
+    return Width >= 8 ? 0xFFu
+                      : static_cast<std::uint8_t>((1u << Width) - 1u);
+}
+
+std::uint8_t eval(unsigned Opcode, std::uint8_t Lhs, std::uint8_t Rhs,
+                  unsigned Width) {
+    const std::uint8_t Mask = bitMask(Width);
+    Lhs &= Mask;
+    Rhs &= Mask;
+    std::uint8_t Result = 0;
     switch (Opcode) {
     case Instruction::Add:
-        return static_cast<std::uint8_t>(Lhs + Rhs);
+        Result = static_cast<std::uint8_t>(Lhs + Rhs);
+        break;
     case Instruction::Sub:
-        return static_cast<std::uint8_t>(Lhs - Rhs);
+        Result = static_cast<std::uint8_t>(Lhs - Rhs);
+        break;
     case Instruction::Mul:
-        return static_cast<std::uint8_t>(Lhs * Rhs);
+        Result = static_cast<std::uint8_t>(Lhs * Rhs);
+        break;
     case Instruction::And:
-        return static_cast<std::uint8_t>(Lhs & Rhs);
+        Result = static_cast<std::uint8_t>(Lhs & Rhs);
+        break;
     case Instruction::Or:
-        return static_cast<std::uint8_t>(Lhs | Rhs);
+        Result = static_cast<std::uint8_t>(Lhs | Rhs);
+        break;
     case Instruction::Xor:
-        return static_cast<std::uint8_t>(Lhs ^ Rhs);
+        Result = static_cast<std::uint8_t>(Lhs ^ Rhs);
+        break;
     default:
-        return 0;
+        break;
     }
+    return static_cast<std::uint8_t>(Result & Mask);
 }
 
 std::uint64_t hashStep(std::uint64_t H, std::uint8_t B) {
@@ -317,7 +334,7 @@ KeySchedule makeKey(Runtime &R, ir::IRRandom &Rng) {
 }
 
 GlobalVariable *createTable(Module &M, Function &F, unsigned Opcode,
-                            const KeySchedule &Key) {
+                            unsigned BitWidth, const KeySchedule &Key) {
     LLVMContext &Ctx = M.getContext();
     auto *I8 = Type::getInt8Ty(Ctx);
     auto *TableTy = ArrayType::get(I8, kTableSize);
@@ -326,7 +343,8 @@ GlobalVariable *createTable(Module &M, Function &F, unsigned Opcode,
     for (std::uint32_t Idx = 0; Idx < kTableSize; ++Idx) {
         const auto Lhs = static_cast<std::uint8_t>(Idx >> 8);
         const auto Rhs = static_cast<std::uint8_t>(Idx & 0xFFu);
-        Enc[Idx] = eval(Opcode, Lhs, Rhs) ^ keyAt(Idx, Key.expected_hash, Key);
+        Enc[Idx] = eval(Opcode, Lhs, Rhs, BitWidth) ^
+                   keyAt(Idx, Key.expected_hash, Key);
     }
 
     auto *Table = new GlobalVariable(
@@ -340,8 +358,10 @@ GlobalVariable *createTable(Module &M, Function &F, unsigned Opcode,
 
 Value *emitLookup(Module &M, Function &F, Runtime &R, BinaryOperator &BO,
                   ir::IRRandom &Rng) {
+    auto *SourceTy = cast<IntegerType>(BO.getType());
+    const unsigned BitWidth = SourceTy->getBitWidth();
     KeySchedule Key = makeKey(R, Rng);
-    GlobalVariable *Table = createTable(M, F, BO.getOpcode(), Key);
+    GlobalVariable *Table = createTable(M, F, BO.getOpcode(), BitWidth, Key);
 
     Builder B(&BO);
     auto *I8 = B.getInt8Ty();
@@ -354,8 +374,14 @@ Value *emitLookup(Module &M, Function &F, Runtime &R, BinaryOperator &BO,
                               "morok.dfi.hash.call");
     Value *Seed = B.CreateXor(Diff, ConstantInt::get(I64, Key.expected_hash),
                               "morok.dfi.seed");
-    Value *L = B.CreateZExt(BO.getOperand(0), I16, "morok.dfi.lhs");
-    Value *Rhs = B.CreateZExt(BO.getOperand(1), I16, "morok.dfi.rhs");
+    Value *L8 = BitWidth == 8 ? BO.getOperand(0)
+                              : B.CreateZExt(BO.getOperand(0), I8,
+                                             "morok.dfi.lhs8");
+    Value *R8 = BitWidth == 8 ? BO.getOperand(1)
+                              : B.CreateZExt(BO.getOperand(1), I8,
+                                             "morok.dfi.rhs8");
+    Value *L = B.CreateZExt(L8, I16, "morok.dfi.lhs");
+    Value *Rhs = B.CreateZExt(R8, I16, "morok.dfi.rhs");
     Value *Hi = B.CreateShl(L, ConstantInt::get(I16, 8), "morok.dfi.hi");
     Value *Idx16 = B.CreateOr(Hi, Rhs, "morok.dfi.idx16");
     Value *Idx = B.CreateZExt(Idx16, I32, "morok.dfi.idx");
@@ -365,7 +391,10 @@ Value *emitLookup(Module &M, Function &F, Runtime &R, BinaryOperator &BO,
     Encoded->setVolatile(true);
     Encoded->setAlignment(Align(1));
     Value *KeyByte = emitKey(B, Idx, Seed, Key);
-    return B.CreateXor(Encoded, KeyByte, "morok.dfi.value");
+    Value *Value = B.CreateXor(Encoded, KeyByte, "morok.dfi.value");
+    if (BitWidth == 8)
+        return Value;
+    return B.CreateTrunc(Value, SourceTy, "morok.dfi.trunc");
 }
 
 } // namespace

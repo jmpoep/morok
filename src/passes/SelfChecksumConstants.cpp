@@ -60,7 +60,7 @@ bool generatedFunction(const Function &F) {
 }
 
 bool eligibleWidth(unsigned Bits) {
-    return Bits == 8 || Bits == 16 || Bits == 32 || Bits == 64;
+    return Bits >= 1 && Bits <= 64;
 }
 
 std::uint64_t widthMask(unsigned Bits) {

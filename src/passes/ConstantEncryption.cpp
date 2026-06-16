@@ -34,9 +34,8 @@ namespace {
 
 constexpr std::size_t kMaxConstEncTargetsPerIteration = 128;
 
-// Width must be one we can round-trip through the 64-bit share representation.
 bool eligibleWidth(unsigned bits) {
-    return bits == 8 || bits == 16 || bits == 32 || bits == 64;
+    return bits >= 1 && bits <= 64;
 }
 
 // Only the operands of these instructions are safe to turn into runtime values.

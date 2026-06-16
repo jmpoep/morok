@@ -4,9 +4,10 @@
 //
 // morok/passes/VectorObfuscation.cpp
 //
-// a OP b  becomes  extractelement(shuffle(<a,j...> OP <b,j...>), 0).  Per-lane
-// vector semantics keep the chosen real lane exactly equal to the scalar op;
-// the surrounding vector lanes and optional shuffle create a SIMD surface for
+// a OP b  becomes  extractelement(shuffle(<a,j...> OP <b,j...>), 0), and
+// integer selects get the same true/false vector treatment.  Per-lane vector
+// semantics keep the chosen real lane exactly equal to the scalar op; the
+// surrounding vector lanes and optional shuffle create a SIMD surface for
 // decompilers.
 
 #include "morok/passes/VectorObfuscation.hpp"
@@ -29,6 +30,7 @@ namespace {
 
 constexpr std::size_t kMaxVectorLiftTargets = 128;
 constexpr std::size_t kMaxVectorCompareTargets = 128;
+constexpr std::size_t kMaxVectorSelectTargets = 128;
 
 bool liftable(BinaryOperator *bo) {
     auto *ty = dyn_cast<IntegerType>(bo->getType());
@@ -53,6 +55,11 @@ bool liftable(BinaryOperator *bo) {
 bool liftableCompare(ICmpInst *cmp) {
     return cmp->getOperand(0)->getType()->isIntegerTy() &&
            cmp->getOperand(1)->getType()->isIntegerTy();
+}
+
+bool liftableSelect(SelectInst *sel) {
+    return sel->getType()->isIntegerTy() &&
+           sel->getCondition()->getType()->isIntegerTy(1);
 }
 
 std::uint32_t laneCount(IntegerType *ty, const VecParams &params) {
@@ -145,12 +152,37 @@ bool liftCompare(ICmpInst *cmp, const VecParams &params, ir::IRRandom &rng) {
     return true;
 }
 
+bool liftSelect(SelectInst *sel, const VecParams &params, ir::IRRandom &rng) {
+    auto *ty = cast<IntegerType>(sel->getType());
+    const std::uint32_t lanes = laneCount(ty, params);
+    if (lanes < 2u)
+        return false;
+
+    auto *vecTy = FixedVectorType::get(ty, lanes);
+    IRBuilder<> B(sel);
+    const std::uint32_t realLane =
+        params.shuffle ? rng.range(lanes) : static_cast<std::uint32_t>(0);
+    Value *vt = buildVector(B, sel->getTrueValue(), vecTy, realLane, rng,
+                            "morok.vec.sel.t");
+    Value *vf = buildVector(B, sel->getFalseValue(), vecTy, realLane, rng,
+                            "morok.vec.sel.f");
+    Value *vsel =
+        B.CreateSelect(sel->getCondition(), vt, vf, "morok.vec.sel");
+    Value *r = extractRealLane(B, vsel, lanes, realLane, params.shuffle, rng,
+                               "morok.vec.sel.value");
+
+    sel->replaceAllUsesWith(r);
+    sel->eraseFromParent();
+    return true;
+}
+
 } // namespace
 
 bool vectorObfuscateFunction(Function &F, const VecParams &params,
                              ir::IRRandom &rng) {
     std::vector<BinaryOperator *> targets;
     std::vector<ICmpInst *> compares;
+    std::vector<SelectInst *> selects;
     for (BasicBlock &bb : F) {
         for (Instruction &inst : bb) {
             if (auto *bo = dyn_cast<BinaryOperator>(&inst))
@@ -162,14 +194,20 @@ bool vectorObfuscateFunction(Function &F, const VecParams &params,
                     if (liftableCompare(cmp))
                         if (compares.size() < kMaxVectorCompareTargets)
                             compares.push_back(cmp);
+            if (auto *sel = dyn_cast<SelectInst>(&inst))
+                if (liftableSelect(sel))
+                    if (selects.size() < kMaxVectorSelectTargets)
+                        selects.push_back(sel);
             if (targets.size() >= kMaxVectorLiftTargets &&
                 (!params.lift_comparisons ||
-                 compares.size() >= kMaxVectorCompareTargets))
+                 compares.size() >= kMaxVectorCompareTargets) &&
+                selects.size() >= kMaxVectorSelectTargets)
                 break;
         }
         if (targets.size() >= kMaxVectorLiftTargets &&
             (!params.lift_comparisons ||
-             compares.size() >= kMaxVectorCompareTargets))
+             compares.size() >= kMaxVectorCompareTargets) &&
+            selects.size() >= kMaxVectorSelectTargets)
             break;
     }
 
@@ -183,6 +221,11 @@ bool vectorObfuscateFunction(Function &F, const VecParams &params,
         if (!rng.chance(params.probability))
             continue;
         changed |= liftCompare(cmp, params, rng);
+    }
+    for (SelectInst *sel : selects) {
+        if (!rng.chance(params.probability))
+            continue;
+        changed |= liftSelect(sel, params, rng);
     }
     return changed;
 }

@@ -1,0 +1,190 @@
+[global]
+preset = "high"
+
+[passes.bcf]
+probability = 100
+iterations = 3
+complexity = 8
+
+[passes.substitution]
+probability = 100
+iterations = 3
+
+[passes.mba]
+probability = 100
+layers = 3
+heuristic = true
+
+[passes.stack_delta_games]
+probability = 100
+max_blocks = 10
+min_bytes = 17
+max_extra_bytes = 96
+touches = 4
+
+[passes.pointer_laundering]
+pointer_probability = 100
+integer_probability = 100
+
+[passes.type_punning]
+probability = 100
+max_targets = 64
+
+[passes.phi_tangling]
+probability = 100
+layers = 3
+max_phis = 48
+
+[passes.alias_opaque_predicates]
+probability = 100
+iterations = 3
+max_blocks = 16
+
+[passes.external_opaque_predicates]
+probability = 100
+max_blocks = 16
+decoy_stores = 3
+
+[passes.coherent_decoys]
+probability = 100
+max_blocks = 12
+depth = 6
+
+[passes.data_entangled_flattening]
+max_terms = 8
+
+[passes.non_invertible_state]
+max_terms = 8
+rounds = 5
+
+[passes.state_opaque_predicates]
+probability = 100
+max_blocks = 48
+max_terms = 8
+
+[passes.interprocedural_fsm]
+probability = 100
+max_sites = 96
+max_terms = 8
+
+[passes.optimizer_amplification]
+probability = 100
+max_forms = 4
+
+[passes.table_arithmetic]
+probability = 100
+max_tables = 12
+
+[passes.sub_threshold_persistence]
+probability = 100
+max_terms = 4
+
+[passes.uniform_primitive_lowering]
+op_probability = 100
+branch_probability = 100
+max_tables = 8
+max_branches = 12
+
+[passes.virtualization]
+probability = 100
+max_functions = 16
+max_instructions = 256
+max_registers = 128
+
+[passes.hash_gated_self_decrypt]
+probability = 100
+max_payloads = 16
+context_keying = true
+
+[passes.self_checksum_constants]
+probability = 100
+max_constants = 12
+region_bytes = 48
+
+[passes.data_flow_integrity]
+probability = 100
+max_tables = 4
+region_bytes = 48
+
+[passes.mutual_guard_graph]
+enabled = true
+probability = 100
+nodes = 3
+region_bytes = 48
+max_returns = 2
+
+[passes.shamir_share]
+probability = 100
+threshold = 3
+shares = 5
+max_secrets = 24
+
+[passes.mq_gate]
+probability = 100
+vars = 24
+eqs = 24
+density = 50
+max_gates = 2
+fold_diff = true
+
+[passes.adversarial_function_merging]
+enabled = true
+probability = 100
+max_groups = 1
+max_functions = 3
+outline_probability = 100
+max_outlines = 4
+
+[passes.adversarial_self_tuning]
+enabled = true
+max_candidates = 2
+max_candidate_passes = 2
+score_floor = 0
+emit_marker = true
+
+[passes.path_explosion]
+probability = 100
+max_blocks = 4
+max_iterations = 16
+
+[passes.execution_trace_keying]
+probability = 100
+max_blocks = 8
+
+[passes.dispatcherless_routing]
+probability = 100
+max_routes = 24
+max_terms = 6
+
+[passes.microcode_stress]
+probability = 100
+max_sites = 3
+table_entries = 32
+decoy_blocks = 8
+alias_stores = 2
+
+[passes.vector_obfuscation]
+probability = 100
+width = 512
+shuffle = true
+lift_comparisons = true
+
+[passes.chaos_state_machine]
+nested_dispatch = true
+warmup = 256
+
+[passes.flattening]
+enabled = true
+
+[passes.function_wrapper]
+probability = 100
+times = 2
+
+[passes.anti_hooking]
+enabled = true
+
+[passes.anti_debugging]
+enabled = true
+
+[passes.anti_class_dump]
+enabled = true

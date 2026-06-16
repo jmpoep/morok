@@ -8,8 +8,8 @@
 // functions are lifted into an encrypted per-function bytecode stream and an
 // internal interpreter helper.  The helper uses threaded computed-goto dispatch
 // (`indirectbr` over a blockaddress table), duplicated arithmetic handlers, and
-// per-byte decryption keyed by the VM PC; the original function becomes a native
-// wrapper that calls into the VM.
+// per-byte decryption keyed by the VM PC; the original function becomes a
+// native wrapper that calls into the VM.
 
 #include "morok/passes/Virtualization.hpp"
 
@@ -57,8 +57,20 @@ enum class VmOp : std::uint8_t {
     Shl,
     LShr,
     AShr,
+    ICmpEQ,
+    ICmpNE,
+    ICmpULT,
+    ICmpULE,
+    ICmpUGT,
+    ICmpUGE,
+    ICmpSLT,
+    ICmpSLE,
+    ICmpSGT,
+    ICmpSGE,
+    Select,
     Const,
     Ret,
+    Count,
 };
 
 struct VmInstr {
@@ -92,12 +104,11 @@ struct HandlerSpec {
 
 struct HandlerLayout {
     std::vector<HandlerSpec> specs;
-    std::array<std::vector<std::uint8_t>, 11> ids;
+    std::array<std::vector<std::uint8_t>, static_cast<std::size_t>(VmOp::Count)>
+        ids;
 };
 
-std::size_t opIndex(VmOp Op) {
-    return static_cast<std::size_t>(Op);
-}
+std::size_t opIndex(VmOp Op) { return static_cast<std::size_t>(Op); }
 
 bool generatedFunction(const Function &F) {
     return F.getName().starts_with("morok.");
@@ -107,9 +118,7 @@ std::uint64_t widthMask(unsigned Width) {
     return Width >= 64 ? ~0ULL : ((1ULL << Width) - 1ULL);
 }
 
-bool supportedWidth(unsigned Width) {
-    return Width >= 8 && Width <= 64;
-}
+bool supportedWidth(unsigned Width) { return Width >= 1 && Width <= 64; }
 
 std::optional<VmOp> binaryOpcode(BinaryOperator &BO, unsigned Width) {
     switch (BO.getOpcode()) {
@@ -154,6 +163,39 @@ std::optional<VmOp> binaryOpcode(BinaryOperator &BO, unsigned Width) {
     return VmOp::AShr;
 }
 
+std::optional<VmOp> icmpOpcode(ICmpInst &Cmp, unsigned Width) {
+    auto *LhsTy = dyn_cast<IntegerType>(Cmp.getOperand(0)->getType());
+    auto *RhsTy = dyn_cast<IntegerType>(Cmp.getOperand(1)->getType());
+    if (!LhsTy || !RhsTy || LhsTy->getBitWidth() != Width ||
+        RhsTy->getBitWidth() != Width)
+        return std::nullopt;
+
+    switch (Cmp.getPredicate()) {
+    case ICmpInst::ICMP_EQ:
+        return VmOp::ICmpEQ;
+    case ICmpInst::ICMP_NE:
+        return VmOp::ICmpNE;
+    case ICmpInst::ICMP_ULT:
+        return VmOp::ICmpULT;
+    case ICmpInst::ICMP_ULE:
+        return VmOp::ICmpULE;
+    case ICmpInst::ICMP_UGT:
+        return VmOp::ICmpUGT;
+    case ICmpInst::ICMP_UGE:
+        return VmOp::ICmpUGE;
+    case ICmpInst::ICMP_SLT:
+        return VmOp::ICmpSLT;
+    case ICmpInst::ICMP_SLE:
+        return VmOp::ICmpSLE;
+    case ICmpInst::ICMP_SGT:
+        return VmOp::ICmpSGT;
+    case ICmpInst::ICMP_SGE:
+        return VmOp::ICmpSGE;
+    default:
+        return std::nullopt;
+    }
+}
+
 std::optional<unsigned> signatureWidth(Function &F) {
     if (F.isDeclaration() || generatedFunction(F) || F.isVarArg() ||
         F.hasPersonalityFn())
@@ -191,9 +233,9 @@ bool appendInstr(Program &P, const VmInstr &Instr,
 }
 
 std::optional<std::uint8_t>
-materializeOperand(Value *V, Program &P, DenseMap<const Value *, std::uint8_t> &Regs,
-                   std::uint32_t &NextReg,
-                   const VirtualizationParams &Params) {
+materializeOperand(Value *V, Program &P,
+                   DenseMap<const Value *, std::uint8_t> &Regs,
+                   std::uint32_t &NextReg, const VirtualizationParams &Params) {
     if (auto It = Regs.find(V); It != Regs.end())
         return It->second;
 
@@ -240,9 +282,28 @@ std::optional<Program> buildProgram(Function &F,
                 return std::nullopt;
             if (!BO->getType()->isIntegerTy(P.width))
                 return std::nullopt;
-            auto L = materializeOperand(BO->getOperand(0), P, Regs, NextReg,
+            auto L =
+                materializeOperand(BO->getOperand(0), P, Regs, NextReg, Params);
+            auto R =
+                materializeOperand(BO->getOperand(1), P, Regs, NextReg, Params);
+            if (!L || !R)
+                return std::nullopt;
+            std::uint8_t Dst = 0;
+            if (!newRegister(NextReg, Params, Dst))
+                return std::nullopt;
+            if (!appendInstr(P, VmInstr{*Op, Dst, *L, *R, 0}, Params))
+                return std::nullopt;
+            Regs[&I] = Dst;
+            continue;
+        }
+
+        if (auto *Cmp = dyn_cast<ICmpInst>(&I)) {
+            auto Op = icmpOpcode(*Cmp, P.width);
+            if (!Op)
+                return std::nullopt;
+            auto L = materializeOperand(Cmp->getOperand(0), P, Regs, NextReg,
                                         Params);
-            auto R = materializeOperand(BO->getOperand(1), P, Regs, NextReg,
+            auto R = materializeOperand(Cmp->getOperand(1), P, Regs, NextReg,
                                         Params);
             if (!L || !R)
                 return std::nullopt;
@@ -255,12 +316,50 @@ std::optional<Program> buildProgram(Function &F,
             continue;
         }
 
+        if (auto *ZExt = dyn_cast<ZExtInst>(&I)) {
+            auto *DstTy = dyn_cast<IntegerType>(ZExt->getType());
+            auto *SrcTy = dyn_cast<IntegerType>(ZExt->getOperand(0)->getType());
+            if (!DstTy || !SrcTy || DstTy->getBitWidth() != P.width ||
+                SrcTy->getBitWidth() > P.width)
+                return std::nullopt;
+            auto R = materializeOperand(ZExt->getOperand(0), P, Regs, NextReg,
+                                        Params);
+            if (!R)
+                return std::nullopt;
+            Regs[&I] = *R;
+            continue;
+        }
+
+        if (auto *SI = dyn_cast<SelectInst>(&I)) {
+            auto *DstTy = dyn_cast<IntegerType>(SI->getType());
+            auto *CondTy = dyn_cast<IntegerType>(SI->getCondition()->getType());
+            if (!DstTy || !CondTy || DstTy->getBitWidth() != P.width ||
+                CondTy->getBitWidth() != 1)
+                return std::nullopt;
+            auto C = materializeOperand(SI->getCondition(), P, Regs, NextReg,
+                                        Params);
+            auto T = materializeOperand(SI->getTrueValue(), P, Regs, NextReg,
+                                        Params);
+            auto FalseReg = materializeOperand(SI->getFalseValue(), P, Regs,
+                                               NextReg, Params);
+            if (!C || !T || !FalseReg)
+                return std::nullopt;
+            std::uint8_t Dst = 0;
+            if (!newRegister(NextReg, Params, Dst))
+                return std::nullopt;
+            if (!appendInstr(P,
+                             VmInstr{VmOp::Select, Dst, *C, *T, *FalseReg},
+                             Params))
+                return std::nullopt;
+            Regs[&I] = Dst;
+            continue;
+        }
+
         if (auto *RI = dyn_cast<ReturnInst>(&I)) {
             if (SawReturn || !RI->getReturnValue())
                 return std::nullopt;
-            auto R =
-                materializeOperand(RI->getReturnValue(), P, Regs, NextReg,
-                                   Params);
+            auto R = materializeOperand(RI->getReturnValue(), P, Regs, NextReg,
+                                        Params);
             if (!R)
                 return std::nullopt;
             if (!appendInstr(P, VmInstr{VmOp::Ret, 0, *R, 0, 0}, Params))
@@ -276,13 +375,6 @@ std::optional<Program> buildProgram(Function &F,
         return std::nullopt;
     P.reg_count = std::max<std::uint32_t>(NextReg, 1);
     return P;
-}
-
-void shufflePrograms(std::vector<Program> &Programs, ir::IRRandom &Rng) {
-    for (std::size_t I = Programs.size(); I > 1; --I) {
-        const std::size_t J = Rng.range(static_cast<std::uint32_t>(I));
-        std::swap(Programs[I - 1], Programs[J]);
-    }
 }
 
 void shuffleSpecs(std::vector<HandlerSpec> &Specs, ir::IRRandom &Rng) {
@@ -305,6 +397,12 @@ HandlerLayout makeLayout(ir::IRRandom &Rng) {
         {VmOp::Shl, 0, "shl.a"},   {VmOp::Shl, 1, "shl.b"},
         {VmOp::LShr, 0, "lshr.a"}, {VmOp::LShr, 1, "lshr.b"},
         {VmOp::AShr, 0, "ashr.a"}, {VmOp::AShr, 1, "ashr.b"},
+        {VmOp::ICmpEQ, 0, "icmp.eq"},   {VmOp::ICmpNE, 0, "icmp.ne"},
+        {VmOp::ICmpULT, 0, "icmp.ult"}, {VmOp::ICmpULE, 0, "icmp.ule"},
+        {VmOp::ICmpUGT, 0, "icmp.ugt"}, {VmOp::ICmpUGE, 0, "icmp.uge"},
+        {VmOp::ICmpSLT, 0, "icmp.slt"}, {VmOp::ICmpSLE, 0, "icmp.sle"},
+        {VmOp::ICmpSGT, 0, "icmp.sgt"}, {VmOp::ICmpSGE, 0, "icmp.sge"},
+        {VmOp::Select, 0, "select"},
     };
     shuffleSpecs(Layout.specs, Rng);
     for (std::uint32_t I = 0; I < Layout.specs.size(); ++I)
@@ -332,8 +430,7 @@ Encoding makeEncoding(ir::IRRandom &Rng) {
 
 std::uint64_t encodedImm(std::uint64_t Imm, std::uint32_t Pc,
                          const Encoding &Enc) {
-    return Imm ^ Enc.imm_key ^
-           (static_cast<std::uint64_t>(Pc) * kImmPcSalt);
+    return Imm ^ Enc.imm_key ^ (static_cast<std::uint64_t>(Pc) * kImmPcSalt);
 }
 
 std::vector<std::uint8_t> encodeBytecode(const Program &P,
@@ -354,8 +451,7 @@ std::vector<std::uint8_t> encodeBytecode(const Program &P,
         Plain[3] = Instr.rhs ^ Enc.operand_key;
         const std::uint64_t Imm = encodedImm(Instr.imm, Pc, Enc);
         for (unsigned B = 0; B < 8; ++B)
-            Plain[4 + B] =
-                static_cast<std::uint8_t>((Imm >> (B * 8)) & 0xFFu);
+            Plain[4 + B] = static_cast<std::uint8_t>((Imm >> (B * 8)) & 0xFFu);
         for (unsigned B = 12; B < kInstrStride; ++B)
             Plain[B] = static_cast<std::uint8_t>(Rng.next());
         for (unsigned B = 0; B < kInstrStride; ++B)
@@ -372,9 +468,8 @@ GlobalVariable *createBytecode(Module &M, ArrayRef<std::uint8_t> Bytes,
     auto *Init = ConstantDataArray::get(Ctx, Bytes);
     const std::string Name =
         std::string("morok.vm.bytecode.") + SourceName.str();
-    auto *GV = new GlobalVariable(
-        M, ArrTy, /*isConstant=*/true, GlobalValue::PrivateLinkage, Init,
-        Name);
+    auto *GV = new GlobalVariable(M, ArrTy, /*isConstant=*/true,
+                                  GlobalValue::PrivateLinkage, Init, Name);
     GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
     GV->setAlignment(Align(1));
     return GV;
@@ -426,8 +521,8 @@ Value *maskToWidth(Builder &B, Value *V, unsigned Width) {
 Value *emitStreamKey(Builder &B, Value *Offset, const Encoding &Enc) {
     auto *I32 = B.getInt32Ty();
     auto *I8 = B.getInt8Ty();
-    Value *X = B.CreateMul(Offset, ConstantInt::get(I32, Enc.mul),
-                           "morok.vm.key.mul");
+    Value *X =
+        B.CreateMul(Offset, ConstantInt::get(I32, Enc.mul), "morok.vm.key.mul");
     X = B.CreateAdd(X, ConstantInt::get(I32, Enc.add), "morok.vm.key.add");
     X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 7)),
                     "morok.vm.key.fold7");
@@ -442,11 +537,10 @@ Value *emitDecodeByte(Builder &B, GlobalVariable *Bytecode, Value *Pc,
     auto *I32 = B.getInt32Ty();
     auto *I8 = B.getInt8Ty();
     auto *ArrTy = cast<ArrayType>(Bytecode->getValueType());
-    Value *Offset = B.CreateAdd(Pc, ConstantInt::get(I32, Field),
-                                "morok.vm.bc.off");
+    Value *Offset =
+        B.CreateAdd(Pc, ConstantInt::get(I32, Field), "morok.vm.bc.off");
     Value *Ptr = B.CreateInBoundsGEP(
-        ArrTy, Bytecode, {ConstantInt::get(I32, 0), Offset},
-        "morok.vm.bc.ptr");
+        ArrTy, Bytecode, {ConstantInt::get(I32, 0), Offset}, "morok.vm.bc.ptr");
     auto *EncByte = B.CreateLoad(I8, Ptr, "morok.vm.bc.enc");
     EncByte->setVolatile(true);
     EncByte->setAlignment(Align(1));
@@ -457,9 +551,9 @@ Value *emitDecodeByte(Builder &B, GlobalVariable *Bytecode, Value *Pc,
 Value *emitDecodeReg(Builder &B, GlobalVariable *Bytecode, Value *Pc,
                      std::uint32_t Field, const Encoding &Enc) {
     Value *Raw = emitDecodeByte(B, Bytecode, Pc, Field, Enc);
-    Value *Reg = B.CreateXor(Raw, ConstantInt::get(B.getInt8Ty(),
-                                                  Enc.operand_key),
-                             "morok.vm.reg.enc");
+    Value *Reg =
+        B.CreateXor(Raw, ConstantInt::get(B.getInt8Ty(), Enc.operand_key),
+                    "morok.vm.reg.enc");
     return B.CreateZExt(Reg, B.getInt32Ty(), "morok.vm.reg.idx");
 }
 
@@ -485,9 +579,9 @@ Value *emitDecodeImm(Builder &B, GlobalVariable *Bytecode, Value *Pc,
 }
 
 Value *regPtr(Builder &B, AllocaInst *Regs, ArrayType *RegsTy, Value *Idx) {
-    return B.CreateInBoundsGEP(
-        RegsTy, Regs, {ConstantInt::get(B.getInt32Ty(), 0), Idx},
-        "morok.vm.reg.ptr");
+    return B.CreateInBoundsGEP(RegsTy, Regs,
+                               {ConstantInt::get(B.getInt32Ty(), 0), Idx},
+                               "morok.vm.reg.ptr");
 }
 
 Value *loadReg(Builder &B, AllocaInst *Regs, ArrayType *RegsTy, Value *Idx) {
@@ -507,19 +601,25 @@ Value *bitwiseNot(Builder &B, Value *V, const Twine &Name) {
     return B.CreateXor(V, ConstantInt::get(B.getInt64Ty(), ~0ULL), Name);
 }
 
-Value *emitBinary(Builder &B, VmOp Op, std::uint8_t Variant, Value *L,
-                  Value *R, Value *Pc, unsigned Width) {
+Value *emitBinary(Builder &B, VmOp Op, std::uint8_t Variant, Value *L, Value *R,
+                  Value *Pc, unsigned Width) {
     auto *I64 = B.getInt64Ty();
     Value *Out = nullptr;
+    auto signedValue = [&](Value *V, const Twine &Name) -> Value * {
+        if (Width >= 64)
+            return V;
+        auto *Ty = IntegerType::get(B.getContext(), Width);
+        return B.CreateSExt(B.CreateTrunc(V, Ty, Name + ".trunc"), I64,
+                            Name + ".sext");
+    };
     switch (Op) {
     case VmOp::Add:
         if (Variant == 0) {
             Out = B.CreateAdd(L, R, "morok.vm.add");
         } else {
             Value *Carry = B.CreateAnd(L, R, "morok.vm.add.carry");
-            Carry =
-                B.CreateShl(Carry, ConstantInt::get(I64, 1),
-                            "morok.vm.add.carry2");
+            Carry = B.CreateShl(Carry, ConstantInt::get(I64, 1),
+                                "morok.vm.add.carry2");
             Out = B.CreateAdd(B.CreateXor(L, R, "morok.vm.add.sum"), Carry,
                               "morok.vm.add.alt");
         }
@@ -528,9 +628,9 @@ Value *emitBinary(Builder &B, VmOp Op, std::uint8_t Variant, Value *L,
         if (Variant == 0) {
             Out = B.CreateSub(L, R, "morok.vm.sub");
         } else {
-            Value *Neg = B.CreateAdd(bitwiseNot(B, R, "morok.vm.sub.not"),
-                                     ConstantInt::get(I64, 1),
-                                     "morok.vm.sub.neg");
+            Value *Neg =
+                B.CreateAdd(bitwiseNot(B, R, "morok.vm.sub.not"),
+                            ConstantInt::get(I64, 1), "morok.vm.sub.neg");
             Out = B.CreateAdd(L, Neg, "morok.vm.sub.alt");
         }
         break;
@@ -565,30 +665,75 @@ Value *emitBinary(Builder &B, VmOp Op, std::uint8_t Variant, Value *L,
         }
         break;
     case VmOp::Mul:
-        Out = B.CreateMul(L, R, Variant == 0 ? "morok.vm.mul"
-                                             : "morok.vm.mul.alt");
+        Out = B.CreateMul(L, R,
+                          Variant == 0 ? "morok.vm.mul" : "morok.vm.mul.alt");
         break;
     case VmOp::Shl:
-        Out = B.CreateShl(L, R, Variant == 0 ? "morok.vm.shl"
-                                             : "morok.vm.shl.alt");
+        Out = B.CreateShl(L, R,
+                          Variant == 0 ? "morok.vm.shl" : "morok.vm.shl.alt");
         break;
     case VmOp::LShr:
-        Out = B.CreateLShr(L, R, Variant == 0 ? "morok.vm.lshr"
-                                              : "morok.vm.lshr.alt");
+        Out = B.CreateLShr(
+            L, R, Variant == 0 ? "morok.vm.lshr" : "morok.vm.lshr.alt");
         break;
     case VmOp::AShr: {
-        Value *Signed = L;
-        if (Width < 64) {
-            auto *Ty = IntegerType::get(B.getContext(), Width);
-            Signed = B.CreateSExt(B.CreateTrunc(L, Ty, "morok.vm.ashr.trunc"),
-                                  I64, "morok.vm.ashr.sext");
-        }
-        Out = B.CreateAShr(Signed, R, Variant == 0 ? "morok.vm.ashr"
-                                                   : "morok.vm.ashr.alt");
+        Value *Signed = signedValue(L, "morok.vm.ashr");
+        Out = B.CreateAShr(
+            Signed, R, Variant == 0 ? "morok.vm.ashr" : "morok.vm.ashr.alt");
         break;
     }
+    case VmOp::ICmpEQ:
+        Out = B.CreateZExt(B.CreateICmpEQ(L, R, "morok.vm.icmp.eq"), I64,
+                           "morok.vm.icmp.zext");
+        break;
+    case VmOp::ICmpNE:
+        Out = B.CreateZExt(B.CreateICmpNE(L, R, "morok.vm.icmp.ne"), I64,
+                           "morok.vm.icmp.zext");
+        break;
+    case VmOp::ICmpULT:
+        Out = B.CreateZExt(B.CreateICmpULT(L, R, "morok.vm.icmp.ult"), I64,
+                           "morok.vm.icmp.zext");
+        break;
+    case VmOp::ICmpULE:
+        Out = B.CreateZExt(B.CreateICmpULE(L, R, "morok.vm.icmp.ule"), I64,
+                           "morok.vm.icmp.zext");
+        break;
+    case VmOp::ICmpUGT:
+        Out = B.CreateZExt(B.CreateICmpUGT(L, R, "morok.vm.icmp.ugt"), I64,
+                           "morok.vm.icmp.zext");
+        break;
+    case VmOp::ICmpUGE:
+        Out = B.CreateZExt(B.CreateICmpUGE(L, R, "morok.vm.icmp.uge"), I64,
+                           "morok.vm.icmp.zext");
+        break;
+    case VmOp::ICmpSLT:
+        Out = B.CreateZExt(B.CreateICmpSLT(signedValue(L, "morok.vm.icmp.l"),
+                                           signedValue(R, "morok.vm.icmp.r"),
+                                           "morok.vm.icmp.slt"),
+                           I64, "morok.vm.icmp.zext");
+        break;
+    case VmOp::ICmpSLE:
+        Out = B.CreateZExt(B.CreateICmpSLE(signedValue(L, "morok.vm.icmp.l"),
+                                           signedValue(R, "morok.vm.icmp.r"),
+                                           "morok.vm.icmp.sle"),
+                           I64, "morok.vm.icmp.zext");
+        break;
+    case VmOp::ICmpSGT:
+        Out = B.CreateZExt(B.CreateICmpSGT(signedValue(L, "morok.vm.icmp.l"),
+                                           signedValue(R, "morok.vm.icmp.r"),
+                                           "morok.vm.icmp.sgt"),
+                           I64, "morok.vm.icmp.zext");
+        break;
+    case VmOp::ICmpSGE:
+        Out = B.CreateZExt(B.CreateICmpSGE(signedValue(L, "morok.vm.icmp.l"),
+                                           signedValue(R, "morok.vm.icmp.r"),
+                                           "morok.vm.icmp.sge"),
+                           I64, "morok.vm.icmp.zext");
+        break;
     case VmOp::Const:
+    case VmOp::Select:
     case VmOp::Ret:
+    case VmOp::Count:
         Out = ConstantInt::get(I64, 0);
         break;
     }
@@ -632,8 +777,8 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
     FunctionType *FT = Src->getFunctionType();
     const std::string HelperName =
         std::string("morok.vm.") + Src->getName().str() + ".exec";
-    Function *Helper = Function::Create(
-        FT, GlobalValue::InternalLinkage, HelperName, &M);
+    Function *Helper =
+        Function::Create(FT, GlobalValue::InternalLinkage, HelperName, &M);
     addHelperAttrs(Helper);
 
     LLVMContext &Ctx = M.getContext();
@@ -643,8 +788,7 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
     auto *RegsTy = ArrayType::get(I64, P.reg_count);
 
     BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Helper);
-    BasicBlock *Dispatch = BasicBlock::Create(Ctx, "morok.vm.dispatch",
-                                              Helper);
+    BasicBlock *Dispatch = BasicBlock::Create(Ctx, "morok.vm.dispatch", Helper);
 
     std::vector<BasicBlock *> Handlers;
     Handlers.reserve(Layout.specs.size());
@@ -657,8 +801,7 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
         createTargetTable(M, Helper, Handlers, Src->getName());
 
     Builder EB(Entry);
-    AllocaInst *Regs =
-        EB.CreateAlloca(RegsTy, nullptr, "morok.vm.regs");
+    AllocaInst *Regs = EB.CreateAlloca(RegsTy, nullptr, "morok.vm.regs");
     Regs->setAlignment(Align(8));
     AllocaInst *PcSlot = EB.CreateAlloca(I32, nullptr, "morok.vm.pc");
     PcSlot->setAlignment(Align(4));
@@ -666,9 +809,8 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
 
     std::uint32_t ArgIndex = 0;
     for (Argument &Arg : Helper->args()) {
-        Value *Wide = P.width < 64
-                          ? EB.CreateZExt(&Arg, I64, "morok.vm.arg")
-                          : static_cast<Value *>(&Arg);
+        Value *Wide = P.width < 64 ? EB.CreateZExt(&Arg, I64, "morok.vm.arg")
+                                   : static_cast<Value *>(&Arg);
         Wide = maskToWidth(EB, Wide, P.width);
         storeReg(EB, Regs, RegsTy, ConstantInt::get(I32, ArgIndex), Wide);
         ++ArgIndex;
@@ -680,12 +822,12 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
     Value *Op = DB.CreateZExt(emitDecodeByte(DB, Bytecode, Pc, 0, Enc), I32,
                               "morok.vm.op");
     auto *TargetsTy = cast<ArrayType>(Targets->getValueType());
-    Value *Slot = DB.CreateInBoundsGEP(
-        TargetsTy, Targets, {ConstantInt::get(I32, 0), Op},
-        "morok.vm.target.slot");
+    Value *Slot =
+        DB.CreateInBoundsGEP(TargetsTy, Targets, {ConstantInt::get(I32, 0), Op},
+                             "morok.vm.target.slot");
     Value *Target = DB.CreateLoad(PtrTy, Slot, "morok.vm.target");
-    auto *IB = DB.CreateIndirectBr(Target,
-                                   static_cast<unsigned>(Handlers.size()));
+    auto *IB =
+        DB.CreateIndirectBr(Target, static_cast<unsigned>(Handlers.size()));
     for (BasicBlock *Handler : Handlers)
         IB->addDestination(Handler);
 
@@ -712,13 +854,31 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
             continue;
         }
 
+        if (Spec.op == VmOp::Select) {
+            Value *Dst = emitDecodeReg(B, Bytecode, CurPc, 1, Enc);
+            Value *CondIdx = emitDecodeReg(B, Bytecode, CurPc, 2, Enc);
+            Value *TrueIdx = emitDecodeReg(B, Bytecode, CurPc, 3, Enc);
+            Value *FalseIdx = B.CreateTrunc(
+                emitDecodeImm(B, Bytecode, CurPc, Enc, P.width), I32,
+                "morok.vm.select.false.idx");
+            Value *Cond = loadReg(B, Regs, RegsTy, CondIdx);
+            Value *TrueVal = loadReg(B, Regs, RegsTy, TrueIdx);
+            Value *FalseVal = loadReg(B, Regs, RegsTy, FalseIdx);
+            Value *TakeTrue = B.CreateICmpNE(
+                Cond, ConstantInt::get(I64, 0), "morok.vm.select.cond");
+            Value *Out = B.CreateSelect(TakeTrue, TrueVal, FalseVal,
+                                        "morok.vm.select");
+            storeReg(B, Regs, RegsTy, Dst, Out);
+            advancePc(B, PcSlot, Dispatch);
+            continue;
+        }
+
         Value *Dst = emitDecodeReg(B, Bytecode, CurPc, 1, Enc);
         Value *LIdx = emitDecodeReg(B, Bytecode, CurPc, 2, Enc);
         Value *RIdx = emitDecodeReg(B, Bytecode, CurPc, 3, Enc);
         Value *L = loadReg(B, Regs, RegsTy, LIdx);
         Value *R = loadReg(B, Regs, RegsTy, RIdx);
-        Value *Out =
-            emitBinary(B, Spec.op, Spec.variant, L, R, CurPc, P.width);
+        Value *Out = emitBinary(B, Spec.op, Spec.variant, L, R, CurPc, P.width);
         storeReg(B, Regs, RegsTy, Dst, Out);
         advancePc(B, PcSlot, Dispatch);
     }
@@ -772,34 +932,26 @@ bool virtualizeModule(Module &M, const VirtualizationParams &Params,
         Params.max_instructions == 0 || Params.max_registers == 0)
         return false;
 
-    std::vector<Program> Programs;
-    for (Function &F : M) {
-        std::optional<Program> P = buildProgram(F, Params);
-        if (P)
-            Programs.push_back(std::move(*P));
-    }
-    if (Programs.empty())
-        return false;
-
-    shufflePrograms(Programs, Rng);
     bool Changed = false;
     std::uint32_t Lifted = 0;
-    for (Program &P : Programs) {
+    for (Function &F : M) {
         if (Lifted >= Params.max_functions)
             break;
         if (!Rng.chance(Params.probability))
             continue;
-        Changed |= materializeProgram(M, P, Rng);
+        std::optional<Program> P = buildProgram(F, Params);
+        if (!P)
+            continue;
+        Changed |= materializeProgram(M, *P, Rng);
         ++Lifted;
     }
     return Changed;
 }
 
-PreservedAnalyses VirtualizationPass::run(Module &M,
-                                          ModuleAnalysisManager &) {
+PreservedAnalyses VirtualizationPass::run(Module &M, ModuleAnalysisManager &) {
     ir::IRRandom Rng(engine_);
     return virtualizeModule(M, params_, Rng) ? PreservedAnalyses::none()
-                                            : PreservedAnalyses::all();
+                                             : PreservedAnalyses::all();
 }
 
 } // namespace morok::passes

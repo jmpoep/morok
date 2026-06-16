@@ -80,13 +80,13 @@ Per-function `__attribute__((annotate("sub")))` / `annotate("nosub")` overrides
 are honoured.
 
 The scheduler has hard instruction/block/module budgets and skips growth passes
-once a function or module is too large.  The `high` preset is memory-first by
-default: VM lifting, hash self-decrypt, late integrity graphs/tables, MQ,
-microcode stress, adversarial clone/merge tuning, and call-site wrappers are
-explicit opt-ins rather than preset defaults.
-String encryption also has direct byte caps so large global literals do not
-expand into unbounded constructor IR.  Standalone growth-heavy passes also have
-fixed local caps for table, CFG-route, and call-site collection.
+once a function or module is too large.  The `high` preset is bounded-aggressive:
+it enables small capped slices of VM lifting, hash self-decrypt, DFI,
+self-checks, MQ, microcode stress, and call-site wrapping while keeping
+adversarial clone/merge tuning as explicit opt-ins.  String encryption also has
+direct byte caps so large global literals do not expand into unbounded
+constructor IR.  Standalone growth-heavy passes have fixed local caps for table,
+CFG-route, and call-site collection.
 
 ## Testing strategy
 
@@ -119,11 +119,11 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 | Adversarial merge/outline | `morok-afm` | unrelated functions fused behind selector dispatchers and shared helpers |
 | Adversarial self-tuning | `morok-selftune` | cloned-candidate hardness search with selected bundle replay |
 | Per-build polymorphism | `morok-polymorph` | seed-driven function/block layout and neutral return anchors |
-| Data-flow integrity | `morok-dfi` | byte lookup tables decoded from runtime integrity hashes |
+| Data-flow integrity | `morok-dfi` | narrow lookup tables decoded from runtime integrity hashes |
 | Mutual guard graph | `morok-mutualguard` | overlapping checksum nodes whose aggregate diff poisons returns |
-| Table arithmetic | `morok-tablearith` | byte arithmetic lowered to encrypted lookup tables |
-| Uniform primitive lowering | `morok-uniform` | byte ops and direct branches lowered to table/memory dispatch |
-| Virtualization | `morok-vm` | selected straight-line integer functions lifted to encrypted threaded bytecode VMs |
+| Table arithmetic | `morok-tablearith` | narrow integer arithmetic lowered to encrypted lookup tables |
+| Uniform primitive lowering | `morok-uniform` | narrow ops and direct branches lowered to table/memory dispatch |
+| Virtualization | `morok-vm` | selected straight-line integer arithmetic/comparison functions lifted to encrypted threaded bytecode VMs |
 | Hash-gated self-decrypt | `morok-selfdecrypt` | VM bytecode payloads hash/context-gated and lazily decrypted |
 | Path explosion | `morok-pathexplode` | opaque-guarded input-derived decoy loops |
 | Execution-trace keying | `morok-tracekey` | rolling trace accumulator guards and neutral data/control poisoning |
@@ -144,7 +144,7 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 | T-function flattening | `morok-tfa` | single-cycle nonlinear dispatcher-state generator |
 | Dispatcherless routing | `morok-dispatchless` | branch/switch edges → state-entangled `indirectbr` DAG |
 | Microcode stress | `morok-microstress` | oversized computed blockaddress tables with aliased decoy destinations |
-| Vector obfuscation | `morok-vec` | scalar integer ops/comparisons lifted to configurable SIMD |
+| Vector obfuscation | `morok-vec` | scalar integer ops/comparisons/selects lifted to configurable SIMD |
 | Self-checksum constants | `morok-selfcheck` | constants fused with runtime checksum diff so tamper corrupts data |
 | Shamir threshold sharing | `morok-shamir` | selected integer literals reconstructed from GF(2^8) threshold shares |
 | MQ opaque gate | `morok-mq` | planted GF(2) quadratic systems guarding input-derived branch sites |
@@ -160,8 +160,8 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 Every pass is exercised by an IR-validity test, and the value/control-flow
 passes are additionally proven semantics-preserving by the end-to-end
 differential tests across the `low`/`mid`/`high` presets.  The `high` preset
-stacks the bounded default pipeline, skips the heavyweight opt-in passes above,
-and still reproduces the reference output byte-for-byte.
+stacks the bounded aggressive pipeline and still reproduces the reference
+output byte-for-byte.
 
 Faithfulness note for the current LLVM: indirect-branch keys the table index
 rather than multiplicatively encrypting the loaded pointer (modern LLVM forbids

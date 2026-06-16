@@ -6,8 +6,9 @@
 //
 // Pointer/integer laundering targets the decompiler value layer: pointer
 // operands cross an integer boundary and return through a computed byte GEP,
-// while integer SSA values round-trip through a vector byte view.  Both
-// rewrites preserve the bit pattern but poison simple alias/type propagation.
+// while integer SSA values round-trip through a vector byte view or a covering
+// byte-width view.  Both rewrites preserve the value but poison simple
+// alias/type propagation.
 
 #include "morok/passes/PointerLaundering.hpp"
 
@@ -44,7 +45,7 @@ struct PointerTarget {
 
 struct IntegerLaunderResult {
     Value *replacement = nullptr;
-    SmallVector<Instruction *, 4> generated;
+    SmallVector<Instruction *, 5> generated;
 };
 
 bool canRoundTripPointer(const DataLayout &DL, Type *ptrTy) {
@@ -133,7 +134,7 @@ bool canLaunderInteger(const Instruction &I) {
     if (!Ty)
         return false;
     const unsigned bits = Ty->getBitWidth();
-    return bits >= 8 && bits <= 1024 && bits % 8 == 0 && I.getNextNode();
+    return bits >= 1 && bits <= 1024 && I.getNextNode();
 }
 
 void collectIntegerTargets(Function &F, std::vector<Instruction *> &targets) {
@@ -183,11 +184,18 @@ Value *launderPointer(Module &M, const DataLayout &DL, Instruction &user,
 
 IntegerLaunderResult launderInteger(Instruction &I) {
     auto *Ty = cast<IntegerType>(I.getType());
-    const unsigned lanes = Ty->getBitWidth() / 8;
+    const unsigned bits = Ty->getBitWidth();
+    const unsigned lanes = (bits + 7u) / 8u;
+    auto *WorkTy = bits % 8u == 0
+                       ? Ty
+                       : IntegerType::get(I.getContext(), lanes * 8u);
     auto *VecTy = FixedVectorType::get(Type::getInt8Ty(I.getContext()), lanes);
 
     IRBuilder<NoFolder> B(I.getNextNode());
-    Value *bytes = B.CreateBitCast(&I, VecTy, "morok.int.bytes");
+    Value *Work = &I;
+    if (WorkTy != Ty)
+        Work = B.CreateZExt(&I, WorkTy, "morok.int.wide");
+    Value *bytes = B.CreateBitCast(Work, VecTy, "morok.int.bytes");
 
     SmallVector<int, 16> mask;
     mask.reserve(lanes);
@@ -195,13 +203,19 @@ IntegerLaunderResult launderInteger(Instruction &I) {
         mask.push_back(static_cast<int>(i));
     Value *shuffled = B.CreateShuffleVector(bytes, PoisonValue::get(VecTy),
                                             mask, "morok.int.shuffle");
-    Value *back = B.CreateBitCast(shuffled, Ty, "morok.int.value");
+    Value *wideBack = B.CreateBitCast(shuffled, WorkTy, "morok.int.wide.value");
+    Value *back = WorkTy == Ty ? wideBack
+                               : B.CreateTrunc(wideBack, Ty, "morok.int.value");
 
     IntegerLaunderResult result;
     result.replacement = back;
+    if (Work != &I)
+        result.generated.push_back(cast<Instruction>(Work));
     result.generated.push_back(cast<Instruction>(bytes));
     result.generated.push_back(cast<Instruction>(shuffled));
-    result.generated.push_back(cast<Instruction>(back));
+    result.generated.push_back(cast<Instruction>(wideBack));
+    if (back != wideBack)
+        result.generated.push_back(cast<Instruction>(back));
     return result;
 }
 

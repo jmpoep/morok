@@ -4,8 +4,8 @@
 //
 // morok/passes/ArithmeticTables.cpp
 //
-// Arithmetic-as-table lowering for byte-width integer operators.  Each selected
-// `i8 a OP b` becomes:
+// Arithmetic-as-table lowering for narrow integer operators.  Each selected
+// `i1..i8 a OP b` becomes:
 //   ensure(table)
 //   load table[(zext(a) << 8) | zext(b)]
 // Tables are stored encrypted and materialized lazily by a small internal
@@ -65,7 +65,7 @@ bool supportedOpcode(unsigned opcode) {
 
 bool eligible(BinaryOperator &BO) {
     auto *Ty = dyn_cast<IntegerType>(BO.getType());
-    if (!Ty || Ty->getBitWidth() != 8)
+    if (!Ty || Ty->getBitWidth() == 0 || Ty->getBitWidth() > 8)
         return false;
     if (!supportedOpcode(BO.getOpcode()))
         return false;
@@ -77,23 +77,39 @@ bool eligible(BinaryOperator &BO) {
     return true;
 }
 
-std::uint8_t eval(unsigned opcode, std::uint8_t lhs, std::uint8_t rhs) {
+std::uint8_t bitMask(unsigned width) {
+    return width >= 8 ? 0xFFu : static_cast<std::uint8_t>((1u << width) - 1u);
+}
+
+std::uint8_t eval(unsigned opcode, std::uint8_t lhs, std::uint8_t rhs,
+                  unsigned width) {
+    const std::uint8_t mask = bitMask(width);
+    lhs &= mask;
+    rhs &= mask;
+    std::uint8_t result = 0;
     switch (opcode) {
     case Instruction::Add:
-        return static_cast<std::uint8_t>(lhs + rhs);
+        result = static_cast<std::uint8_t>(lhs + rhs);
+        break;
     case Instruction::Sub:
-        return static_cast<std::uint8_t>(lhs - rhs);
+        result = static_cast<std::uint8_t>(lhs - rhs);
+        break;
     case Instruction::Mul:
-        return static_cast<std::uint8_t>(lhs * rhs);
+        result = static_cast<std::uint8_t>(lhs * rhs);
+        break;
     case Instruction::And:
-        return static_cast<std::uint8_t>(lhs & rhs);
+        result = static_cast<std::uint8_t>(lhs & rhs);
+        break;
     case Instruction::Or:
-        return static_cast<std::uint8_t>(lhs | rhs);
+        result = static_cast<std::uint8_t>(lhs | rhs);
+        break;
     case Instruction::Xor:
-        return static_cast<std::uint8_t>(lhs ^ rhs);
+        result = static_cast<std::uint8_t>(lhs ^ rhs);
+        break;
     default:
-        return 0;
+        break;
     }
+    return static_cast<std::uint8_t>(result & mask);
 }
 
 std::uint8_t keyAt(std::uint32_t idx, const KeySchedule &key) {
@@ -170,7 +186,8 @@ Function *createEnsureFunction(Module &M, GlobalVariable *Table,
     return Fn;
 }
 
-TableMaterial createTable(Module &M, unsigned opcode, ir::IRRandom &rng) {
+TableMaterial createTable(Module &M, unsigned opcode, unsigned bitWidth,
+                          ir::IRRandom &rng) {
     LLVMContext &Ctx = M.getContext();
     auto *I8 = Type::getInt8Ty(Ctx);
     auto *I1 = Type::getInt1Ty(Ctx);
@@ -183,7 +200,7 @@ TableMaterial createTable(Module &M, unsigned opcode, ir::IRRandom &rng) {
     for (std::uint32_t idx = 0; idx < kTableSize; ++idx) {
         const auto lhs = static_cast<std::uint8_t>(idx >> 8);
         const auto rhs = static_cast<std::uint8_t>(idx & 0xFFu);
-        encrypted[idx] = eval(opcode, lhs, rhs) ^ keyAt(idx, key);
+        encrypted[idx] = eval(opcode, lhs, rhs, bitWidth) ^ keyAt(idx, key);
     }
 
     Constant *Init = ConstantDataArray::get(Ctx, ArrayRef(encrypted));
@@ -199,7 +216,9 @@ TableMaterial createTable(Module &M, unsigned opcode, ir::IRRandom &rng) {
 }
 
 Value *emitLookup(Module &M, BinaryOperator &BO, ir::IRRandom &rng) {
-    TableMaterial Mat = createTable(M, BO.getOpcode(), rng);
+    auto *SourceTy = cast<IntegerType>(BO.getType());
+    const unsigned bitWidth = SourceTy->getBitWidth();
+    TableMaterial Mat = createTable(M, BO.getOpcode(), bitWidth, rng);
     IRBuilder<NoFolder> B(&BO);
     auto *I8 = B.getInt8Ty();
     auto *I16 = B.getInt16Ty();
@@ -207,15 +226,26 @@ Value *emitLookup(Module &M, BinaryOperator &BO, ir::IRRandom &rng) {
     auto *TableTy = cast<ArrayType>(Mat.table->getValueType());
 
     B.CreateCall(Mat.ensure);
-    Value *L = B.CreateZExt(BO.getOperand(0), I16, "morok.tablearith.lhs");
-    Value *R = B.CreateZExt(BO.getOperand(1), I16, "morok.tablearith.rhs");
+    Value *L8 = bitWidth == 8
+                    ? BO.getOperand(0)
+                    : B.CreateZExt(BO.getOperand(0), I8,
+                                   "morok.tablearith.lhs8");
+    Value *R8 = bitWidth == 8
+                    ? BO.getOperand(1)
+                    : B.CreateZExt(BO.getOperand(1), I8,
+                                   "morok.tablearith.rhs8");
+    Value *L = B.CreateZExt(L8, I16, "morok.tablearith.lhs");
+    Value *R = B.CreateZExt(R8, I16, "morok.tablearith.rhs");
     Value *Hi = B.CreateShl(L, ConstantInt::get(I16, 8), "morok.tablearith.hi");
     Value *Idx16 = B.CreateOr(Hi, R, "morok.tablearith.idx16");
     Value *Idx = B.CreateZExt(Idx16, I32, "morok.tablearith.idx");
     Value *Ptr =
         B.CreateInBoundsGEP(TableTy, Mat.table, {ConstantInt::get(I32, 0), Idx},
                             "morok.tablearith.ptr");
-    return B.CreateLoad(I8, Ptr, "morok.tablearith.value");
+    Value *Result = B.CreateLoad(I8, Ptr, "morok.tablearith.value");
+    if (bitWidth == 8)
+        return Result;
+    return B.CreateTrunc(Result, SourceTy, "morok.tablearith.trunc");
 }
 
 } // namespace
