@@ -4129,6 +4129,60 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("vectorObfuscateFunction lifts scalar casts") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i64 @veccasts(i32 %a, float %f) {
+entry:
+  %wide = zext i32 %a to i64
+  %narrow = trunc i64 %wide to i16
+  %double = fpext float %f to double
+  %bits = bitcast double %double to i64
+  %narrow64 = zext i16 %narrow to i64
+  %out = xor i64 %bits, %narrow64
+  ret i64 %out
+}
+)ir");
+    Function *F = M->getFunction("veccasts");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(2122);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::vectorObfuscateFunction(
+        *F,
+        {/*probability=*/100, /*width=*/128, /*shuffle=*/true,
+         /*lift_comparisons=*/true},
+        rng));
+
+    bool hasVectorZExt = false;
+    bool hasVectorTrunc = false;
+    bool hasVectorFPExt = false;
+    bool hasVectorBitCast = false;
+    bool hasCastExtract = false;
+    for (Instruction &I : instructions(*F)) {
+        auto *Cast = dyn_cast<CastInst>(&I);
+        if (!Cast)
+            continue;
+        const bool vectorCast =
+            Cast->getSrcTy()->isVectorTy() && Cast->getDestTy()->isVectorTy();
+        hasVectorZExt |= vectorCast && Cast->getOpcode() == Instruction::ZExt;
+        hasVectorTrunc |= vectorCast && Cast->getOpcode() == Instruction::Trunc;
+        hasVectorFPExt |= vectorCast && Cast->getOpcode() == Instruction::FPExt;
+        hasVectorBitCast |=
+            vectorCast && Cast->getOpcode() == Instruction::BitCast;
+    }
+    for (Instruction &I : instructions(*F))
+        if (auto *Extract = dyn_cast<ExtractElementInst>(&I))
+            hasCastExtract |=
+                Extract->getName().starts_with("morok.vec.cast.value");
+
+    CHECK(hasVectorZExt);
+    CHECK(hasVectorTrunc);
+    CHECK(hasVectorFPExt);
+    CHECK(hasVectorBitCast);
+    CHECK(hasCastExtract);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("vectorObfuscateFunction lifts sub-byte and odd-width selects") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

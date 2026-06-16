@@ -4,11 +4,11 @@
 //
 // morok/passes/VectorObfuscation.cpp
 //
-// a OP b  becomes  extractelement(shuffle(<a,j...> OP <b,j...>), 0), and
-// scalar selects get the same true/false vector treatment.  Per-lane vector
-// semantics keep the chosen real lane exactly equal to the scalar op; the
-// surrounding vector lanes and optional shuffle create a SIMD surface for
-// decompilers.
+// a OP b  becomes  extractelement(shuffle(<a,j...> OP <b,j...>), 0), scalar
+// casts become vector casts over junk-filled lanes, and scalar selects get the
+// same true/false vector treatment.  Per-lane vector semantics keep the chosen
+// real lane exactly equal to the scalar op; the surrounding vector lanes and
+// optional shuffle create a SIMD surface for decompilers.
 
 #include "morok/passes/VectorObfuscation.hpp"
 
@@ -32,6 +32,16 @@ namespace {
 constexpr std::size_t kMaxVectorLiftTargets = 128;
 constexpr std::size_t kMaxVectorCompareTargets = 128;
 constexpr std::size_t kMaxVectorSelectTargets = 128;
+constexpr std::size_t kMaxVectorCastTargets = 128;
+
+bool passGenerated(const Instruction *I) {
+    return I && I->getName().starts_with("morok.vec");
+}
+
+bool supportedScalar(Type *Ty) {
+    return Ty->isIntegerTy() || Ty->isHalfTy() || Ty->isBFloatTy() ||
+           Ty->isFloatTy() || Ty->isDoubleTy();
+}
 
 bool liftable(BinaryOperator *bo) {
     Type *Ty = bo->getType();
@@ -92,19 +102,57 @@ bool liftableSelect(SelectInst *sel) {
            sel->getCondition()->getType()->isIntegerTy(1);
 }
 
+bool supportedCastOpcode(unsigned Opcode) {
+    switch (Opcode) {
+    case Instruction::Trunc:
+    case Instruction::ZExt:
+    case Instruction::SExt:
+    case Instruction::FPTrunc:
+    case Instruction::FPExt:
+    case Instruction::FPToUI:
+    case Instruction::FPToSI:
+    case Instruction::UIToFP:
+    case Instruction::SIToFP:
+    case Instruction::BitCast:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool liftableCast(CastInst *Cast) {
+    if (!supportedCastOpcode(Cast->getOpcode()))
+        return false;
+    Type *SrcTy = Cast->getSrcTy();
+    Type *DstTy = Cast->getDestTy();
+    if (!supportedScalar(SrcTy) || !supportedScalar(DstTy))
+        return false;
+    if (Cast->getOpcode() == Instruction::BitCast)
+        return SrcTy->getPrimitiveSizeInBits() ==
+               DstTy->getPrimitiveSizeInBits();
+    return true;
+}
+
 unsigned scalarBits(Type *Ty) {
     if (auto *IT = dyn_cast<IntegerType>(Ty))
         return IT->getBitWidth();
     return static_cast<unsigned>(Ty->getPrimitiveSizeInBits());
 }
 
-std::uint32_t laneCount(Type *Ty, const VecParams &params) {
-    const std::uint32_t bits =
-        std::max<std::uint32_t>(static_cast<std::uint32_t>(scalarBits(Ty)), 1u);
+std::uint32_t laneCountForBits(unsigned bits, const VecParams &params) {
     const std::uint32_t width =
         params.width == 256 || params.width == 512 ? params.width : 128u;
-    const std::uint32_t lanes = width / bits;
+    const std::uint32_t lanes = width / std::max<unsigned>(bits, 1u);
     return lanes >= 2u ? lanes : 0u;
+}
+
+std::uint32_t laneCount(Type *Ty, const VecParams &params) {
+    return laneCountForBits(scalarBits(Ty), params);
+}
+
+std::uint32_t laneCount(Type *SrcTy, Type *DstTy, const VecParams &params) {
+    return laneCountForBits(std::max(scalarBits(SrcTy), scalarBits(DstTy)),
+                            params);
 }
 
 Constant *junkScalar(Type *Ty, ir::IRRandom &rng) {
@@ -162,11 +210,43 @@ bool liftBinary(BinaryOperator *bo, const VecParams &params,
     Value *vb =
         buildVector(B, bo->getOperand(1), vecTy, realLane, rng, "morok.vec.b");
     Value *vr = B.CreateBinOp(bo->getOpcode(), va, vb, "morok.vec.op");
+    if (auto *VecBO = dyn_cast<BinaryOperator>(vr)) {
+        if (auto *OldOverflow = dyn_cast<OverflowingBinaryOperator>(bo)) {
+            VecBO->setHasNoUnsignedWrap(OldOverflow->hasNoUnsignedWrap());
+            VecBO->setHasNoSignedWrap(OldOverflow->hasNoSignedWrap());
+        }
+        if (auto *OldExact = dyn_cast<PossiblyExactOperator>(bo))
+            VecBO->setIsExact(OldExact->isExact());
+    }
     Value *r = extractRealLane(B, vr, lanes, realLane, params.shuffle, rng,
                                "morok.vec.value");
 
     bo->replaceAllUsesWith(r);
     bo->eraseFromParent();
+    return true;
+}
+
+bool liftCast(CastInst *Cast, const VecParams &params, ir::IRRandom &rng) {
+    Type *SrcTy = Cast->getSrcTy();
+    Type *DstTy = Cast->getDestTy();
+    const std::uint32_t lanes = laneCount(SrcTy, DstTy, params);
+    if (lanes < 2u)
+        return false;
+
+    auto *SrcVecTy = FixedVectorType::get(SrcTy, lanes);
+    auto *DstVecTy = FixedVectorType::get(DstTy, lanes);
+    IRBuilder<> B(Cast);
+    const std::uint32_t realLane =
+        params.shuffle ? rng.range(lanes) : static_cast<std::uint32_t>(0);
+    Value *Input = buildVector(B, Cast->getOperand(0), SrcVecTy, realLane, rng,
+                               "morok.vec.cast.input");
+    Value *VecCast =
+        B.CreateCast(Cast->getOpcode(), Input, DstVecTy, "morok.vec.cast");
+    Value *R = extractRealLane(B, VecCast, lanes, realLane, params.shuffle, rng,
+                               "morok.vec.cast.value");
+
+    Cast->replaceAllUsesWith(R);
+    Cast->eraseFromParent();
     return true;
 }
 
@@ -184,11 +264,10 @@ bool liftCompare(CmpInst *cmp, const VecParams &params, ir::IRRandom &rng) {
                             "morok.vec.cmp.a");
     Value *vb = buildVector(B, cmp->getOperand(1), vecTy, realLane, rng,
                             "morok.vec.cmp.b");
-    Value *vcmp = isa<ICmpInst>(cmp)
-                      ? B.CreateICmp(cmp->getPredicate(), va, vb,
-                                     "morok.vec.cmp")
-                      : B.CreateFCmp(cmp->getPredicate(), va, vb,
-                                     "morok.vec.cmp");
+    Value *vcmp =
+        isa<ICmpInst>(cmp)
+            ? B.CreateICmp(cmp->getPredicate(), va, vb, "morok.vec.cmp")
+            : B.CreateFCmp(cmp->getPredicate(), va, vb, "morok.vec.cmp");
     Value *r = extractRealLane(B, vcmp, lanes, realLane, params.shuffle, rng,
                                "morok.vec.cmp.value");
 
@@ -211,8 +290,7 @@ bool liftSelect(SelectInst *sel, const VecParams &params, ir::IRRandom &rng) {
                             "morok.vec.sel.t");
     Value *vf = buildVector(B, sel->getFalseValue(), vecTy, realLane, rng,
                             "morok.vec.sel.f");
-    Value *vsel =
-        B.CreateSelect(sel->getCondition(), vt, vf, "morok.vec.sel");
+    Value *vsel = B.CreateSelect(sel->getCondition(), vt, vf, "morok.vec.sel");
     Value *r = extractRealLane(B, vsel, lanes, realLane, params.shuffle, rng,
                                "morok.vec.sel.value");
 
@@ -228,8 +306,11 @@ bool vectorObfuscateFunction(Function &F, const VecParams &params,
     std::vector<BinaryOperator *> targets;
     std::vector<CmpInst *> compares;
     std::vector<SelectInst *> selects;
+    std::vector<CastInst *> casts;
     for (BasicBlock &bb : F) {
         for (Instruction &inst : bb) {
+            if (passGenerated(&inst))
+                continue;
             if (auto *bo = dyn_cast<BinaryOperator>(&inst))
                 if (liftable(bo))
                     if (targets.size() < kMaxVectorLiftTargets)
@@ -243,20 +324,31 @@ bool vectorObfuscateFunction(Function &F, const VecParams &params,
                 if (liftableSelect(sel))
                     if (selects.size() < kMaxVectorSelectTargets)
                         selects.push_back(sel);
+            if (auto *cast = dyn_cast<CastInst>(&inst))
+                if (liftableCast(cast))
+                    if (casts.size() < kMaxVectorCastTargets)
+                        casts.push_back(cast);
             if (targets.size() >= kMaxVectorLiftTargets &&
                 (!params.lift_comparisons ||
                  compares.size() >= kMaxVectorCompareTargets) &&
-                selects.size() >= kMaxVectorSelectTargets)
+                selects.size() >= kMaxVectorSelectTargets &&
+                casts.size() >= kMaxVectorCastTargets)
                 break;
         }
         if (targets.size() >= kMaxVectorLiftTargets &&
             (!params.lift_comparisons ||
              compares.size() >= kMaxVectorCompareTargets) &&
-            selects.size() >= kMaxVectorSelectTargets)
+            selects.size() >= kMaxVectorSelectTargets &&
+            casts.size() >= kMaxVectorCastTargets)
             break;
     }
 
     bool changed = false;
+    for (CastInst *cast : casts) {
+        if (!rng.chance(params.probability))
+            continue;
+        changed |= liftCast(cast, params, rng);
+    }
     for (BinaryOperator *bo : targets) {
         if (!rng.chance(params.probability))
             continue;

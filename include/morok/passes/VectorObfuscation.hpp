@@ -4,8 +4,8 @@
 //
 // morok/passes/VectorObfuscation.hpp — scalar-to-SIMD lifting.
 //
-// Rewrites scalar integer/floating binary operations, comparisons, and selects
-// into configurable-width vector operations whose real lane carries the
+// Rewrites scalar integer/floating binary operations, casts, comparisons, and
+// selects into configurable-width vector operations whose real lane carries the
 // original computation and the remaining lanes are junk, then extracts the real
 // lane.  A decompiler renders the result as opaque vector intrinsics while
 // per-lane semantics preserve the scalar value.

@@ -751,12 +751,18 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   `fcmp` instructions are lifted in the same way and extracted back to `i1`.
   This lets select/branch conditions acquire vector provenance without changing
   control semantics.
+- Scalar casts between integer/floating scalar types are lifted as
+  `<N x src> -> <N x dst>` vector casts when both source and destination fit at
+  least two lanes in the configured width.  Supported casts are integer
+  extend/truncate, FP extend/truncate, integer/FP conversions, and same-width
+  scalar bitcasts.  Pointer casts remain pointer-domain transforms and are left
+  to pointer laundering.
 - Scalar integer/floating `select i1 cond, T t, T f` instructions lift the
   true/false values into junk-filled vectors, perform a scalar-conditioned
   vector select, then extract the original lane.  The condition remains scalar,
   but the chosen value inherits SIMD provenance.
 - Direct memory caps: each invocation lifts at most 128 binary operators, at
-  most 128 compares, and at most 128 selects.
+  most 128 compares, at most 128 selects, and at most 128 casts.
 - The scheduler runs this after table arithmetic and before path explosion:
   arithmetic and dispatcher values can be lifted, while later indirectbr-heavy
   anti-DSE regions are left intact.
@@ -896,7 +902,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - TraceKeying: edge-carried rolling trace accumulator with guards and neutral poisoning.
 - SelfChecksumConstants: scalar constants XORed with runtime checksum diffs for data-only tamper corruption.
 - ShamirShare: selected scalar literals reconstructed from volatile GF(2^8) threshold shares.
-- VectorObfuscation: scalar→SIMD lifting; width 128/256/512, shuffle, lift_comparisons.
+- VectorObfuscation: scalar op/cast/compare/select → SIMD lifting; width 128/256/512, shuffle, lift_comparisons.
 - FunctionWrapper: polymorphic proxies; prob/times/max_wrappers/hard cap 256.
 - FunctionCallObfuscate: dlopen/dlsym indirection; hard cap 256 call sites.
 - AntiClassDump / AntiDebugging / AntiHooking: platform anti-analysis (module passes).

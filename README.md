@@ -144,7 +144,7 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 | T-function flattening | `morok-tfa` | single-cycle nonlinear dispatcher-state generator |
 | Dispatcherless routing | `morok-dispatchless` | branch/switch edges → state-entangled `indirectbr` DAG |
 | Microcode stress | `morok-microstress` | oversized computed blockaddress tables with aliased decoy destinations |
-| Vector obfuscation | `morok-vec` | scalar integer ops/comparisons/selects lifted to configurable SIMD |
+| Vector obfuscation | `morok-vec` | scalar ops/casts/comparisons/selects lifted to configurable SIMD |
 | Self-checksum constants | `morok-selfcheck` | constants fused with runtime checksum diff so tamper corrupts data |
 | Shamir threshold sharing | `morok-shamir` | selected integer literals reconstructed from GF(2^8) threshold shares |
 | MQ opaque gate | `morok-mq` | planted GF(2) quadratic systems guarding input-derived branch sites |
