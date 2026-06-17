@@ -267,6 +267,55 @@ void buildDecoy(BasicBlock *BB, BasicBlock *Body, AllocaInst *Scratch,
     B.CreateBr(Body);
 }
 
+std::optional<std::pair<StringRef, StringRef>>
+antiDisasmHopAsm(const Triple &TT) {
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        return std::pair<StringRef, StringRef>{
+            "callq 0f\n"
+            "0:\n\t"
+            "popq %rax\n\t"
+            "leaq 1f-0b(%rax), %rax\n\t"
+            "jmpq *%rax\n\t"
+            ".byte 0xe8,0x13,0x37,0x00,0x00\n\t"
+            ".byte 0xc3,0x90,0x0f,0x0b\n"
+            "1:",
+            "~{rax},~{dirflag},~{fpsr},~{flags},~{memory}"};
+    case Triple::x86:
+        return std::pair<StringRef, StringRef>{
+            "calll 0f\n"
+            "0:\n\t"
+            "popl %eax\n\t"
+            "leal 1f-0b(%eax), %eax\n\t"
+            "jmp *%eax\n\t"
+            ".byte 0xe8,0x13,0x37,0x00,0x00\n\t"
+            ".byte 0xc3,0x90,0x0f,0x0b\n"
+            "1:",
+            "~{eax},~{dirflag},~{fpsr},~{flags},~{memory}"};
+    case Triple::aarch64:
+    case Triple::aarch64_be:
+        return std::pair<StringRef, StringRef>{
+            "adr x16, 0f\n\t"
+            "br x16\n\t"
+            ".inst 0x14000002\n\t"
+            ".inst 0xd65f03c0\n"
+            "0:",
+            "~{x16},~{memory}"};
+    default:
+        return std::nullopt;
+    }
+}
+
+void emitAntiDisasmHop(Builder &B, const Triple &TT) {
+    auto Asm = antiDisasmHopAsm(TT);
+    if (!Asm)
+        return;
+    auto *FTy = FunctionType::get(Type::getVoidTy(B.getContext()), false);
+    InlineAsm *IA = InlineAsm::get(FTy, Asm->first, Asm->second,
+                                   /*hasSideEffects=*/true);
+    B.CreateCall(FTy, IA);
+}
+
 GlobalVariable *createTable(Module &M, Function &F,
                             ArrayRef<BasicBlock *> Dests,
                             std::uint32_t Entries, ir::IRRandom &rng) {
@@ -319,6 +368,7 @@ void rewriteSite(Function &F, BasicBlock *Body, Instruction &HeadTerm,
     Value *Target =
         HeadBuilder.CreateLoad(PointerType::get(F.getContext(), 0), Slot,
                                "morok.micro.target");
+    emitAntiDisasmHop(HeadBuilder, Triple(F.getParent()->getTargetTriple()));
     auto *IB =
         HeadBuilder.CreateIndirectBr(Target, static_cast<unsigned>(Dests.size()));
     for (BasicBlock *Dest : Dests)

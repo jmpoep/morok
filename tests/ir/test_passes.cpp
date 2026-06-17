@@ -7514,6 +7514,7 @@ join:
     bool hasPtrToInt = false;
     bool hasIntToPtr = false;
     bool hasIndex = false;
+    bool hasAntiDisasmHop = false;
     for (BasicBlock &BB : *F) {
         const bool IsDecoy = BB.getName().starts_with("morok.micro.decoy");
         if (IsDecoy)
@@ -7522,6 +7523,13 @@ join:
             hasIndex |= I.getName().starts_with("morok.micro.index");
             hasPtrToInt |= isa<PtrToIntInst>(&I);
             hasIntToPtr |= isa<IntToPtrInst>(&I);
+            if (auto *CB = dyn_cast<CallBase>(&I))
+                if (auto *Asm = dyn_cast<InlineAsm>(CB->getCalledOperand())) {
+                    StringRef S = Asm->getAsmString();
+                    hasAntiDisasmHop |= S.contains("callq 0f") &&
+                                        S.contains("popq %rax") &&
+                                        S.contains("jmpq *%rax");
+                }
             if (auto *IB = dyn_cast<IndirectBrInst>(&I)) {
                 ++indirects;
                 destinations += IB->getNumDestinations();
@@ -7539,6 +7547,7 @@ join:
     CHECK(hasPtrToInt);
     CHECK(hasIntToPtr);
     CHECK(hasIndex);
+    CHECK(hasAntiDisasmHop);
     bool hasAsmBait = false;
     for (Instruction &I : instructions(*Bait)) {
         if (auto *CB = dyn_cast<CallBase>(&I)) {

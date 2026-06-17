@@ -64,7 +64,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 - [x] Misleading metadata: plant bogus symbol names, fake function boundaries, and malformed-but-tolerated DWARF to mislead the auto-analyzer `[xplat · extends SymbolCloak]`
 - [x] Auto-analysis sabotage: computed `jmp` / oversized switch with runtime-only targets (no recoverable jump table), bogus `endbr64`, fake epilogues/prologues `[xplat · extends microstress/dispatchless]`
 - [x] API-call-via-exception: replace `call <import>` with a deliberate fault whose handler resolves and invokes the API by hash (defeats IAT hook + call-site inline hook + static call-graph at once) `[xplat · extends fco]`
-- [ ] Anti-disasm control flow: signal/VEH-as-`goto`, `call $+5;pop` PIC, computed `jmp reg` `[xplat · new]`
+- [x] Anti-disasm control flow: signal/VEH-as-`goto`, `call $+5;pop` PIC, computed `jmp reg` `[xplat · new]`
 
 ## L — new subsystems
 

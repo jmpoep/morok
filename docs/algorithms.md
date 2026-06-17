@@ -966,6 +966,12 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   `ptrtoint -> xor -> xor -> inttoptr` aliases into a per-function
   `morok.micro.scratch` frame before branching to the original body.  This
   combines goto-spaghetti CFG pressure with alias/lvar recovery pressure.
+- Each rewritten site also emits a side-effecting anti-disassembly hop before
+  the computed branch.  x86/x86_64 sites use `call`/`pop` to recover PIC state,
+  derive a local label, and `jmp *reg` over fake call/ret/trap bytes; AArch64
+  sites use `adr` plus `br x16` over fake branch/return words.  Together with
+  the existing signal/exception control-flow handlers, this covers the
+  signal-as-goto/PIC/computed-jump anti-disasm pattern without a new preset knob.
 - When the transform fires on x86/x86_64/aarch64, the module also retains a
   cold local `morok.micro.analysis.bait` byte-sled helper.  Its inline-asm body
   immediately jumps over bogus landing/prologue/epilogue bytes (`endbr64` on
