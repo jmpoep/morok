@@ -753,6 +753,45 @@ Value *emitDarwinMmap(IRBuilder<> &B, Module &M, const Triple &TT, Value *Size,
         "morok.clean.mmap");
 }
 
+Value *emitPosixAnonMmapAddr(IRBuilder<> &B, Module &M, const Triple &TT,
+                             Value *Size, Value *Prot, Value *Flags,
+                             const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    if (TT.isOSLinux() && useDirectLinuxSyscalls(TT))
+        return emitLinuxSyscall(B, M, TT, 9,
+                                {ConstantPointerNull::get(ptr), Size, Prot,
+                                 Flags, ConstantInt::getSigned(i32, -1),
+                                 ConstantInt::get(ip, 0)});
+    if (TT.isOSDarwin() && useDirectDarwinSyscalls(TT))
+        return emitDarwinSyscall(B, M, TT, 197,
+                                 {ConstantPointerNull::get(ptr), Size, Prot,
+                                  Flags, ConstantInt::getSigned(i32, -1),
+                                  ConstantInt::get(ip, 0)});
+
+    Value *mapped = B.CreateCall(
+        mmapDecl(M),
+        {ConstantPointerNull::get(ptr), Size, B.CreateTruncOrBitCast(Prot, i32),
+         B.CreateTruncOrBitCast(Flags, i32), ConstantInt::getSigned(i32, -1),
+         ConstantInt::get(ip, 0)},
+        Name);
+    return B.CreatePtrToInt(mapped, ip, Name + ".addr");
+}
+
+Value *emitPosixMprotect(IRBuilder<> &B, Module &M, const Triple &TT,
+                         Value *Addr, Value *Size, Value *Prot) {
+    if (TT.isOSLinux())
+        return emitLinuxMprotect(B, M, TT, Addr, Size, Prot);
+    if (TT.isOSDarwin())
+        return emitDarwinMprotect(B, M, TT, Addr, Size, Prot);
+    return B.CreateCall(
+        mprotectDecl(M),
+        {B.CreateIntToPtr(Addr, PointerType::getUnqual(M.getContext())), Size,
+         B.CreateTruncOrBitCast(Prot, Type::getInt32Ty(M.getContext()))});
+}
+
 void emitDarwinMunmap(IRBuilder<> &B, Module &M, const Triple &TT,
                       Value *Mapped, Value *Size) {
     if (useDirectDarwinSyscalls(TT)) {
@@ -6061,6 +6100,452 @@ unsigned emitTrapStimuli(IRBuilder<> &B, Module &M, const Triple &TT) {
     return 3;
 }
 
+struct SchroFaultLayout {
+    std::uint64_t sigactionSize = 0;
+    std::uint64_t flagsOffset = 0;
+    std::uint64_t siginfoAddrOffset = 0;
+    std::uint64_t linuxPcSlotOffset = 0;
+    std::uint64_t darwinMcontextOffset = 0;
+    std::uint64_t darwinPcOffset = 0;
+    std::uint32_t saSiginfo = 0;
+    std::int32_t sigSegv = 11;
+    std::int32_t sigBus = 7;
+    bool darwinMcontext = false;
+};
+
+bool schroFaultLayout(const Triple &TT, SchroFaultLayout &L) {
+    if (TT.isOSLinux() && TT.getArch() == Triple::x86_64) {
+        L.sigactionSize = 152;
+        L.flagsOffset = 136;
+        L.siginfoAddrOffset = 16;
+        L.linuxPcSlotOffset = 168;
+        L.saSiginfo = 4;
+        L.sigSegv = 11;
+        L.sigBus = 7;
+        return true;
+    }
+    if (TT.isOSDarwin() &&
+        (TT.getArch() == Triple::x86_64 || TT.getArch() == Triple::aarch64 ||
+         TT.getArch() == Triple::aarch64_32)) {
+        L.sigactionSize = 16;
+        L.flagsOffset = 12;
+        L.siginfoAddrOffset = 24;
+        L.darwinMcontextOffset = 48;
+        L.darwinPcOffset = TT.getArch() == Triple::x86_64 ? 160 : 288;
+        L.saSiginfo = 0x40;
+        L.sigSegv = 11;
+        L.sigBus = 10;
+        L.darwinMcontext = true;
+        return true;
+    }
+    return false;
+}
+
+GlobalVariable *schroPageGlobal(Module &M) {
+    if (auto *existing = M.getGlobalVariable("morok.antihook.schro.page",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *ip = intPtrTy(M);
+    auto *gv = new GlobalVariable(
+        M, ip, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(ip, 0), "morok.antihook.schro.page");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *schroSizeGlobal(Module &M) {
+    if (auto *existing = M.getGlobalVariable("morok.antihook.schro.size",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *ip = intPtrTy(M);
+    auto *gv = new GlobalVariable(
+        M, ip, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(ip, 0), "morok.antihook.schro.size");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *schroArmedGlobal(Module &M) {
+    if (auto *existing = M.getGlobalVariable("morok.antihook.schro.armed",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i32, 0), "morok.antihook.schro.armed");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *schroOldActionGlobal(Module &M, StringRef Name,
+                                     std::uint64_t Bytes) {
+    if (auto *existing = M.getGlobalVariable(Name, /*AllowInternal=*/true))
+        return existing;
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    auto *ty = ArrayType::get(i8, Bytes);
+    auto *gv = new GlobalVariable(M, ty, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantAggregateZero::get(ty), Name);
+    gv->setAlignment(Align(8));
+    return gv;
+}
+
+void storeTargetSiginfoAction(IRBuilder<> &B, Module &M, AllocaInst *Action,
+                              Function *Handler,
+                              const SchroFaultLayout &Layout) {
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    zeroActionBytes(B, M, Action, Layout.sigactionSize);
+    B.CreateStore(Handler, gepI8(B, M, Action, constIp(M, 0),
+                                 "morok.antihook.schro.sa.handler"));
+    B.CreateStore(ConstantInt::get(i32, Layout.saSiginfo),
+                  gepI8(B, M, Action, constIp(M, Layout.flagsOffset),
+                        "morok.antihook.schro.sa.flags"));
+}
+
+void storeCodeByte(IRBuilder<> &B, Module &M, Value *Page,
+                   std::uint64_t Offset, std::uint8_t Byte) {
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    auto *st = B.CreateStore(ConstantInt::get(i8, Byte),
+                             gepI8(B, M, B.CreateIntToPtr(
+                                             Page, PointerType::getUnqual(
+                                                       M.getContext())),
+                                   constIp(M, Offset),
+                                   "morok.antihook.schro.code.ptr"));
+    st->setVolatile(true);
+    st->setAlignment(Align(1));
+}
+
+std::uint8_t emitSchroCodeIsland(IRBuilder<> &B, Module &M, const Triple &TT,
+                                 Value *Page, ir::IRRandom &rng) {
+    if (isX86Target(TT)) {
+        const std::uint32_t imm =
+            static_cast<std::uint32_t>(rng.next() ^ 0x51D07E3Fu);
+        const std::array<std::uint8_t, 8> bytes = {
+            0xB8,
+            static_cast<std::uint8_t>(imm & 0xffu),
+            static_cast<std::uint8_t>((imm >> 8) & 0xffu),
+            static_cast<std::uint8_t>((imm >> 16) & 0xffu),
+            static_cast<std::uint8_t>((imm >> 24) & 0xffu),
+            0xC3,
+            0x0F,
+            0x0B,
+        };
+        for (std::uint64_t i = 0; i < bytes.size(); ++i)
+            storeCodeByte(B, M, Page, i, bytes[i]);
+        return bytes[0];
+    }
+
+    const std::uint32_t imm =
+        static_cast<std::uint32_t>((rng.next() ^ 0x46A9u) & 0xffffu);
+    const std::uint32_t movz = 0x52800000u | (imm << 5);
+    const std::uint32_t ret = 0xD65F03C0u;
+    const std::array<std::uint8_t, 8> bytes = {
+        static_cast<std::uint8_t>(movz & 0xffu),
+        static_cast<std::uint8_t>((movz >> 8) & 0xffu),
+        static_cast<std::uint8_t>((movz >> 16) & 0xffu),
+        static_cast<std::uint8_t>((movz >> 24) & 0xffu),
+        static_cast<std::uint8_t>(ret & 0xffu),
+        static_cast<std::uint8_t>((ret >> 8) & 0xffu),
+        static_cast<std::uint8_t>((ret >> 16) & 0xffu),
+        static_cast<std::uint8_t>((ret >> 24) & 0xffu),
+    };
+    for (std::uint64_t i = 0; i < bytes.size(); ++i)
+        storeCodeByte(B, M, Page, i, bytes[i]);
+    return bytes[0];
+}
+
+Function *schroSignalHandler(Module &M, GlobalVariable *State,
+                             Function *Probe, const Triple &TT,
+                             const SchroFaultLayout &Layout) {
+    if (Function *existing = M.getFunction("morok.antihook.schro.handler"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(
+        FunctionType::get(Type::getVoidTy(ctx), {i32, ptr, ptr}, false),
+        GlobalValue::PrivateLinkage, "morok.antihook.schro.handler", &M);
+    fn->setDSOLocal(true);
+    Argument *sig = fn->getArg(0);
+    sig->setName("sig");
+    Argument *info = fn->getArg(1);
+    info->setName("info");
+    Argument *uctx = fn->getArg(2);
+    uctx->setName("uctx");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loadFaultBB = BasicBlock::Create(ctx, "fault.addr", fn);
+    auto *checkCtxBB = BasicBlock::Create(ctx, "ctx.check", fn);
+    auto *loadPcBB = BasicBlock::Create(ctx, "pc.load", fn);
+    auto *loadDarwinPcBB = BasicBlock::Create(ctx, "pc.darwin", fn);
+    auto *classifyBB = BasicBlock::Create(ctx, "classify", fn);
+    auto *oursBB = BasicBlock::Create(ctx, "ours", fn);
+    auto *restoreBB = BasicBlock::Create(ctx, "restore", fn);
+    auto *legitBB = BasicBlock::Create(ctx, "legit", fn);
+    auto *readerBB = BasicBlock::Create(ctx, "reader", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "done", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *pcSlot = B.CreateAlloca(ip, nullptr, "morok.antihook.schro.pc.slot");
+    AllocaInst *faultSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.schro.fault.slot");
+    B.CreateStore(ConstantInt::get(ip, 0), pcSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), faultSlot)->setVolatile(true);
+    B.CreateCondBr(B.CreateICmpNE(info, ConstantPointerNull::get(ptr)),
+                   loadFaultBB, checkCtxBB);
+
+    IRBuilder<> FB(loadFaultBB);
+    Value *faultAddr = loadAt(FB, M, ip, info, Layout.siginfoAddrOffset,
+                              "morok.antihook.schro.fault");
+    FB.CreateStore(faultAddr, faultSlot)->setVolatile(true);
+    FB.CreateBr(checkCtxBB);
+
+    IRBuilder<> CB(checkCtxBB);
+    CB.CreateCondBr(CB.CreateICmpNE(uctx, ConstantPointerNull::get(ptr)),
+                    loadPcBB, classifyBB);
+
+    IRBuilder<> PB(loadPcBB);
+    if (Layout.darwinMcontext) {
+        Value *mctx = loadAt(PB, M, ptr, uctx, Layout.darwinMcontextOffset,
+                             "morok.antihook.schro.mcontext");
+        PB.CreateCondBr(PB.CreateICmpNE(mctx, ConstantPointerNull::get(ptr)),
+                        loadDarwinPcBB, classifyBB);
+
+        IRBuilder<> DPB(loadDarwinPcBB);
+        Value *pc = loadAt(DPB, M, ip, mctx, Layout.darwinPcOffset,
+                           "morok.antihook.schro.pc");
+        DPB.CreateStore(pc, pcSlot)->setVolatile(true);
+        DPB.CreateBr(classifyBB);
+    } else {
+        Value *pc = loadAt(PB, M, ip, uctx, Layout.linuxPcSlotOffset,
+                           "morok.antihook.schro.pc");
+        PB.CreateStore(pc, pcSlot)->setVolatile(true);
+        PB.CreateBr(classifyBB);
+        IRBuilder<> DPB(loadDarwinPcBB);
+        DPB.CreateUnreachable();
+    }
+
+    IRBuilder<> KB(classifyBB);
+    Value *page = KB.CreateLoad(ip, schroPageGlobal(M),
+                                "morok.antihook.schro.page.v");
+    page->setName("morok.antihook.schro.page.v");
+    cast<LoadInst>(page)->setVolatile(true);
+    Value *size = KB.CreateLoad(ip, schroSizeGlobal(M),
+                                "morok.antihook.schro.size.v");
+    cast<LoadInst>(size)->setVolatile(true);
+    Value *pc = KB.CreateLoad(ip, pcSlot, "morok.antihook.schro.pc.v");
+    cast<LoadInst>(pc)->setVolatile(true);
+    Value *fault = KB.CreateLoad(ip, faultSlot, "morok.antihook.schro.fault.v");
+    cast<LoadInst>(fault)->setVolatile(true);
+    Value *armed = KB.CreateLoad(i32, schroArmedGlobal(M),
+                                 "morok.antihook.schro.armed.v");
+    cast<LoadInst>(armed)->setVolatile(true);
+    Value *end = KB.CreateAdd(page, size, "morok.antihook.schro.page.end");
+    Value *inPage = KB.CreateAnd(
+        KB.CreateICmpNE(page, ConstantInt::get(ip, 0)),
+        KB.CreateAnd(KB.CreateICmpUGE(fault, page),
+                     KB.CreateICmpULT(fault, end)),
+        "morok.antihook.schro.fault.in.page");
+    Value *probeStart =
+        KB.CreatePtrToInt(Probe, ip, "morok.antihook.schro.probe.start");
+    Value *probeEnd = KB.CreateAdd(probeStart, ConstantInt::get(ip, 8192),
+                                   "morok.antihook.schro.probe.end");
+    Value *ripOk = KB.CreateAnd(KB.CreateICmpUGE(pc, probeStart),
+                                KB.CreateICmpULT(pc, probeEnd),
+                                "morok.antihook.schro.rip.allowed");
+    Value *armedOk =
+        KB.CreateICmpEQ(armed, ConstantInt::get(i32, 1),
+                        "morok.antihook.schro.armed.allowed");
+    Value *legit = KB.CreateAnd(KB.CreateAnd(inPage, ripOk), armedOk,
+                                "morok.antihook.schro.legit");
+    KB.CreateCondBr(inPage, oursBB, restoreBB);
+
+    IRBuilder<> OB(oursBB);
+    Value *rc = emitPosixMprotect(OB, M, TT, page, size,
+                                  ConstantInt::get(ip, 5));
+    rc->setName("morok.antihook.schro.mprotect.rx");
+    foldState(OB, State, fault, 0x3B9F71A8C4D205E6ULL,
+              "morok.antihook.schro.fault.mix");
+    foldState(OB, State, pc, 0xA64D07C2E9315B8FULL,
+              "morok.antihook.schro.rip.mix");
+    Value *reader = OB.CreateNot(legit, "morok.antihook.schro.reader");
+    foldFlag(OB, State, reader, 0x6C42B871D9E503AFULL,
+             "morok.antihook.schro.reader");
+    OB.CreateCondBr(legit, legitBB, readerBB);
+
+    IRBuilder<> LB(legitBB);
+    LB.CreateStore(ConstantInt::get(i32, 2), schroArmedGlobal(M))
+        ->setVolatile(true);
+    LB.CreateBr(doneBB);
+
+    IRBuilder<> RB(readerBB);
+    RB.CreateStore(ConstantInt::get(i32, 3), schroArmedGlobal(M))
+        ->setVolatile(true);
+    RB.CreateBr(doneBB);
+
+    IRBuilder<> XB(restoreBB);
+    Value *isBus =
+        XB.CreateICmpEQ(sig, ConstantInt::getSigned(i32, Layout.sigBus),
+                        "morok.antihook.schro.sigbus");
+    GlobalVariable *oldSegv = schroOldActionGlobal(
+        M, "morok.antihook.schro.old.segv", Layout.sigactionSize);
+    GlobalVariable *oldBus = schroOldActionGlobal(
+        M, "morok.antihook.schro.old.bus", Layout.sigactionSize);
+    Value *oldAction =
+        XB.CreateSelect(isBus, static_cast<Value *>(oldBus),
+                        static_cast<Value *>(oldSegv),
+                        "morok.antihook.schro.old.action");
+    XB.CreateCall(sigactionDecl(M),
+                  {sig, oldAction, ConstantPointerNull::get(ptr)},
+                  "morok.antihook.schro.restore");
+    XB.CreateBr(doneBB);
+
+    IRBuilder<> DB(doneBB);
+    DB.CreateRetVoid();
+    return fn;
+}
+
+Function *schrodingerPageProbe(Module &M, GlobalVariable *State,
+                               ir::IRRandom &rng, const Triple &TT) {
+    SchroFaultLayout layout;
+    if (intPtrTy(M)->getBitWidth() != 64 || !schroFaultLayout(TT, layout))
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.schro"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.schro", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *setupBB = BasicBlock::Create(ctx, "setup", fn);
+    auto *afterRxBB = BasicBlock::Create(ctx, "after.rx", fn);
+    auto *afterSigBB = BasicBlock::Create(ctx, "after.sig", fn);
+    auto *faultBB = BasicBlock::Create(ctx, "fault", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *diff = B.CreateAlloca(i64, nullptr, "morok.antihook.schro.diff");
+    B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
+    Value *pageSize = nullptr;
+    if (TT.isOSDarwin()) {
+        FunctionCallee getpagesize =
+            M.getOrInsertFunction("getpagesize", FunctionType::get(i32, false));
+        pageSize = B.CreateZExt(
+            B.CreateCall(getpagesize, {}, "morok.antihook.schro.pagesz"), ip);
+    } else {
+        pageSize = ConstantInt::get(ip, 4096);
+    }
+    const std::uint32_t mapAnon = TT.isOSDarwin() ? 0x1000u : 0x20u;
+    Value *mapped = emitPosixAnonMmapAddr(
+        B, M, TT, pageSize, ConstantInt::get(ip, 3),
+        ConstantInt::get(ip, 2u | mapAnon), "morok.antihook.schro.mmap");
+    mapped->setName("morok.antihook.schro.mmap");
+    Value *mappedOk = B.CreateAnd(
+        B.CreateICmpUGT(mapped, ConstantInt::get(ip, 4096)),
+        B.CreateICmpNE(mapped, ConstantInt::get(ip, ~0ULL)),
+        "morok.antihook.schro.mapped");
+    B.CreateCondBr(mappedOk, setupBB, retBB);
+
+    IRBuilder<> SB(setupBB);
+    SB.CreateStore(mapped, schroPageGlobal(M))->setVolatile(true);
+    SB.CreateStore(pageSize, schroSizeGlobal(M))->setVolatile(true);
+    const std::uint8_t firstByte =
+        emitSchroCodeIsland(SB, M, TT, mapped, rng);
+    Value *rxTest = emitPosixMprotect(SB, M, TT, mapped, pageSize,
+                                      ConstantInt::get(ip, 5));
+    rxTest->setName("morok.antihook.schro.mprotect.rx.test");
+    Value *rxFail =
+        SB.CreateICmpSLT(rxTest, ConstantInt::getSigned(i32, 0),
+                         "morok.antihook.schro.rx.fail");
+    incrementDiff(SB, diff, rxFail, "morok.antihook.schro.rx.fail");
+    SB.CreateCondBr(rxFail, retBB, afterRxBB);
+
+    IRBuilder<> AB(afterRxBB);
+    Function *handler = schroSignalHandler(M, State, fn, TT, layout);
+    auto *actionTy = ArrayType::get(i8, layout.sigactionSize);
+    AllocaInst *action =
+        AB.CreateAlloca(actionTy, nullptr, "morok.antihook.schro.sa");
+    storeTargetSiginfoAction(AB, M, action, handler, layout);
+    FunctionCallee sigactionFn = sigactionDecl(M);
+    GlobalVariable *oldSegv = schroOldActionGlobal(
+        M, "morok.antihook.schro.old.segv", layout.sigactionSize);
+    GlobalVariable *oldBus = schroOldActionGlobal(
+        M, "morok.antihook.schro.old.bus", layout.sigactionSize);
+    Value *segvRc =
+        AB.CreateCall(sigactionFn,
+                      {ConstantInt::getSigned(i32, layout.sigSegv), action,
+                       oldSegv},
+                      "morok.antihook.schro.sigaction.segv");
+    Value *busRc =
+        AB.CreateCall(sigactionFn,
+                      {ConstantInt::getSigned(i32, layout.sigBus), action,
+                       oldBus},
+                      "morok.antihook.schro.sigaction.bus");
+    Value *sigFail = AB.CreateOr(
+        AB.CreateICmpNE(segvRc, ConstantInt::get(i32, 0)),
+        AB.CreateICmpNE(busRc, ConstantInt::get(i32, 0)),
+        "morok.antihook.schro.sigaction.fail");
+    incrementDiff(AB, diff, sigFail, "morok.antihook.schro.sigaction.fail");
+    AB.CreateCondBr(sigFail, retBB, afterSigBB);
+
+    IRBuilder<> NB(afterSigBB);
+    Value *noneRc = emitPosixMprotect(NB, M, TT, mapped, pageSize,
+                                      ConstantInt::get(ip, 0));
+    noneRc->setName("morok.antihook.schro.mprotect.none");
+    Value *noneFail =
+        NB.CreateICmpSLT(noneRc, ConstantInt::getSigned(i32, 0),
+                         "morok.antihook.schro.none.fail");
+    incrementDiff(NB, diff, noneFail, "morok.antihook.schro.none.fail");
+    NB.CreateCondBr(noneFail, retBB, faultBB);
+
+    IRBuilder<> FB(faultBB);
+    FB.CreateStore(ConstantInt::get(i32, 1), schroArmedGlobal(M))
+        ->setVolatile(true);
+    Value *pagePtr = FB.CreateIntToPtr(mapped, ptr, "morok.antihook.schro.ptr");
+    auto *faultByte = FB.CreateLoad(i8, pagePtr,
+                                    "morok.antihook.schro.fault.byte");
+    faultByte->setVolatile(true);
+    faultByte->setAlignment(Align(1));
+    auto *armedAfter =
+        FB.CreateLoad(i32, schroArmedGlobal(M),
+                      "morok.antihook.schro.armed.after");
+    armedAfter->setVolatile(true);
+    Value *handlerOk =
+        FB.CreateICmpEQ(armedAfter, ConstantInt::get(i32, 2),
+                        "morok.antihook.schro.handler.ok");
+    Value *byteOk =
+        FB.CreateICmpEQ(faultByte, ConstantInt::get(i8, firstByte),
+                        "morok.antihook.schro.byte.ok");
+    incrementDiff(FB, diff, FB.CreateNot(FB.CreateAnd(handlerOk, byteOk),
+                                         "morok.antihook.schro.trip"),
+                  "morok.antihook.schro.trip");
+    FB.CreateStore(ConstantInt::get(i32, 0), schroArmedGlobal(M))
+        ->setVolatile(true);
+    Value *rearmRc = emitPosixMprotect(FB, M, TT, mapped, pageSize,
+                                       ConstantInt::get(ip, 0));
+    rearmRc->setName("morok.antihook.schro.mprotect.rearm");
+    incrementDiff(FB, diff,
+                  FB.CreateICmpSLT(rearmRc, ConstantInt::getSigned(i32, 0),
+                                   "morok.antihook.schro.rearm.fail"),
+                  "morok.antihook.schro.rearm.fail");
+    FB.CreateBr(retBB);
+
+    IRBuilder<> RB(retBB);
+    emitRetDiff(RB, diff);
+    return fn;
+}
+
 } // namespace
 
 bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
@@ -6286,6 +6771,17 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
                   "morok.antihook.dbi.smc");
         foldFlag(B, state, changed, 0x73B5D02E6C49A18FULL,
                  "morok.antihook.dbi.smc.changed");
+    }
+    if (Function *schro = schrodingerPageProbe(M, state, rng, tt)) {
+        Value *diff = B.CreateCall(schro, {}, "morok.antihook.schro.diff");
+        Value *changed =
+            B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0),
+                           "morok.corroborate.schro.changed");
+        incrementDiff(B, corroboration, changed, "morok.corroborate.schro");
+        foldState(B, state, diff, 0xC92D4F61A7E8053BULL,
+                  "morok.antihook.schro");
+        foldFlag(B, state, changed, 0x5F0A81C3D624B7E9ULL,
+                 "morok.antihook.schro.changed");
     }
     if (Function *dbi = linuxDbiSignatureProbe(M, rng, tt)) {
         Value *diff = B.CreateCall(dbi, {}, "morok.antihook.dbi.diff");

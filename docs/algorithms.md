@@ -1208,6 +1208,18 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   uses `VirtualQuery`/`VirtualProtect` to downgrade committed RWX regions to
   execute-read.  Protection failures are folded into the same delayed anti-hook
   state instead of branching to an immediate exit.
+  POSIX targets with a known signal-context layout also get a guarded executable
+  code island: startup maps a private page, writes architecture-specific return
+  code bytes into it, verifies the page can be RX, installs a `SA_SIGINFO`
+  `SIGSEGV`/`SIGBUS` handler, and re-protects the page to `PROT_NONE`.  The
+  local probe arms a volatile token and deliberately reads that page; the fault
+  handler validates both the fault address and the saved RIP/PC against the
+  probe's code range before temporarily reopening the page as RX.  Unauthorized
+  in-process readers of the guarded page are treated as tripwires and folded
+  into delayed anti-hook state.  Linux x86_64 keeps the page-map/protect path on
+  inline syscalls; macOS x86_64 uses the existing direct Darwin syscall path,
+  while macOS arm64 uses libc `mmap`/`mprotect`/`sigaction` pending a supported
+  direct syscall ABI.
   Selected non-`main` user functions also get an entry-time stack-origin check:
   the pass reads the function's immediate return address with
   `llvm.returnaddress(0)` and verifies it against the platform executable-origin
