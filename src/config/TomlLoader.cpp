@@ -444,6 +444,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseToggle(*t, pc.anti_class_dump);
     if (auto *t = p["timing_oracles"].as_table())
         parseToggle(*t, pc.timing_oracles);
+    if (auto *t = p["trap_oracles"].as_table())
+        parseToggle(*t, pc.trap_oracles);
 }
 
 Policy parsePolicy(const toml::table &pt) {

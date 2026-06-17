@@ -931,6 +931,106 @@ Function *timingOracleProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
     return fn;
 }
 
+GlobalVariable *trapOracleState(Module &M, ir::IRRandom &rng) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.trap.state", /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i64, rng.next()), "morok.trap.state");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *trapHitCounter(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.trap.hits", /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i32, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i32, 0), "morok.trap.hits");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+Function *trapSignalHandler(Module &M, GlobalVariable *Counter,
+                            GlobalVariable *State) {
+    if (Function *existing = M.getFunction("morok.trap.handler"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *fn =
+        Function::Create(FunctionType::get(Type::getVoidTy(ctx), {i32}, false),
+                         GlobalValue::PrivateLinkage, "morok.trap.handler", &M);
+    fn->setDSOLocal(true);
+    Argument *sig = fn->getArg(0);
+    sig->setName("sig");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    auto *old = B.CreateLoad(i32, Counter, "morok.trap.hits.old");
+    old->setVolatile(true);
+    Value *next =
+        B.CreateAdd(old, ConstantInt::get(i32, 1), "morok.trap.hits.next");
+    auto *store = B.CreateStore(next, Counter);
+    store->setVolatile(true);
+    foldState(B, State, sig, 0xC286B9F2B77D6A41ULL, "morok.trap.signal");
+    foldState(B, State, next, 0x4F3C2D1E9876A5B1ULL, "morok.trap.count");
+    B.CreateRetVoid();
+    return fn;
+}
+
+FunctionCallee signalDecl(Module &M) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ptr = PointerType::getUnqual(ctx);
+    return M.getOrInsertFunction("signal",
+                                 FunctionType::get(ptr, {i32, ptr}, false));
+}
+
+FunctionCallee raiseDecl(Module &M) {
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    return M.getOrInsertFunction("raise", FunctionType::get(i32, {i32}, false));
+}
+
+void emitTrapInlineAsm(IRBuilder<> &B, StringRef Asm, StringRef Constraints) {
+    auto *asmTy = FunctionType::get(Type::getVoidTy(B.getContext()), false);
+    InlineAsm *IA =
+        InlineAsm::get(asmTy, Asm, Constraints, /*hasSideEffects=*/true);
+    B.CreateCall(asmTy, IA);
+}
+
+unsigned emitTrapStimuli(IRBuilder<> &B, Module &M, const Triple &TT) {
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    constexpr int kSigTrap = 5;
+    if (isX86Target(TT)) {
+        emitTrapInlineAsm(B, "int3", "~{dirflag},~{fpsr},~{flags}");
+        emitTrapInlineAsm(B, ".byte 0xf1", "~{dirflag},~{fpsr},~{flags}");
+        if (TT.getArch() == Triple::x86_64) {
+            emitTrapInlineAsm(B,
+                              "pushfq\npopq %rax\norq $$256, %rax\npushq "
+                              "%rax\npopfq\nnop\npushfq\npopq %rax\nandq "
+                              "$$-257, %rax\npushq %rax\npopfq",
+                              "~{rax},~{dirflag},~{fpsr},~{flags}");
+        } else {
+            emitTrapInlineAsm(B,
+                              "pushfl\npopl %eax\norl $$256, %eax\npushl "
+                              "%eax\npopfl\nnop\npushfl\npopl %eax\nandl "
+                              "$$-257, %eax\npushl %eax\npopfl",
+                              "~{eax},~{dirflag},~{fpsr},~{flags}");
+        }
+        return 3;
+    }
+
+    FunctionCallee raiseFn = raiseDecl(M);
+    for (unsigned i = 0; i < 3; ++i)
+        B.CreateCall(raiseFn, {ConstantInt::get(i32, kSigTrap)});
+    return 3;
+}
+
 } // namespace
 
 bool antiDebuggingModule(Module &M, ir::IRRandom &rng) {
@@ -974,6 +1074,34 @@ bool timingOracleModule(Module &M, ir::IRRandom &rng) {
 
     IRBuilder<> B(&ctor->getEntryBlock());
     B.CreateCall(oracle);
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, ctor, 0);
+    return true;
+}
+
+bool trapOracleModule(Module &M, ir::IRRandom &rng) {
+    const Triple tt(M.getTargetTriple());
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    constexpr int kSigTrap = 5;
+
+    Function *ctor = makeCtorShell(M, "morok.trap");
+    GlobalVariable *state = trapOracleState(M, rng);
+    GlobalVariable *counter = trapHitCounter(M);
+    Function *handler = trapSignalHandler(M, counter, state);
+
+    IRBuilder<> B(&ctor->getEntryBlock());
+    B.CreateStore(ConstantInt::get(i32, 0), counter)->setVolatile(true);
+    Value *oldHandler =
+        B.CreateCall(signalDecl(M), {ConstantInt::get(i32, kSigTrap), handler},
+                     "morok.trap.old.handler");
+    unsigned expected = emitTrapStimuli(B, M, tt);
+    auto *hits = B.CreateLoad(i32, counter, "morok.trap.hits.final");
+    hits->setVolatile(true);
+    foldState(B, state, hits, 0x91D0F736B52C48EAULL, "morok.trap.final");
+    foldFlag(B, state, B.CreateICmpULT(hits, ConstantInt::get(i32, expected)),
+             0xE2AB41739D08C6F5ULL, "morok.trap.missing");
+    B.CreateCall(signalDecl(M), {ConstantInt::get(i32, kSigTrap), oldHandler});
     B.CreateRetVoid();
     appendToGlobalCtors(M, ctor, 0);
     return true;
@@ -1062,6 +1190,12 @@ PreservedAnalyses TimingOraclePass::run(Module &M, ModuleAnalysisManager &) {
     ir::IRRandom rng(engine_);
     return timingOracleModule(M, rng) ? PreservedAnalyses::none()
                                       : PreservedAnalyses::all();
+}
+
+PreservedAnalyses TrapOraclePass::run(Module &M, ModuleAnalysisManager &) {
+    ir::IRRandom rng(engine_);
+    return trapOracleModule(M, rng) ? PreservedAnalyses::none()
+                                    : PreservedAnalyses::all();
 }
 
 } // namespace morok::passes

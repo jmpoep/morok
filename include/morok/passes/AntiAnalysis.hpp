@@ -10,7 +10,8 @@
 //   • AntiHooking    — checks a function prologue for inline-hook trampolines.
 //   • AntiClassDump  — scrambles Objective-C metadata (no-op on non-ObjC code).
 //   • TimingOracle   — samples independent clocks around short spans.
-// All four are module passes that add code/metadata without altering the
+//   • TrapOracle     — checks whether SIGTRAP/int3-style traps reach the app.
+// All five are module passes that add code/metadata without altering the
 // program's observable behaviour in an un-instrumented run.
 
 #ifndef MOROK_PASSES_ANTI_ANALYSIS_HPP
@@ -50,6 +51,11 @@ bool antiClassDumpModule(llvm::Module &M);
 /// anomalies into hidden state.  Returns true if code was added.
 bool timingOracleModule(llvm::Module &M, morok::ir::IRRandom &rng);
 
+/// Inject a trap-delivery oracle.  The emitted constructor temporarily installs
+/// a SIGTRAP handler, triggers a few architecture-appropriate traps, and folds
+/// missing delivery into hidden state.  Returns true if code was added.
+bool trapOracleModule(llvm::Module &M, morok::ir::IRRandom &rng);
+
 class AntiDebuggingPass : public llvm::PassInfoMixin<AntiDebuggingPass> {
 public:
     explicit AntiDebuggingPass(std::uint64_t seed = 0xA17D3B9u)
@@ -83,6 +89,18 @@ public:
 class TimingOraclePass : public llvm::PassInfoMixin<TimingOraclePass> {
 public:
     explicit TimingOraclePass(std::uint64_t seed = 0x710C10C5u)
+        : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
+
+    llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
+    static bool isRequired() { return true; }
+
+private:
+    core::Xoshiro256pp engine_;
+};
+
+class TrapOraclePass : public llvm::PassInfoMixin<TrapOraclePass> {
+public:
+    explicit TrapOraclePass(std::uint64_t seed = 0x7A9A7A9Au)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);

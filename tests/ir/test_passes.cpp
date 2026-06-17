@@ -8761,6 +8761,48 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("trapOracleModule emits x86 trap stimuli and SIGTRAP handler") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(885);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::trapOracleModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.trap");
+    Function *Handler = M->getFunction("morok.trap.handler");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Handler != nullptr);
+    CHECK(M->getGlobalVariable("morok.trap.state", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.trap.hits", true) != nullptr);
+    CHECK(M->getFunction("signal") != nullptr);
+    CHECK(hasInlineAsmCall(*Ctor));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("trapOracleModule emits portable raise fallback on Darwin arm64") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "arm64-apple-macosx13.0.0"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(886);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::trapOracleModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.trap");
+    REQUIRE(Ctor != nullptr);
+    CHECK(M->getFunction("morok.trap.handler") != nullptr);
+    CHECK(M->getFunction("signal") != nullptr);
+    CHECK(M->getFunction("raise") != nullptr);
+    CHECK_FALSE(hasInlineAsmCall(*Ctor));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("probability 0 is a no-op") {
     LLVMContext ctx;
     auto M = parse(ctx, kArith);

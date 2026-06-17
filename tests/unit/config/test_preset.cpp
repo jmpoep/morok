@@ -74,6 +74,7 @@ TEST_CASE("low preset matches the documented table") {
     CHECK(c.csm.enabled == false);
     CHECK(c.flatten.enabled == false);
     CHECK(c.timing_oracles.enabled == false);
+    CHECK(c.trap_oracles.enabled == false);
 }
 
 TEST_CASE("mid preset matches the documented table") {
@@ -376,6 +377,7 @@ TEST_CASE("max preset enables every pass at full intensity") {
     CHECK(c.anti_dbg.enabled == true);
     CHECK(c.anti_class_dump.enabled == true);
     CHECK(c.timing_oracles.enabled == true);
+    CHECK(c.trap_oracles.enabled == true);
 
     // Probabilities are pinned at 100 and budgets exceed the high preset.
     CHECK(c.bcf.probability == 100u);

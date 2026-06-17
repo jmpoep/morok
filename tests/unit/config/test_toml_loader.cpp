@@ -236,6 +236,8 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     warmup = 128
     [passes.timing_oracles]
     enabled = true
+    [passes.trap_oracles]
+    enabled = true
   )");
     REQUIRE(r.ok);
     // From the mid preset base:
@@ -382,6 +384,7 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.csm.nested_dispatch == true);
     CHECK(r.config.passes.csm.warmup == 128u);
     CHECK(r.config.passes.timing_oracles.enabled == true);
+    CHECK(r.config.passes.trap_oracles.enabled == true);
 }
 
 TEST_CASE("string-array filters are parsed") {

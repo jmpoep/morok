@@ -192,3 +192,6 @@ enabled = true
 
 [passes.timing_oracles]
 enabled = true
+
+[passes.trap_oracles]
+enabled = true

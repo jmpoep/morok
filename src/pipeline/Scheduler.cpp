@@ -180,7 +180,7 @@ bool hasSensitiveGeneratedPrefix(StringRef Name) {
            Name.starts_with("morok.mg.diff.") ||
            Name.starts_with("morok.antidbg") ||
            Name.starts_with("morok.antihook") ||
-           Name.starts_with("morok.timing");
+           Name.starts_with("morok.timing") || Name.starts_with("morok.trap");
 }
 
 bool isSensitiveGeneratedFunction(const Function &F) {
@@ -296,6 +296,9 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         changed |= passes::antiDebuggingModule(M, rng);
     if (config_.passes.timing_oracles.enabled.value_or(false))
         changed |= passes::timingOracleModule(M, rng);
+    if (config_.passes.trap_oracles.enabled.value_or(false))
+        changed |= passes::trapOracleModule(M, rng);
+
 
     // Hide library imports behind dlsym.
     if (InitialModuleGrowthOk && config_.passes.fco.enabled.value_or(false)) {
