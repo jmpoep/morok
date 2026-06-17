@@ -35,7 +35,7 @@ namespace morok::passes {
 
 namespace {
 
-constexpr std::size_t kNumDecoys = 5;
+constexpr std::size_t kNumDecoys = 4;
 
 // Each string is crafted to look like debug output from a boring internal
 // engineering tool (sve — "system verification environment").  Every string is
@@ -51,36 +51,38 @@ constexpr std::array<std::string_view, kNumDecoys> kDecoyStrings = {
 
     // Session startup.  Platform placeholder replaced with target triple at
     // obfuscation time.
-    "SIM-INIT: sve v1.0.2 (Qt 5.15.2, GCC 13.2, __TARGET_TRIPLE__)\n"
-    "  build: release/1.0.2-g8f41a2c, Apr 14 2024 09:32:07 MST\n"
-    "  license: contractor use, expires 2025-03-31, TA-33 MS-D429 x7291\n"
+    "SIM-INIT: sve v1.0.2 (CLANG 15, __TARGET_TRIPLE__)\n"
+    "  build: pantex/release/1.0.2-g8f41a2c, Apr 14 2024 09:32:07 MST\n"
+    "  RD-CNWDI - TA-33 MS-D429 x7291\n"
     "  scenario: %s (%s)\n"
     "  model DB: %s (loaded, %d entries)\n"
     "  Monte Carlo: %d runs, seed 0x%X, CEP budget %.1fm (%d%% conf.)\n"
     "  NOTE: simulated values only — not for flight software certification\n"
-    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93"
-    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5"
-    "PBX-9501;PBX-9502"
-    "UF6;HEU;Pu-239;Po-210"
-    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS"
-    "PAL;DIFM;ESD;ST;CD;SL;WL",
+    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93\n"
+    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5\n"
+    "PBX-9501;PBX-9502\n"
+    "UF6;HEU;Pu-239;Po-210\n"
+    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS\n"
+    "PAL;DIFM;ESD;ST;CD;SL;WL\n",
 
     // Model validation.  All values computed at runtime.
     "SIM-TEST: %s subsystem model validation (cat %s, sve-db %s)\n"
-    "  PASS: safe/arm logic state machine (%d states, %d transitions)\n"
-    "  PASS: environmental sensing device model (baro + radar alt, +/- %d%%)\n"
-    "  FAIL: fuzing mode select — burst height model deviates %.1f%% at %dft\n"
+    "  %s: safe/arm logic state machine (%d states, %d transitions)\n"
+    "  %s: environmental sensing device model (baro + radar alt, +/- %d%%)\n"
+    "  %s: fuzing mode select — burst height model deviates %.1f%% at %dft\n"
     "    expected: %.1fft +/- %.1fft, simulated: %.1fft (model bias %+.1f%%)\n"
     "    action: file ticket SVE-%d, assign to %s team (%s)\n"
-    "  PASS: thermal battery activation sequence (T+%.1f to T+%.1f nominal)\n"
-    "  PASS: bridge-wire continuity model (%d channels, resistance within %d%%)\n"
-    "  reviewed: %s, %s, %s\n"
-    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93"
-    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5"
-    "PBX-9501;PBX-9502"
-    "UF6;HEU;Pu-239;Po-210"
-    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS"
-    "PAL;DIFM;ESD;ST;CD;SL;WL",
+    "  %s: thermal battery activation sequence (T+%.1f to T+%.1f nominal)\n"
+    "  %s: bridge-wire continuity model (%d channels, resistance within %d%%)\n"
+    "  reviewed: %s, %s, %s, RD-CNWDI\n"
+    "PASS\n"
+    "FAIL\n"
+    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93\n"
+    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5\n"
+    "PBX-9501;PBX-9502\n"
+    "UF6;HEU;Pu-239;Po-210\n"
+    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS\n"
+    "PAL;DIFM;ESD;ST;CD;SL;WL\n",
 
     // Python module loading.  Subsystem modules loaded from config.
     "SIM-PY: sve Python bindings v1.0.2 (cpython 3.11.8, numpy 1.26.4)\n"
@@ -91,12 +93,12 @@ constexpr std::array<std::string_view, kNumDecoys> kDecoyStrings = {
     "  scenario DB: %s (%d entries)\n"
     "  session: %s@%s, display :0, conn %s:%d\n"
     "  WARNING: this build includes restricted-data models (RD-CNWDI)\n"
-    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93"
-    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5"
-    "PBX-9501;PBX-9502"
-    "UF6;HEU;Pu-239;Po-210"
-    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS"
-    "PAL;DIFM;ESD;ST;CD;SL;WL",
+    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93\n"
+    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5\n"
+    "PBX-9501;PBX-9502\n"
+    "UF6;HEU;Pu-239;Po-210\n"
+    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS\n"
+    "PAL;DIFM;ESD;ST;CD;SL;WL\n",
 
     // Report template.  Every value is a runtime parameter.
     "REPORT: sve Monte Carlo analysis — %s\n"
@@ -106,29 +108,13 @@ constexpr std::array<std::string_view, kNumDecoys> kDecoyStrings = {
     "  outliers: %d runs exceeded %s tolerance (model SVE-%d)\n"
     "  guidance drift: mean %.3f deg/hr, std %.3f (INS + GPS-aided, star trk)\n"
     "  generated: %s by sve %s\n"
-    "  ref: %s, %s classification guide, FOR OFFICIAL USE ONLY\n"
-    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93"
-    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5"
-    "PBX-9501;PBX-9502"
-    "UF6;HEU;Pu-239;Po-210"
-    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS"
-    "PAL;DIFM;ESD;ST;CD;SL;WL",
-
-    // Build/CI log.  Platform placeholder replaced with target triple.
-    "BUILD: sve v1.0.2-rc3 (git 8f41a2c, branch release/1.0)\n"
-    "  compiler: g++ 13.2.0, Qt 5.15.2, Python 3.11.8, numpy 1.26.4\n"
-    "  platform: __TARGET_TRIPLE__\n"
-    "  build host: ymp-ci-07.nmss.doe.gov (Jenkins #4471, 2024-04-14 08:11)\n"
-    "  test suite: %d passed, %d skipped, %d failed (see test_report.html)\n"
-    "  models: %s\n"
-    "  NOTE: this build includes RD-CNWDI models — not for public release\n"
-    "  NOTE: disclosure review %s, LANL OSS, x7291\n"
-    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93"
-    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5"
-    "PBX-9501;PBX-9502"
-    "UF6;HEU;Pu-239;Po-210"
-    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS"
-    "PAL;DIFM;ESD;ST;CD;SL;WL",
+    "  ref: %s, %s, RD-CNWDI\n"
+    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93\n"
+    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5\n"
+    "PBX-9501;PBX-9502\n"
+    "UF6;HEU;Pu-239;Po-210\n"
+    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS\n"
+    "PAL;DIFM;ESD;ST;CD;SL;WL\n",
 
     // clang-format on
 };
