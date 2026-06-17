@@ -5,11 +5,11 @@
 // morok/passes/TraceKeying.cpp
 //
 // Execution-trace keying.  This pass threads a private rolling hash through
-// selected CFG edges, then guards selected blocks by comparing a volatile
-// accumulator load with the edge-carried expected value.  The valid path is
-// semantics-neutral; if instrumentation or replay perturbs the order, branch
-// conditions and integer returns are keyed by the accumulator mismatch and the
-// block guard traps.
+// selected CFG edges and bounded live scalar values, then guards selected blocks
+// by comparing a volatile accumulator load with the edge-carried expected
+// value.  The valid path is semantics-neutral; if instrumentation or replay
+// perturbs the order or value trace, branch conditions and integer returns are
+// keyed by the accumulator mismatch and the block guard traps.
 
 #include "morok/passes/TraceKeying.hpp"
 
@@ -44,6 +44,7 @@ namespace morok::passes {
 namespace {
 
 constexpr char kSeedName[] = "morok.trace.seed";
+constexpr std::uint32_t kMaxValueTerms = 4;
 
 struct GuardedBlock {
     BasicBlock *guard = nullptr;
@@ -140,6 +141,74 @@ Value *mix64(IRBuilder<NoFolder> &B, Value *State, Value *Tag,
                     "morok.trace.edge.mix");
     return B.CreateMul(X, ConstantInt::get(I64, 0xc4ceb9fe1a85ec53ULL),
                        "morok.trace.edge.mix");
+}
+
+Value *traceValueBits(IRBuilder<NoFolder> &B, Value *V) {
+    auto *I64 = B.getInt64Ty();
+    Type *Ty = V->getType();
+    if (Ty->isVoidTy() || Ty->isTokenTy() || Ty->isMetadataTy())
+        return nullptr;
+
+    if (auto *IT = dyn_cast<IntegerType>(Ty)) {
+        if (IT->getBitWidth() > 64)
+            return nullptr;
+        Value *Frozen = B.CreateFreeze(V, "morok.trace.value.freeze");
+        return B.CreateZExtOrTrunc(Frozen, I64, "morok.trace.value.bits");
+    }
+    if (Ty->isPointerTy()) {
+        Value *Frozen = B.CreateFreeze(V, "morok.trace.value.freeze");
+        return B.CreatePtrToInt(Frozen, I64, "morok.trace.value.bits");
+    }
+    if (Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+        Ty->isDoubleTy()) {
+        unsigned Bits = static_cast<unsigned>(Ty->getPrimitiveSizeInBits());
+        if (Bits == 0 || Bits > 64)
+            return nullptr;
+        Value *Frozen = B.CreateFreeze(V, "morok.trace.value.freeze");
+        auto *Carrier = IntegerType::get(Ty->getContext(), Bits);
+        Value *Raw = B.CreateBitCast(Frozen, Carrier,
+                                     "morok.trace.value.rawbits");
+        return B.CreateZExtOrTrunc(Raw, I64, "morok.trace.value.bits");
+    }
+    return nullptr;
+}
+
+Value *mixRuntimeValue(IRBuilder<NoFolder> &B, Value *Acc, Value *V,
+                       ir::IRRandom &Rng) {
+    Value *Bits = traceValueBits(B, V);
+    if (!Bits)
+        return Acc;
+    return mix64(B, Acc, Bits, Rng.next());
+}
+
+Value *valueTraceTag(IRBuilder<NoFolder> &B, Instruction &Term, Value *EdgeTag,
+                     ir::IRRandom &Rng) {
+    Value *Tag = EdgeTag;
+
+    if (auto *BI = dyn_cast<BranchInst>(&Term)) {
+        if (BI->isConditional())
+            Tag = mixRuntimeValue(B, Tag, BI->getCondition(), Rng);
+    } else if (auto *SI = dyn_cast<SwitchInst>(&Term)) {
+        Tag = mixRuntimeValue(B, Tag, SI->getCondition(), Rng);
+    }
+
+    std::uint32_t Terms = 0;
+    auto It = Term.getIterator();
+    while (It != Term.getParent()->begin() && Terms < kMaxValueTerms) {
+        --It;
+        Instruction &Candidate = *It;
+        if (Candidate.getName().starts_with("morok.trace.") ||
+            isa<DbgInfoIntrinsic>(&Candidate))
+            continue;
+        if (Candidate.getType()->isVoidTy())
+            continue;
+        Value *Mixed = mixRuntimeValue(B, Tag, &Candidate, Rng);
+        if (Mixed != Tag) {
+            Tag = Mixed;
+            ++Terms;
+        }
+    }
+    return Tag;
 }
 
 Value *asReturnWidth(IRBuilder<NoFolder> &B, Value *Diff, Type *Ty) {
@@ -326,7 +395,8 @@ Value *insertEdgeUpdate(Instruction &Term, AllocaInst *State,
     Cur->setVolatile(true);
     Cur->setAlignment(Align(8));
     Value *Tag = selectedEdgeTag(B, Term, KeyOf, Rng);
-    Value *Next = mix64(B, Cur, Tag, Rng.next());
+    Value *RuntimeTag = valueTraceTag(B, Term, Tag, Rng);
+    Value *Next = mix64(B, Cur, RuntimeTag, Rng.next());
     auto *Store = B.CreateStore(Next, State);
     Store->setVolatile(true);
     Store->setAlignment(Align(8));

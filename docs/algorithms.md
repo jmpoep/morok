@@ -903,8 +903,15 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Selected non-entry direct-CFG blocks receive a `morok.trace.expected` PHI.  For
   every predecessor branch or switch edge into selected blocks, the pass loads
   the current accumulator, selects an edge tag based on the actual successor,
-  applies an avalanche-style rolling hash, stores it back volatile, and feeds
-  the new value into the successor's expected PHI.
+  freezes and normalizes a bounded set of live scalar values near the edge,
+  folds those runtime values into the edge tag with the same avalanche primitive,
+  stores the resulting rolling hash back volatile, and feeds the new value into
+  the successor's expected PHI.
+- This is an oblivious runtime hash over branch and value trace, not a static
+  byte checksum.  Integer, pointer, and scalar FP values are normalized to `i64`
+  after `freeze`, so extra uses of poison-producing computations do not change
+  valid-program semantics while still making replay/emulation reproduce the
+  observed value trace.
 - At the selected block entry, a volatile accumulator load is compared with the
   expected edge value.  The normal body is reached only through
   `morok.trace.guard`; the mismatch edge calls `llvm.trap`, so replay or

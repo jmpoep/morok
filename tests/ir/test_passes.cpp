@@ -7096,6 +7096,7 @@ no:
     std::size_t branchKeys = 0;
     std::size_t returnKeys = 0;
     std::size_t edgeMixes = 0;
+    std::size_t valueTerms = 0;
     for (BasicBlock &BB : *F) {
         failBlocks += BB.getName().starts_with("morok.trace.fail") ? 1u : 0u;
         for (Instruction &I : BB) {
@@ -7105,6 +7106,8 @@ no:
                 ++expectedPhis;
             if (I.getName().starts_with("morok.trace.edge.mix"))
                 ++edgeMixes;
+            if (I.getName().starts_with("morok.trace.value.bits"))
+                ++valueTerms;
             if (auto *LI = dyn_cast<LoadInst>(&I))
                 volatileLoads += LI->isVolatile() ? 1u : 0u;
             if (auto *SI = dyn_cast<StoreInst>(&I))
@@ -7129,6 +7132,7 @@ no:
     CHECK(branchKeys >= 1u);
     CHECK(returnKeys >= 1u);
     CHECK(edgeMixes >= 3u);
+    CHECK(valueTerms >= 3u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
