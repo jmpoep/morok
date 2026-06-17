@@ -8780,19 +8780,35 @@ define i32 @caller() {
     // a computed stack pointer (an alloca), not a direct global string.
     Function *Caller = M->getFunction("caller");
     REQUIRE(Caller);
+    CallInst *DlsymCall = nullptr;
     bool hasVolatileLoad = false;
     bool dlsymTakesAlloca = false;
+    bool indirectUsesDecodedPointer = false;
     for (Instruction &I : instructions(*Caller)) {
         if (auto *LI = dyn_cast<LoadInst>(&I))
             hasVolatileLoad |= LI->isVolatile();
-        if (auto *CI = dyn_cast<CallInst>(&I))
-            if (Function *Cee = CI->getCalledFunction())
-                if (Cee->getName() == "dlsym")
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+            if (Function *Cee = CI->getCalledFunction()) {
+                if (Cee->getName() == "dlsym") {
+                    DlsymCall = CI;
                     dlsymTakesAlloca |= isa<AllocaInst>(
                         CI->getArgOperand(1)->stripInBoundsOffsets());
+                }
+            } else if (auto *I2P =
+                           dyn_cast<IntToPtrInst>(CI->getCalledOperand())) {
+                indirectUsesDecodedPointer =
+                    I2P->getName().starts_with("morok.fco.ptr.dec");
+            }
+        }
     }
+    REQUIRE(DlsymCall != nullptr);
+    for (User *U : DlsymCall->users())
+        CHECK(isa<PtrToIntInst>(U));
     CHECK(hasVolatileLoad);
     CHECK(dlsymTakesAlloca);
+    CHECK(indirectUsesDecodedPointer);
+    CHECK(countNamedAllocas(*Caller, "morok.fco.ptr.slot") == 1u);
+    CHECK(countNamedInstructions(*Caller, "morok.fco.ptr.enc") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

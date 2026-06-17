@@ -982,13 +982,16 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - FunctionWrapper: polymorphic proxies including concrete variadic call/invoke sites; prob/times/max_wrappers/hard cap 256.
 - FunctionCallObfuscate: dlsym indirection; hard cap 256 call/invoke sites. The
   symbol name is never stored or recovered as a readable string: each site
-  carries its own ciphertext (a `morok.fco.c` byte global) and its own unrolled
-  MurmurHash3-finalizer keystream, keyed on `k0 = (volatile load of the mutable
-  module seed `morok.fco.s`) ^ siteKey`. The volatile load is opaque to the
-  optimizer, so the cipher never folds back to text; per-site `siteKey`/`mul`
-  diversity means cracking one site does not crack the others. The recovered
-  name is decrypted into a stack buffer that feeds `dlsym`, so a decompiler sees
-  `dlsym(RTLD_DEFAULT, <computed buffer>)` with no symbol to annotate.
+  carries its own ciphertext (a `morok.cloak.c` byte global) and its own
+  unrolled per-site keystream, keyed on `k0 = (volatile load of the mutable
+  module seed `morok.cloak.seed`) ^ siteKey`. The recovered name is decrypted
+  into a stack buffer that feeds `dlsym`, so a decompiler sees
+  `dlsym(RTLD_DEFAULT, <computed buffer>)` with no symbol to annotate. The
+  returned import pointer is then immediately encoded as an integer with
+  per-site reversible math, stored only in a volatile `morok.fco.ptr.slot`, and
+  decoded with a fresh volatile key load immediately before the indirect
+  call/invoke.  There is no reusable plaintext function-pointer slot for static
+  IAT-style recovery.
 - AntiClassDump / AntiDebugging / AntiHooking / TimingOracle / TrapOracle:
   platform anti-analysis
   (module passes). AntiDebugging combines startup checks with a mutable hidden
