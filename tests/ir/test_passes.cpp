@@ -10882,6 +10882,70 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("windowsUnhookModule emits KnownDlls text remap probes") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-pc-windows-msvc"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(7141);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::windowsUnhookModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.win.unhook");
+    Function *Probe = M->getFunction("morok.win.unhook.probe");
+    Function *Helper = M->getFunction("morok.win.unhook.known");
+    Function *Text = M->getFunction("morok.win.pe.text");
+    Function *Peb = M->getFunction("morok.win.peb");
+    Function *Resolve = M->getFunction("morok.win.pe.resolve");
+    Function *Ldr = M->getFunction("morok.win.ldr.module");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Probe != nullptr);
+    REQUIRE(Helper != nullptr);
+    REQUIRE(Text != nullptr);
+    REQUIRE(Peb != nullptr);
+    REQUIRE(Resolve != nullptr);
+    REQUIRE(Ldr != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
+    CHECK(M->getFunction("NtOpenSection") == nullptr);
+    CHECK(M->getFunction("NtMapViewOfSection") == nullptr);
+    CHECK(M->getFunction("NtProtectVirtualMemory") == nullptr);
+    CHECK(M->getFunction("NtUnmapViewOfSection") == nullptr);
+    CHECK(M->getFunction("NtClose") == nullptr);
+    CHECK(hasInlineAsmCall(*Peb));
+    CHECK(countNamedInstructions(*Text, "morok.win.pe.text.name.match") >= 1u);
+    CHECK(countNamedInstructions(*Text, "morok.win.pe.text.pack") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.unhook.ntopensection") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.unhook.ntmapview") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.unhook.ntprotect") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.unhook.ntdll.status") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.unhook.kernel32.status") >=
+          1u);
+    CHECK(countNamedInstructions(*Helper,
+                                 "morok.win.unhook.ntopensection.status") >=
+          1u);
+    CHECK(countNamedInstructions(*Helper, "morok.win.unhook.ntmapview.status") >=
+          1u);
+    CHECK(countNamedInstructions(*Helper, "morok.win.unhook.live.text") >= 1u);
+    CHECK(countNamedInstructions(*Helper, "morok.win.unhook.mapped.text") >=
+          1u);
+    CHECK(countNamedInstructions(*Helper, "morok.win.unhook.ntprotect.status") >=
+          1u);
+    CHECK(countNamedInstructions(*Helper, "morok.win.unhook.copy.qword") >= 1u);
+    CHECK(countNamedInstructions(*Helper, "morok.win.unhook.copy.byte") >= 1u);
+    CHECK(countNamedInstructions(*Helper,
+                                 "morok.win.unhook.ntprotect.restore") >= 1u);
+    CHECK(countNamedInstructions(*Helper, "morok.win.unhook.ntunmap.status") >=
+          1u);
+    CHECK(countNamedInstructions(*Helper, "morok.win.unhook.ntclose.status") >=
+          1u);
+    CHECK_FALSE(hasReadableByteString(*M, "KnownDlls"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("timingOracleModule emits x86 rdtscp and raw clock probes") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

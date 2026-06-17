@@ -8247,6 +8247,476 @@ Function *windowsPeExportResolver(Module &M) {
     return fn;
 }
 
+Function *windowsPeTextSection(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.pe.text"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, {ip}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.pe.text", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *base = fn->getArg(0);
+    base->setName("base");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *headersBB = BasicBlock::Create(ctx, "headers", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
+    auto *foundBB = BasicBlock::Create(ctx, "found", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
+
+    IRBuilder<> B(entry);
+    Value *basePtr = B.CreateIntToPtr(base, ptr, "morok.win.pe.text.base.ptr");
+    Value *mz = loadAt(B, M, i16, basePtr, 0ULL, "morok.win.pe.text.mz");
+    B.CreateCondBr(B.CreateICmpEQ(mz, ConstantInt::get(i16, 0x5A4D)),
+                   headersBB, ret0BB);
+
+    IRBuilder<> HB(headersBB);
+    Value *lfanew32 = loadAt(HB, M, i32, basePtr, 0x3c,
+                             "morok.win.pe.text.lfanew");
+    Value *lfanew = HB.CreateZExt(lfanew32, ip, "morok.win.pe.text.lfanew.ip");
+    Value *ntPtr = gepI8(HB, M, basePtr, lfanew, "morok.win.pe.text.nt");
+    Value *sig = loadAt(HB, M, i32, ntPtr, 0ULL, "morok.win.pe.text.sig");
+    Value *sections =
+        loadAt(HB, M, i16, ntPtr, 6, "morok.win.pe.text.sections");
+    Value *optSize =
+        loadAt(HB, M, i16, ntPtr, 20, "morok.win.pe.text.opt.size");
+    Value *sectionBase = gepI8(
+        HB, M, ntPtr,
+        HB.CreateAdd(ConstantInt::get(ip, 24),
+                     HB.CreateZExt(optSize, ip, "morok.win.pe.text.opt.ip"),
+                     "morok.win.pe.text.section.off"),
+        "morok.win.pe.text.section.base");
+    Value *sectionCount = HB.CreateZExt(sections, i32,
+                                        "morok.win.pe.text.section.count");
+    Value *limit = HB.CreateSelect(
+        HB.CreateICmpULT(sectionCount, ConstantInt::get(i32, 96)),
+        sectionCount, ConstantInt::get(i32, 96),
+        "morok.win.pe.text.section.limit");
+    Value *headersOk = HB.CreateAnd(
+        HB.CreateICmpEQ(sig, ConstantInt::get(i32, 0x4550)),
+        HB.CreateICmpNE(limit, ConstantInt::get(i32, 0)),
+        "morok.win.pe.text.headers.ok");
+    HB.CreateCondBr(headersOk, loopBB, ret0BB);
+
+    IRBuilder<> LB(loopBB);
+    auto *idx = LB.CreatePHI(i32, 2, "morok.win.pe.text.idx");
+    idx->addIncoming(ConstantInt::get(i32, 0), headersBB);
+    LB.CreateCondBr(LB.CreateICmpULT(idx, limit,
+                                     "morok.win.pe.text.idx.in.range"),
+                    bodyBB, ret0BB);
+
+    IRBuilder<> SB(bodyBB);
+    Value *idxIp = SB.CreateZExt(idx, ip, "morok.win.pe.text.idx.ip");
+    Value *sectionPtr =
+        gepI8(SB, M, sectionBase,
+              SB.CreateMul(idxIp, ConstantInt::get(ip, 40),
+                           "morok.win.pe.text.section.stride"),
+              "morok.win.pe.text.section.ptr");
+    Value *name0 =
+        loadAt(SB, M, i32, sectionPtr, 0ULL, "morok.win.pe.text.name0");
+    Value *virtualSize =
+        loadAt(SB, M, i32, sectionPtr, 8, "morok.win.pe.text.virtual.size");
+    Value *virtualRva =
+        loadAt(SB, M, i32, sectionPtr, 12, "morok.win.pe.text.rva");
+    Value *rawSize =
+        loadAt(SB, M, i32, sectionPtr, 16, "morok.win.pe.text.raw.size");
+    Value *chars =
+        loadAt(SB, M, i32, sectionPtr, 36, "morok.win.pe.text.characteristics");
+    Value *nameHit =
+        SB.CreateICmpEQ(name0, ConstantInt::get(i32, 0x7865742e),
+                        "morok.win.pe.text.name.match");
+    Value *isCode =
+        SB.CreateICmpNE(SB.CreateAnd(chars, ConstantInt::get(i32, 0x20)),
+                        ConstantInt::get(i32, 0),
+                        "morok.win.pe.text.code.flag");
+    Value *isExecute = SB.CreateICmpNE(
+        SB.CreateAnd(chars, ConstantInt::get(i32, 0x20000000)),
+        ConstantInt::get(i32, 0), "morok.win.pe.text.execute.flag");
+    Value *size = SB.CreateSelect(
+        SB.CreateICmpNE(virtualSize, ConstantInt::get(i32, 0)),
+        virtualSize, rawSize, "morok.win.pe.text.size");
+    Value *sectionOk = SB.CreateAnd(
+        SB.CreateOr(nameHit, SB.CreateAnd(isCode, isExecute,
+                                          "morok.win.pe.text.code.exec"),
+                    "morok.win.pe.text.kind"),
+        SB.CreateAnd(SB.CreateICmpNE(size, ConstantInt::get(i32, 0)),
+                     SB.CreateICmpNE(virtualRva, ConstantInt::get(i32, 0)),
+                     "morok.win.pe.text.bounds"),
+        "morok.win.pe.text.match");
+    SB.CreateCondBr(sectionOk, foundBB, nextBB);
+
+    IRBuilder<> FB(foundBB);
+    Value *packed = FB.CreateOr(
+        FB.CreateZExt(virtualRva, i64),
+        FB.CreateShl(FB.CreateZExt(size, i64), ConstantInt::get(i64, 32)),
+        "morok.win.pe.text.pack");
+    FB.CreateRet(packed);
+
+    IRBuilder<> NB(nextBB);
+    Value *nextIdx =
+        NB.CreateAdd(idx, ConstantInt::get(i32, 1),
+                     "morok.win.pe.text.next");
+    NB.CreateBr(loopBB);
+    idx->addIncoming(nextIdx, nextBB);
+
+    IRBuilder<> RB(ret0BB);
+    RB.CreateRet(ConstantInt::get(i64, 0));
+    return fn;
+}
+
+Value *storeWindowsWideLiteral(IRBuilderBase &B, Module &M,
+                               std::initializer_list<char> Chars,
+                               const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *arrTy = ArrayType::get(i16, Chars.size() + 1);
+    AllocaInst *buf = B.CreateAlloca(arrTy, nullptr, Name + ".buf");
+    unsigned idx = 0;
+    for (char ch : Chars) {
+        storeAt(B, M, buf, static_cast<unsigned long long>(idx) * 2ULL,
+                ConstantInt::get(i16, static_cast<unsigned char>(ch)),
+                Name + ".char");
+        ++idx;
+    }
+    storeAt(B, M, buf, static_cast<unsigned long long>(idx) * 2ULL,
+            ConstantInt::get(i16, 0), Name + ".nul");
+    return buf;
+}
+
+Function *windowsKnownDllUnhookHelper(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.unhook.known"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(
+        FunctionType::get(i32, {ip, ptr, i16, ip, ip, ip, ip, ip}, false),
+        GlobalValue::PrivateLinkage, "morok.win.unhook.known", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *liveBase = fn->getArg(0);
+    liveBase->setName("live_base");
+    Argument *wideName = fn->getArg(1);
+    wideName->setName("wide_name");
+    Argument *nameBytes = fn->getArg(2);
+    nameBytes->setName("name_bytes");
+    Argument *openSection = fn->getArg(3);
+    openSection->setName("open_section");
+    Argument *mapView = fn->getArg(4);
+    mapView->setName("map_view");
+    Argument *unmapView = fn->getArg(5);
+    unmapView->setName("unmap_view");
+    Argument *protect = fn->getArg(6);
+    protect->setName("protect");
+    Argument *close = fn->getArg(7);
+    close->setName("close");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *openBB = BasicBlock::Create(ctx, "open", fn);
+    auto *mapBB = BasicBlock::Create(ctx, "map", fn);
+    auto *textBB = BasicBlock::Create(ctx, "text", fn);
+    auto *protectBB = BasicBlock::Create(ctx, "protect", fn);
+    auto *qLoopBB = BasicBlock::Create(ctx, "copy.q.loop", fn);
+    auto *qBodyBB = BasicBlock::Create(ctx, "copy.q.body", fn);
+    auto *byteLoopBB = BasicBlock::Create(ctx, "copy.byte.loop", fn);
+    auto *byteBodyBB = BasicBlock::Create(ctx, "copy.byte.body", fn);
+    auto *restoreBB = BasicBlock::Create(ctx, "restore", fn);
+    auto *cleanupBB = BasicBlock::Create(ctx, "cleanup", fn);
+    auto *unmapBB = BasicBlock::Create(ctx, "unmap", fn);
+    auto *closeGateBB = BasicBlock::Create(ctx, "close.gate", fn);
+    auto *closeBB = BasicBlock::Create(ctx, "close", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    auto *unicodeTy = ArrayType::get(i8, 16);
+    auto *objectAttrTy = ArrayType::get(i8, 48);
+    AllocaInst *unicode =
+        B.CreateAlloca(unicodeTy, nullptr, "morok.win.unhook.unicode");
+    AllocaInst *objectAttrs =
+        B.CreateAlloca(objectAttrTy, nullptr, "morok.win.unhook.oa");
+    AllocaInst *sectionHandle =
+        B.CreateAlloca(ip, nullptr, "morok.win.unhook.section");
+    AllocaInst *viewBase =
+        B.CreateAlloca(ip, nullptr, "morok.win.unhook.view.base");
+    AllocaInst *viewSize =
+        B.CreateAlloca(ip, nullptr, "morok.win.unhook.view.size");
+    AllocaInst *baseSlot =
+        B.CreateAlloca(ip, nullptr, "morok.win.unhook.protect.base");
+    AllocaInst *sizeSlot =
+        B.CreateAlloca(ip, nullptr, "morok.win.unhook.protect.size");
+    AllocaInst *oldProt =
+        B.CreateAlloca(i32, nullptr, "morok.win.unhook.oldprot");
+    AllocaInst *result =
+        B.CreateAlloca(i32, nullptr, "morok.win.unhook.result");
+    B.CreateStore(ConstantInt::get(ip, 0), sectionHandle)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), viewBase)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), viewSize)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), baseSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), sizeSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), oldProt)->setVolatile(true);
+    B.CreateStore(ConstantInt::getSigned(i32, -1), result)->setVolatile(true);
+    storeAt(B, M, unicode, 0, nameBytes, "morok.win.unhook.us.length");
+    storeAt(B, M, unicode, 2,
+            B.CreateAdd(nameBytes, ConstantInt::get(i16, 2),
+                        "morok.win.unhook.us.max"),
+            "morok.win.unhook.us.max.store");
+    storeAt(B, M, unicode, 8, wideName, "morok.win.unhook.us.buffer");
+    storeAt(B, M, objectAttrs, 0, ConstantInt::get(i32, 48),
+            "morok.win.unhook.oa.length");
+    storeAt(B, M, objectAttrs, 8, ConstantPointerNull::get(ptr),
+            "morok.win.unhook.oa.root");
+    storeAt(B, M, objectAttrs, 16, unicode, "morok.win.unhook.oa.name");
+    storeAt(B, M, objectAttrs, 24, ConstantInt::get(i32, 0x40),
+            "morok.win.unhook.oa.attrs");
+    storeAt(B, M, objectAttrs, 32, ConstantPointerNull::get(ptr),
+            "morok.win.unhook.oa.sd");
+    storeAt(B, M, objectAttrs, 40, ConstantPointerNull::get(ptr),
+            "morok.win.unhook.oa.sqos");
+    Value *ready = B.CreateAnd(
+        B.CreateAnd(B.CreateICmpNE(liveBase, ConstantInt::get(ip, 0)),
+                    B.CreateICmpNE(wideName, ConstantPointerNull::get(ptr)),
+                    "morok.win.unhook.image.ready"),
+        B.CreateAnd(
+            B.CreateAnd(B.CreateICmpNE(openSection, ConstantInt::get(ip, 0)),
+                        B.CreateICmpNE(mapView, ConstantInt::get(ip, 0)),
+                        "morok.win.unhook.map.ready"),
+            B.CreateAnd(B.CreateICmpNE(unmapView, ConstantInt::get(ip, 0)),
+                        B.CreateAnd(
+                            B.CreateICmpNE(protect, ConstantInt::get(ip, 0)),
+                            B.CreateICmpNE(close, ConstantInt::get(ip, 0)),
+                            "morok.win.unhook.close.ready"),
+                        "morok.win.unhook.cleanup.ready"),
+            "morok.win.unhook.nt.ready"),
+        "morok.win.unhook.ready");
+    B.CreateCondBr(ready, openBB, retBB);
+
+    IRBuilder<> OB(openBB);
+    auto *openTy = FunctionType::get(i32, {ptr, i32, ptr}, false);
+    Value *openStatus = OB.CreateCall(
+        openTy, OB.CreateIntToPtr(openSection, ptr,
+                                  "morok.win.unhook.ntopensection.ptr"),
+        {sectionHandle, ConstantInt::get(i32, 0x0004), objectAttrs},
+        "morok.win.unhook.ntopensection.status");
+    OB.CreateStore(openStatus, result)->setVolatile(true);
+    OB.CreateCondBr(OB.CreateICmpSGE(openStatus, ConstantInt::get(i32, 0),
+                                     "morok.win.unhook.ntopensection.ok"),
+                    mapBB, cleanupBB);
+
+    IRBuilder<> MB(mapBB);
+    auto *mapTy = FunctionType::get(
+        i32, {ptr, ptr, ptr, ip, ip, ptr, ptr, i32, i32, i32}, false);
+    Value *sectionValue =
+        MB.CreateLoad(ip, sectionHandle, "morok.win.unhook.section.handle");
+    cast<LoadInst>(sectionValue)->setVolatile(true);
+    Value *mapStatus = MB.CreateCall(
+        mapTy,
+        MB.CreateIntToPtr(mapView, ptr, "morok.win.unhook.ntmapview.ptr"),
+        {MB.CreateIntToPtr(sectionValue, ptr, "morok.win.unhook.section.ptr"),
+         MB.CreateIntToPtr(ConstantInt::getSigned(ip, -1), ptr,
+                           "morok.win.unhook.current.process"),
+         viewBase, ConstantInt::get(ip, 0), ConstantInt::get(ip, 0),
+         ConstantPointerNull::get(ptr), viewSize, ConstantInt::get(i32, 1),
+         ConstantInt::get(i32, 0), ConstantInt::get(i32, 0x02)},
+        "morok.win.unhook.ntmapview.status");
+    MB.CreateStore(mapStatus, result)->setVolatile(true);
+    MB.CreateCondBr(MB.CreateICmpSGE(mapStatus, ConstantInt::get(i32, 0),
+                                     "morok.win.unhook.ntmapview.ok"),
+                    textBB, cleanupBB);
+
+    IRBuilder<> TB(textBB);
+    Function *textFinder = windowsPeTextSection(M);
+    Value *mappedBase =
+        TB.CreateLoad(ip, viewBase, "morok.win.unhook.mapped.base");
+    cast<LoadInst>(mappedBase)->setVolatile(true);
+    Value *liveText =
+        TB.CreateCall(textFinder, {liveBase}, "morok.win.unhook.live.text");
+    Value *mappedText =
+        TB.CreateCall(textFinder, {mappedBase}, "morok.win.unhook.mapped.text");
+    Value *liveRva32 = TB.CreateTrunc(liveText, i32,
+                                      "morok.win.unhook.live.rva32");
+    Value *mappedRva32 = TB.CreateTrunc(mappedText, i32,
+                                        "morok.win.unhook.mapped.rva32");
+    Value *liveSize32 =
+        TB.CreateTrunc(TB.CreateLShr(liveText, ConstantInt::get(i64, 32)),
+                       i32, "morok.win.unhook.live.size32");
+    Value *mappedSize32 =
+        TB.CreateTrunc(TB.CreateLShr(mappedText, ConstantInt::get(i64, 32)),
+                       i32, "morok.win.unhook.mapped.size32");
+    Value *minSize32 = TB.CreateSelect(
+        TB.CreateICmpULT(liveSize32, mappedSize32,
+                         "morok.win.unhook.size.live.smaller"),
+        liveSize32, mappedSize32, "morok.win.unhook.min.size32");
+    Value *copySize = TB.CreateZExt(
+        TB.CreateSelect(
+            TB.CreateICmpULT(minSize32, ConstantInt::get(i32, 0x01000000)),
+            minSize32, ConstantInt::get(i32, 0x01000000),
+            "morok.win.unhook.copy.size32"),
+        ip, "morok.win.unhook.copy.size");
+    Value *liveRva = TB.CreateZExt(liveRva32, ip,
+                                   "morok.win.unhook.live.rva");
+    Value *mappedRva = TB.CreateZExt(mappedRva32, ip,
+                                     "morok.win.unhook.mapped.rva");
+    Value *targetBase =
+        TB.CreateAdd(liveBase, liveRva, "morok.win.unhook.live.text.base");
+    Value *sourceBase =
+        TB.CreateAdd(mappedBase, mappedRva, "morok.win.unhook.clean.text.base");
+    Value *textReady = TB.CreateAnd(
+        TB.CreateAnd(TB.CreateICmpNE(liveText, ConstantInt::get(i64, 0)),
+                     TB.CreateICmpNE(mappedText, ConstantInt::get(i64, 0)),
+                     "morok.win.unhook.text.present"),
+        TB.CreateICmpNE(copySize, ConstantInt::get(ip, 0),
+                        "morok.win.unhook.copy.nonzero"),
+        "morok.win.unhook.text.ready");
+    TB.CreateStore(TB.CreateSelect(textReady, ConstantInt::get(i32, 0),
+                                   ConstantInt::getSigned(i32, -4),
+                                   "morok.win.unhook.text.result"),
+                   result)
+        ->setVolatile(true);
+    TB.CreateCondBr(textReady, protectBB, cleanupBB);
+
+    IRBuilder<> PB(protectBB);
+    PB.CreateStore(targetBase, baseSlot)->setVolatile(true);
+    PB.CreateStore(copySize, sizeSlot)->setVolatile(true);
+    auto *protectTy = FunctionType::get(i32, {ptr, ptr, ptr, i32, ptr}, false);
+    Value *protectPtr =
+        PB.CreateIntToPtr(protect, ptr, "morok.win.unhook.ntprotect.ptr");
+    Value *protectStatus = PB.CreateCall(
+        protectTy, protectPtr,
+        {PB.CreateIntToPtr(ConstantInt::getSigned(ip, -1), ptr),
+         baseSlot, sizeSlot, ConstantInt::get(i32, 0x40), oldProt},
+        "morok.win.unhook.ntprotect.status");
+    PB.CreateStore(protectStatus, result)->setVolatile(true);
+    Value *qLimit =
+        PB.CreateAnd(copySize, ConstantInt::get(ip, ~7ULL),
+                     "morok.win.unhook.copy.q.limit");
+    PB.CreateCondBr(PB.CreateICmpSGE(protectStatus, ConstantInt::get(i32, 0),
+                                     "morok.win.unhook.ntprotect.ok"),
+                    qLoopBB, cleanupBB);
+
+    IRBuilder<> QL(qLoopBB);
+    auto *qIdx = QL.CreatePHI(ip, 2, "morok.win.unhook.copy.q.idx");
+    qIdx->addIncoming(ConstantInt::get(ip, 0), protectBB);
+    QL.CreateCondBr(QL.CreateICmpULT(qIdx, qLimit,
+                                     "morok.win.unhook.copy.q.more"),
+                    qBodyBB, byteLoopBB);
+
+    IRBuilder<> QB(qBodyBB);
+    Value *qSrc = gepI8(QB, M, QB.CreateIntToPtr(sourceBase, ptr),
+                        qIdx, "morok.win.unhook.copy.q.src");
+    Value *qDst = gepI8(QB, M, QB.CreateIntToPtr(targetBase, ptr),
+                        qIdx, "morok.win.unhook.copy.q.dst");
+    auto *qWord = QB.CreateLoad(i64, qSrc, "morok.win.unhook.copy.qword");
+    qWord->setVolatile(true);
+    qWord->setAlignment(Align(1));
+    auto *qStore = QB.CreateStore(qWord, qDst);
+    qStore->setVolatile(true);
+    qStore->setAlignment(Align(1));
+    Value *qNext =
+        QB.CreateAdd(qIdx, ConstantInt::get(ip, 8),
+                     "morok.win.unhook.copy.q.next");
+    QB.CreateBr(qLoopBB);
+    qIdx->addIncoming(qNext, qBodyBB);
+
+    IRBuilder<> BL(byteLoopBB);
+    auto *bIdx = BL.CreatePHI(ip, 2, "morok.win.unhook.copy.byte.idx");
+    bIdx->addIncoming(qLimit, qLoopBB);
+    BL.CreateCondBr(BL.CreateICmpULT(bIdx, copySize,
+                                     "morok.win.unhook.copy.byte.more"),
+                    byteBodyBB, restoreBB);
+
+    IRBuilder<> BB(byteBodyBB);
+    Value *bSrc = gepI8(BB, M, BB.CreateIntToPtr(sourceBase, ptr),
+                        bIdx, "morok.win.unhook.copy.byte.src");
+    Value *bDst = gepI8(BB, M, BB.CreateIntToPtr(targetBase, ptr),
+                        bIdx, "morok.win.unhook.copy.byte.dst");
+    auto *byte = BB.CreateLoad(i8, bSrc, "morok.win.unhook.copy.byte");
+    byte->setVolatile(true);
+    byte->setAlignment(Align(1));
+    auto *byteStore = BB.CreateStore(byte, bDst);
+    byteStore->setVolatile(true);
+    byteStore->setAlignment(Align(1));
+    Value *bNext =
+        BB.CreateAdd(bIdx, ConstantInt::get(ip, 1),
+                     "morok.win.unhook.copy.byte.next");
+    BB.CreateBr(byteLoopBB);
+    bIdx->addIncoming(bNext, byteBodyBB);
+
+    IRBuilder<> RB(restoreBB);
+    Value *oldProtValue =
+        RB.CreateLoad(i32, oldProt, "morok.win.unhook.oldprot.value");
+    cast<LoadInst>(oldProtValue)->setVolatile(true);
+    RB.CreateStore(targetBase, baseSlot)->setVolatile(true);
+    RB.CreateStore(copySize, sizeSlot)->setVolatile(true);
+    Value *restoreStatus = RB.CreateCall(
+        protectTy, protectPtr,
+        {RB.CreateIntToPtr(ConstantInt::getSigned(ip, -1), ptr),
+         baseSlot, sizeSlot, oldProtValue, oldProt},
+        "morok.win.unhook.ntprotect.restore");
+    RB.CreateStore(restoreStatus, result)->setVolatile(true);
+    RB.CreateBr(cleanupBB);
+
+    IRBuilder<> CB(cleanupBB);
+    Value *mappedForCleanup =
+        CB.CreateLoad(ip, viewBase, "morok.win.unhook.cleanup.mapped");
+    cast<LoadInst>(mappedForCleanup)->setVolatile(true);
+    CB.CreateCondBr(CB.CreateICmpNE(mappedForCleanup, ConstantInt::get(ip, 0),
+                                    "morok.win.unhook.cleanup.has.mapping"),
+                    unmapBB, closeGateBB);
+
+    IRBuilder<> UB(unmapBB);
+    auto *unmapTy = FunctionType::get(i32, {ptr, ptr}, false);
+    Value *unmapStatus = UB.CreateCall(
+        unmapTy,
+        UB.CreateIntToPtr(unmapView, ptr, "morok.win.unhook.ntunmap.ptr"),
+        {UB.CreateIntToPtr(ConstantInt::getSigned(ip, -1), ptr),
+         UB.CreateIntToPtr(mappedForCleanup, ptr,
+                           "morok.win.unhook.cleanup.mapped.ptr")},
+        "morok.win.unhook.ntunmap.status");
+    UB.CreateStore(ConstantInt::get(ip, 0), viewBase)->setVolatile(true);
+    UB.CreateBr(closeGateBB);
+
+    IRBuilder<> CGB(closeGateBB);
+    Value *handleForCleanup =
+        CGB.CreateLoad(ip, sectionHandle, "morok.win.unhook.cleanup.section");
+    cast<LoadInst>(handleForCleanup)->setVolatile(true);
+    CGB.CreateCondBr(CGB.CreateICmpNE(handleForCleanup, ConstantInt::get(ip, 0),
+                                      "morok.win.unhook.cleanup.has.section"),
+                     closeBB, retBB);
+
+    IRBuilder<> CLB(closeBB);
+    auto *closeTy = FunctionType::get(i32, {ptr}, false);
+    Value *closeStatus = CLB.CreateCall(
+        closeTy, CLB.CreateIntToPtr(close, ptr,
+                                    "morok.win.unhook.ntclose.ptr"),
+        {CLB.CreateIntToPtr(handleForCleanup, ptr,
+                            "morok.win.unhook.cleanup.section.ptr")},
+        "morok.win.unhook.ntclose.status");
+    (void)unmapStatus;
+    (void)closeStatus;
+    CLB.CreateStore(ConstantInt::get(ip, 0), sectionHandle)->setVolatile(true);
+    CLB.CreateBr(retBB);
+
+    IRBuilder<> RetB(retBB);
+    Value *out = RetB.CreateLoad(i32, result, "morok.win.unhook.status");
+    cast<LoadInst>(out)->setVolatile(true);
+    RetB.CreateRet(out);
+    return fn;
+}
+
 Function *windowsSyscallStubScanner(Module &M) {
     if (Function *existing = M.getFunction("morok.win.sys.scan"))
         return existing;
@@ -10066,6 +10536,119 @@ Function *windowsSyscallsProbe(Module &M, GlobalVariable *State,
     return fn;
 }
 
+Function *windowsUnhookProbe(Module &M, GlobalVariable *State,
+                             ir::IRRandom &rng, const Triple &TT) {
+    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
+        intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.win.unhook.probe"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.unhook.probe", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    Function *pebReader = windowsPebReader(M);
+    Function *moduleByHash = windowsLdrModuleByHash(M);
+    Function *resolver = windowsPeExportResolver(M);
+    Function *knownUnhook = windowsKnownDllUnhookHelper(M);
+    if (!pebReader || !moduleByHash || !resolver || !knownUnhook)
+        return nullptr;
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *resolveBB = BasicBlock::Create(ctx, "resolve", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    Value *peb = B.CreateCall(pebReader, {}, "morok.win.unhook.peb");
+    foldState(B, State, peb, rng.next(), "morok.win.unhook.peb.mix");
+    B.CreateCondBr(B.CreateICmpNE(peb, ConstantInt::get(ip, 0),
+                                  "morok.win.unhook.peb.present"),
+                   resolveBB, retBB);
+
+    IRBuilder<> RB(resolveBB);
+    Value *ntdll = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("ntdll.dll"))},
+        "morok.win.unhook.ntdll");
+    Value *kernel32 = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("kernel32.dll"))},
+        "morok.win.unhook.kernel32");
+    Value *ntOpenSection = RB.CreateCall(
+        resolver, {ntdll, ConstantInt::get(i64, fnv1aName("NtOpenSection"))},
+        "morok.win.unhook.ntopensection");
+    Value *ntMapView = RB.CreateCall(
+        resolver, {ntdll, ConstantInt::get(i64, fnv1aName("NtMapViewOfSection"))},
+        "morok.win.unhook.ntmapview");
+    Value *ntUnmapView = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtUnmapViewOfSection"))},
+        "morok.win.unhook.ntunmap");
+    Value *ntProtect = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtProtectVirtualMemory"))},
+        "morok.win.unhook.ntprotect");
+    Value *ntClose = RB.CreateCall(
+        resolver, {ntdll, ConstantInt::get(i64, fnv1aName("NtClose"))},
+        "morok.win.unhook.ntclose");
+    foldState(RB, State, ntdll, rng.next(), "morok.win.unhook.ntdll.mix");
+    foldState(RB, State, kernel32, rng.next(),
+              "morok.win.unhook.kernel32.mix");
+    foldState(RB, State, ntOpenSection, rng.next(),
+              "morok.win.unhook.ntopensection.mix");
+    foldState(RB, State, ntMapView, rng.next(),
+              "morok.win.unhook.ntmapview.mix");
+    foldState(RB, State, ntProtect, rng.next(),
+              "morok.win.unhook.ntprotect.mix");
+
+    Value *ntdllKnown = storeWindowsWideLiteral(
+        RB, M,
+        {'\\', 'K', 'n', 'o', 'w', 'n', 'D', 'l', 'l', 's', '\\', 'n',
+         't', 'd', 'l', 'l', '.', 'd', 'l', 'l'},
+        "morok.win.unhook.known.nt");
+    Value *kernelKnown = storeWindowsWideLiteral(
+        RB, M,
+        {'\\', 'K', 'n', 'o', 'w', 'n', 'D', 'l', 'l', 's', '\\', 'k',
+         'e', 'r', 'n', 'e', 'l', '3', '2', '.', 'd', 'l', 'l'},
+        "morok.win.unhook.known.k32");
+    auto *knownTy = knownUnhook->getFunctionType();
+    Value *ntdllStatus = RB.CreateCall(
+        knownTy, knownUnhook,
+        {ntdll, ntdllKnown, ConstantInt::get(i16, 40), ntOpenSection,
+         ntMapView, ntUnmapView, ntProtect, ntClose},
+        "morok.win.unhook.ntdll.status");
+    Value *kernelStatus = RB.CreateCall(
+        knownTy, knownUnhook,
+        {kernel32, kernelKnown, ConstantInt::get(i16, 46), ntOpenSection,
+         ntMapView, ntUnmapView, ntProtect, ntClose},
+        "morok.win.unhook.kernel32.status");
+    foldState(RB, State, ntdllStatus, rng.next(),
+              "morok.win.unhook.ntdll.status.mix");
+    foldState(RB, State, kernelStatus, rng.next(),
+              "morok.win.unhook.kernel32.status.mix");
+    Value *failed = RB.CreateOr(
+        RB.CreateICmpSLT(ntdllStatus, ConstantInt::get(i32, 0),
+                         "morok.win.unhook.ntdll.failed"),
+        RB.CreateICmpSLT(kernelStatus, ConstantInt::get(i32, 0),
+                         "morok.win.unhook.kernel32.failed"),
+        "morok.win.unhook.failed");
+    foldFlag(RB, State, failed, 0x43D2BE581F09A76CULL,
+             "morok.win.unhook.failure");
+    RB.CreateBr(retBB);
+
+    IRBuilder<> RetB(retBB);
+    RetB.CreateRetVoid();
+    return fn;
+}
+
 } // namespace
 
 bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
@@ -10597,6 +11180,21 @@ bool windowsSyscallsModule(Module &M, ir::IRRandom &rng) {
     return true;
 }
 
+bool windowsUnhookModule(Module &M, ir::IRRandom &rng) {
+    const Triple tt(M.getTargetTriple());
+    GlobalVariable *state = windowsPeState(M, rng);
+    Function *probe = windowsUnhookProbe(M, state, rng, tt);
+    if (!probe)
+        return false;
+
+    Function *ctor = makeCtorShell(M, "morok.win.unhook");
+    IRBuilder<> B(&ctor->getEntryBlock());
+    B.CreateCall(probe);
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, ctor, 0);
+    return true;
+}
+
 PreservedAnalyses AntiDebuggingPass::run(Module &M, ModuleAnalysisManager &) {
     ir::IRRandom rng(engine_);
     return antiDebuggingModule(M, rng) ? PreservedAnalyses::none()
@@ -10659,6 +11257,13 @@ PreservedAnalyses WindowsSyscallsPass::run(Module &M,
     ir::IRRandom rng(engine_);
     return windowsSyscallsModule(M, rng) ? PreservedAnalyses::none()
                                          : PreservedAnalyses::all();
+}
+
+PreservedAnalyses WindowsUnhookPass::run(Module &M,
+                                         ModuleAnalysisManager &) {
+    ir::IRRandom rng(engine_);
+    return windowsUnhookModule(M, rng) ? PreservedAnalyses::none()
+                                       : PreservedAnalyses::all();
 }
 
 PreservedAnalyses TimingOraclePass::run(Module &M, ModuleAnalysisManager &) {

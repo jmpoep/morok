@@ -16,6 +16,7 @@
 //   • WindowsAntiAttach — patches remote-breakin/debug-break stubs.
 //   • WindowsKernelDebugger — samples kernel-debugger and decoy census signals.
 //   • WindowsSyscalls — uses Hell's/Halo's/Tartarus-style syscall dispatch.
+//   • WindowsUnhook — remaps KnownDlls and restores hooked `.text` sections.
 //   • TimingOracle   — samples independent clocks around short spans.
 //   • TrapOracle     — checks whether SIGTRAP/int3-style traps reach the app.
 //   • PageFaultTlbOracle — samples protected-page fault delivery and latency.
@@ -104,6 +105,14 @@ bool windowsKernelDebuggerModule(llvm::Module &M, morok::ir::IRRandom &rng);
 /// ntdll-gadget syscall paths, and folds divergences into hidden Windows state.
 /// Returns true if code was added.
 bool windowsSyscallsModule(llvm::Module &M, morok::ir::IRRandom &rng);
+
+/// Inject Windows x86_64 KnownDlls unhooking.  The emitted startup probe resolves
+/// `NtOpenSection`, `NtMapViewOfSection`, `NtProtectVirtualMemory`,
+/// `NtUnmapViewOfSection`, and `NtClose` by hashed ntdll export lookup, maps
+/// pristine KnownDlls ntdll/kernel32 views, locates their `.text` sections, and
+/// overwrites the live text bytes after a transient page-protection flip.
+/// Returns true if code was added.
+bool windowsUnhookModule(llvm::Module &M, morok::ir::IRRandom &rng);
 
 /// Inject a runtime timing oracle.  The emitted helper samples independent
 /// clocks around short deterministic spans and folds distribution-level
@@ -245,6 +254,18 @@ private:
 class WindowsSyscallsPass : public llvm::PassInfoMixin<WindowsSyscallsPass> {
 public:
     explicit WindowsSyscallsPass(std::uint64_t seed = 0x5C411C5u)
+        : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
+
+    llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
+    static bool isRequired() { return true; }
+
+private:
+    core::Xoshiro256pp engine_;
+};
+
+class WindowsUnhookPass : public llvm::PassInfoMixin<WindowsUnhookPass> {
+public:
+    explicit WindowsUnhookPass(std::uint64_t seed = 0xC1EAD11Du)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);

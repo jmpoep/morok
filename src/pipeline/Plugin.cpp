@@ -260,6 +260,10 @@ PassPluginLibraryInfo getPluginInfo() {
                             MPM.addPass(passes::WindowsSyscallsPass());
                             return true;
                         }
+                        if (name == "morok-winunhook") {
+                            MPM.addPass(passes::WindowsUnhookPass());
+                            return true;
+                        }
                         if (name == "morok-timing") {
                             MPM.addPass(passes::TimingOraclePass());
                             return true;
