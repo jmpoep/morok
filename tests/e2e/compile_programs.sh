@@ -68,8 +68,12 @@ compile_one() {
 }
 
 while IFS= read -r src; do
-  total=$((total + 1))
   base="$(basename "$src")"
+  # MOROK_SKIP (space-separated basenames) lets the caller exclude programs that
+  # the obfuscator does not yet handle on a given target — e.g. passes whose
+  # Linux codegen is still being ported. Set per-platform by the e2e CMakeLists.
+  case " ${MOROK_SKIP:-} " in *" $base "*) echo "skip (excluded on this target) $base" >&2; continue;; esac
+  total=$((total + 1))
   stem="${base%.*}"
   ref="$TMP/${stem}.ref"
   obf="$TMP/${stem}.obf"

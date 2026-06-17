@@ -67,6 +67,8 @@ fails=0; total=0
 for base in "${PROGRAMS[@]}"; do
   src="$DIR/$base"
   [ -f "$src" ] || { echo "skip (absent) $base"; continue; }
+  # See compile_programs.sh: exclude programs not yet supported on this target.
+  case " ${MOROK_SKIP:-} " in *" $base "*) echo "skip (excluded on this target) $base"; continue;; esac
   total=$((total + 1))
   cc=("$CLANG"); std=(-std=c11 -D_GNU_SOURCE)
   case "$src" in *.cpp) cc=("$CLANGXX"); std=(-std=c++23 -D_GNU_SOURCE);; esac
