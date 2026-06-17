@@ -60,8 +60,10 @@ std::uint64_t keystreamValue(unsigned variant, std::uint64_t k0,
     }
 }
 
-Value *emitKeystream(IRBuilderBase &B, unsigned variant, Value *K0,
-                     std::uint32_t j, std::uint64_t mul) {
+namespace {
+
+// Shared finalizer: T already holds `K0 + (j+1)*mul`; spread it per variant.
+Value *emitFinalizer(IRBuilderBase &B, unsigned variant, Value *T) {
     auto *I64 = B.getInt64Ty();
     auto R = [&](Value *v, unsigned s) {
         return B.CreateLShr(v, ConstantInt::get(I64, s));
@@ -69,8 +71,6 @@ Value *emitKeystream(IRBuilderBase &B, unsigned variant, Value *K0,
     auto L = [&](Value *v, unsigned s) {
         return B.CreateShl(v, ConstantInt::get(I64, s));
     };
-    Value *T = B.CreateAdd(
-        K0, ConstantInt::get(I64, static_cast<std::uint64_t>(j + 1) * mul));
     switch (variant) {
     case 1:
         T = B.CreateMul(B.CreateXor(T, R(T, 30)), ConstantInt::get(I64, kSplit1));
@@ -88,6 +88,24 @@ Value *emitKeystream(IRBuilderBase &B, unsigned variant, Value *K0,
         T = B.CreateMul(T, ConstantInt::get(I64, kMurmur2));
         return B.CreateXor(T, R(T, 33));
     }
+}
+
+} // namespace
+
+Value *emitKeystream(IRBuilderBase &B, unsigned variant, Value *K0,
+                     std::uint32_t j, std::uint64_t mul) {
+    auto *I64 = B.getInt64Ty();
+    Value *T = B.CreateAdd(
+        K0, ConstantInt::get(I64, static_cast<std::uint64_t>(j + 1) * mul));
+    return emitFinalizer(B, variant, T);
+}
+
+Value *emitKeystreamDynamic(IRBuilderBase &B, unsigned variant, Value *K0,
+                            Value *JVal, std::uint64_t mul) {
+    auto *I64 = B.getInt64Ty();
+    Value *Jp1 = B.CreateAdd(JVal, ConstantInt::get(I64, 1));
+    Value *T = B.CreateAdd(K0, B.CreateMul(Jp1, ConstantInt::get(I64, mul)));
+    return emitFinalizer(B, variant, T);
 }
 
 // The per-module runtime key: a private *mutable* global holding a random

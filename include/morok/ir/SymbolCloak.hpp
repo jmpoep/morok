@@ -45,6 +45,13 @@ std::uint64_t keystreamValue(unsigned variant, std::uint64_t k0,
 llvm::Value *emitKeystream(llvm::IRBuilderBase &B, unsigned variant,
                            llvm::Value *K0, std::uint32_t j, std::uint64_t mul);
 
+/// Like emitKeystream but with a runtime byte index `JVal` (an i64 Value),
+/// for loop-based decryptors over long buffers.  Equivalent to
+/// `keystreamValue(variant, K0, JVal, mul)`.
+llvm::Value *emitKeystreamDynamic(llvm::IRBuilderBase &B, unsigned variant,
+                                  llvm::Value *K0, llvm::Value *JVal,
+                                  std::uint64_t mul);
+
 /// The shared per-module runtime key: a private *mutable* i64 global holding a
 /// random value, meant to be read with a volatile load (so the optimizer cannot
 /// fold keystream-derived values back to plaintext).  Created on first use.

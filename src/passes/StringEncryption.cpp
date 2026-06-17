@@ -32,9 +32,15 @@ namespace morok::passes {
 
 namespace {
 
-constexpr std::uint64_t kMaxEncryptedStrings = 64;
-constexpr std::uint64_t kMaxEncryptedStringBytes = 1024;
-constexpr std::uint64_t kMaxEncryptedTotalBytes = 4096;
+// Encrypt *every* eligible string — readable strings are toxic — so the caps
+// are sized only to keep pathological inputs in check, not to leave strings in
+// the clear.  Strings longer than the unroll threshold get a compact loop
+// decryptor instead of a fully unrolled one, so total code size stays bounded
+// regardless of how much string data a module carries.
+constexpr std::uint64_t kMaxEncryptedStrings = 8192;
+constexpr std::uint64_t kMaxEncryptedStringBytes = 1u << 20; // 1 MiB / string
+constexpr std::uint64_t kMaxEncryptedTotalBytes = 8u << 20;  // 8 MiB / module
+constexpr std::uint64_t kUnrollThreshold = 64; // ≤ this ⇒ unrolled, else loop
 
 bool eligible(const GlobalVariable &gv) {
     if (!gv.hasInitializer() || !gv.hasLocalLinkage())
@@ -128,25 +134,58 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
         gv->setConstant(false); // mutated in place by this string's decryptor
 
         // A decryptor unique to this string: recover its bytes in place with the
-        // keystream inlined, then return.  Each gets its own constructor.
+        // keystream inlined, then return.  Each gets its own constructor.  Short
+        // strings are fully unrolled (maximally tangled); long strings use a
+        // compact loop so module code size stays bounded.
         auto *decFn = Function::Create(FunctionType::get(voidTy, false),
                                        GlobalValue::InternalLinkage,
                                        "morok.strdec", &M);
-        IRBuilder<> B(BasicBlock::Create(ctx, "entry", decFn));
-        Value *seedLoad = B.CreateLoad(i64, seed, /*isVolatile=*/true);
-        Value *rtKey = B.CreateXor(seedLoad, ConstantInt::get(i64, c.key));
-        for (std::uint64_t i = 0; i < n; ++i) {
-            Value *ks = ir::emitKeystream(B, c.variant, rtKey,
-                                          static_cast<std::uint32_t>(i), c.mul);
-            Value *ksByte = B.CreateTrunc(ks, i8);
-            Value *ptr = B.CreateConstInBoundsGEP2_64(gv->getValueType(), gv, 0,
-                                                      i);
-            Value *cipher = B.CreateLoad(i8, ptr);
-            Value *plain = c.add ? B.CreateSub(cipher, ksByte)
-                                 : B.CreateXor(cipher, ksByte);
-            B.CreateStore(plain, ptr);
+        auto combine = [&](IRBuilder<> &B, Value *cipher, Value *ksByte) {
+            return c.add ? B.CreateSub(cipher, ksByte)
+                         : B.CreateXor(cipher, ksByte);
+        };
+        if (n <= kUnrollThreshold) {
+            IRBuilder<> B(BasicBlock::Create(ctx, "entry", decFn));
+            Value *rtKey = B.CreateXor(
+                B.CreateLoad(i64, seed, /*isVolatile=*/true),
+                ConstantInt::get(i64, c.key));
+            for (std::uint64_t i = 0; i < n; ++i) {
+                Value *ks = ir::emitKeystream(
+                    B, c.variant, rtKey, static_cast<std::uint32_t>(i), c.mul);
+                Value *ptr = B.CreateConstInBoundsGEP2_64(gv->getValueType(), gv,
+                                                          0, i);
+                B.CreateStore(combine(B, B.CreateLoad(i8, ptr),
+                                      B.CreateTrunc(ks, i8)),
+                              ptr);
+            }
+            B.CreateRetVoid();
+        } else {
+            auto *entry = BasicBlock::Create(ctx, "entry", decFn);
+            auto *loop = BasicBlock::Create(ctx, "loop", decFn);
+            auto *exit = BasicBlock::Create(ctx, "exit", decFn);
+            IRBuilder<> B(entry);
+            Value *rtKey = B.CreateXor(
+                B.CreateLoad(i64, seed, /*isVolatile=*/true),
+                ConstantInt::get(i64, c.key));
+            B.CreateBr(loop);
+
+            B.SetInsertPoint(loop);
+            PHINode *iv = B.CreatePHI(i64, 2);
+            iv->addIncoming(ConstantInt::get(i64, 0), entry);
+            Value *ks = ir::emitKeystreamDynamic(B, c.variant, rtKey, iv, c.mul);
+            Value *ptr = B.CreateInBoundsGEP(
+                gv->getValueType(), gv, {ConstantInt::get(i64, 0), iv});
+            B.CreateStore(combine(B, B.CreateLoad(i8, ptr),
+                                  B.CreateTrunc(ks, i8)),
+                          ptr);
+            Value *next = B.CreateAdd(iv, ConstantInt::get(i64, 1));
+            iv->addIncoming(next, loop);
+            B.CreateCondBr(B.CreateICmpULT(next, ConstantInt::get(i64, n)), loop,
+                           exit);
+
+            B.SetInsertPoint(exit);
+            B.CreateRetVoid();
         }
-        B.CreateRetVoid();
 
         // Vary the constructor priority so the decryptors do not appear as one
         // contiguous block running back-to-back.

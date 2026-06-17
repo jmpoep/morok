@@ -8196,17 +8196,28 @@ TEST_CASE("stringEncryptModule encrypts in place with per-string decryptors") {
     morok::ir::IRRandom rng(engine);
     CHECK(morok::passes::stringEncryptModule(*M, {/*probability=*/100}, rng));
 
-    CHECK_FALSE(Small->isConstant()); // encrypted, decrypted in place
-    CHECK(Large->isConstant());       // over the per-string byte cap → skipped
+    // EVERY string is encrypted — readable strings are toxic — the small one
+    // with an unrolled decryptor, the long one with a compact loop decryptor.
+    CHECK_FALSE(Small->isConstant());
+    CHECK_FALSE(Large->isConstant());
 
     // The plaintext is gone, and the encryption is driven by the runtime-opaque
-    // module seed plus a dedicated decryptor (no shared gf8mul / key globals).
+    // module seed plus dedicated decryptors (no shared gf8mul / key globals).
     if (auto *CDA = dyn_cast<ConstantDataArray>(Small->getInitializer()))
         CHECK(CDA->getRawDataValues().find("small") == StringRef::npos);
     CHECK(countGlobals(*M, "morok.cloak.seed") == 1u);
     CHECK(countGlobals(*M, "morok.k1") == 0u);
     CHECK(M->getFunction("morok.gf8mul") == nullptr);
-    CHECK(M->getFunction("morok.strdec") != nullptr);
+    CHECK(countFunctions(*M, "morok.strdec") == 2u);
+
+    // The long string's decryptor is a loop (has a PHI induction variable),
+    // not a fully unrolled chain.
+    bool sawLoopDecryptor = false;
+    for (Function &F : *M)
+        if (F.getName().starts_with("morok.strdec"))
+            for (Instruction &I : instructions(F))
+                sawLoopDecryptor |= isa<PHINode>(&I);
+    CHECK(sawLoopDecryptor);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
