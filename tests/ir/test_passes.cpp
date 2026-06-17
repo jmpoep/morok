@@ -7090,19 +7090,23 @@ no:
 
     CHECK(countNamedAllocas(*F, "morok.trace.state") == 1u);
     CHECK(M->getGlobalVariable("morok.trace.seed", true) != nullptr);
-    CHECK(M->getFunction("llvm.trap") != nullptr);
+    CHECK(M->getGlobalVariable("morok.trace.latent", true) != nullptr);
+    CHECK(M->getFunction("llvm.trap") == nullptr);
 
     std::size_t guards = 0;
     std::size_t expectedPhis = 0;
     std::size_t volatileLoads = 0;
     std::size_t volatileStores = 0;
-    std::size_t failBlocks = 0;
-    std::size_t branchKeys = 0;
-    std::size_t returnKeys = 0;
+    std::size_t recordBlocks = 0;
+    std::size_t delayedFires = 0;
+    std::size_t delayedBranchKeys = 0;
+    std::size_t delayedReturnKeys = 0;
+    std::size_t delayedSwitchKeys = 0;
     std::size_t edgeMixes = 0;
     std::size_t valueTerms = 0;
     for (BasicBlock &BB : *F) {
-        failBlocks += BB.getName().starts_with("morok.trace.fail") ? 1u : 0u;
+        recordBlocks +=
+            BB.getName().starts_with("morok.trace.record") ? 1u : 0u;
         for (Instruction &I : BB) {
             if (I.getName().starts_with("morok.trace.guard"))
                 ++guards;
@@ -7110,6 +7114,8 @@ no:
                 ++expectedPhis;
             if (I.getName().starts_with("morok.trace.edge.mix"))
                 ++edgeMixes;
+            if (I.getName().starts_with("morok.trace.delay.fire"))
+                ++delayedFires;
             if (I.getName().starts_with("morok.trace.value.bits"))
                 ++valueTerms;
             if (auto *LI = dyn_cast<LoadInst>(&I))
@@ -7119,22 +7125,26 @@ no:
             if (auto *BI = dyn_cast<BranchInst>(&I))
                 if (BI->isConditional() &&
                     BI->getCondition()->getName().starts_with(
-                        "morok.trace.branch.cond"))
-                    ++branchKeys;
+                        "morok.trace.delay.branch.cond"))
+                    ++delayedBranchKeys;
             if (auto *RI = dyn_cast<ReturnInst>(&I))
                 if (RI->getReturnValue() &&
                     RI->getReturnValue()->getName().starts_with(
-                        "morok.trace.ret"))
-                    ++returnKeys;
+                        "morok.trace.delay.ret"))
+                    ++delayedReturnKeys;
+            if (auto *SW = dyn_cast<SwitchInst>(&I))
+                if (SW->getCondition()->getName().starts_with(
+                        "morok.trace.delay.switch.cond"))
+                    ++delayedSwitchKeys;
         }
     }
     CHECK(guards >= 4u);
     CHECK(expectedPhis >= 4u);
     CHECK(volatileLoads >= 4u);
     CHECK(volatileStores >= 4u);
-    CHECK(failBlocks >= 4u);
-    CHECK(branchKeys >= 1u);
-    CHECK(returnKeys >= 1u);
+    CHECK(recordBlocks >= 4u);
+    CHECK(delayedFires >= 1u);
+    CHECK(delayedBranchKeys + delayedReturnKeys + delayedSwitchKeys >= 1u);
     CHECK(edgeMixes >= 3u);
     CHECK(valueTerms >= 3u);
     CHECK_FALSE(verifyModule(*M, &errs()));
@@ -7162,6 +7172,7 @@ right:
         *F, {/*probability=*/0, /*max_blocks=*/8}, rng));
     CHECK(countNamedAllocas(*F, "morok.trace.state") == 0u);
     CHECK(M->getGlobalVariable("morok.trace.seed", true) == nullptr);
+    CHECK(M->getGlobalVariable("morok.trace.latent", true) == nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

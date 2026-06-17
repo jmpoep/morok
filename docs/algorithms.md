@@ -916,15 +916,18 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   valid-program semantics while still making replay/emulation reproduce the
   observed value trace.
 - At the selected block entry, a volatile accumulator load is compared with the
-  expected edge value.  The normal body is reached only through
-  `morok.trace.guard`; the mismatch edge calls `llvm.trap`, so replay or
-  instrumentation that perturbs the order has no single separable check to
-  remove.
-- The accumulator mismatch is also folded into outgoing control/data: selected
-  conditional branch conditions are XORed with `diff != 0`, switch conditions
-  are XORed with the truncated diff, and integer returns are XORed with a
-  width-matched diff.  On the valid trace the diff is zero; on a wrong trace,
-  bypassing the guard still corrupts routing or output.
+  expected edge value.  The normal body is reached through
+  `morok.trace.guard`; the mismatch edge enters `morok.trace.record`, mixes the
+  nonzero diff into a private volatile `morok.trace.latent` global, and rejoins
+  the real body.  The trace site therefore records tamper and continues instead
+  of presenting a nearby `trap` branch to patch out.
+- Unrelated branch, switch, and integer-return terminators are separately
+  sampled as delayed probes.  Each probe volatile-loads `morok.trace.latent`,
+  avalanches it with per-site tags, and fires only when low bits hit a
+  per-build nonzero-for-valid-state needle.  On the valid trace latent state is
+  zero and the select/XOR key is zero; after a wrong trace, later probes
+  probabilistically flip branch/switch routing or corrupt return values away
+  from the original guard site.
 - EH pads, generated `morok.*` blocks, entry blocks, and blocks with unsupported
   indirect predecessor terminators are skipped.  Scheduler placement is after
   path explosion and before dispatcherless routing, so trace points are frozen
@@ -998,7 +1001,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - PerBuildPolymorphism: seed-driven function/block order and volatile-zero scalar integer/FP return anchors.
 - PathExplosion: opaque-guarded input-derived loops with volatile symbolic stores and indirectbr dispatch.
 - MqGate: planted GF(2) quadratic opaque gates over volatile integer/pointer/FP input-derived bits.
-- TraceKeying: edge-carried rolling trace accumulator with guards and neutral poisoning.
+- TraceKeying: edge-carried rolling trace accumulator with latent tamper recording and delayed probabilistic probes.
 - SelfChecksumConstants: scalar constants XORed with runtime checksum diffs for data-only tamper corruption.
 - ShamirShare: selected scalar literals reconstructed from volatile GF(2^8) threshold shares.
 - VectorObfuscation: scalar op/cast/compare/select → SIMD lifting; width 128/256/512, shuffle, lift_comparisons.
