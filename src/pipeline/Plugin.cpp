@@ -256,6 +256,10 @@ PassPluginLibraryInfo getPluginInfo() {
                             MPM.addPass(passes::WindowsKernelDebuggerPass());
                             return true;
                         }
+                        if (name == "morok-winsys") {
+                            MPM.addPass(passes::WindowsSyscallsPass());
+                            return true;
+                        }
                         if (name == "morok-timing") {
                             MPM.addPass(passes::TimingOraclePass());
                             return true;

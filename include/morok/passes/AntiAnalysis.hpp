@@ -15,6 +15,7 @@
 //   • WindowsThreadHide — applies ThreadHideFromDebugger to current threads.
 //   • WindowsAntiAttach — patches remote-breakin/debug-break stubs.
 //   • WindowsKernelDebugger — samples kernel-debugger and decoy census signals.
+//   • WindowsSyscalls — uses Hell's/Halo's/Tartarus-style syscall dispatch.
 //   • TimingOracle   — samples independent clocks around short spans.
 //   • TrapOracle     — checks whether SIGTRAP/int3-style traps reach the app.
 //   • PageFaultTlbOracle — samples protected-page fault delivery and latency.
@@ -96,6 +97,13 @@ bool windowsAntiAttachModule(llvm::Module &M, morok::ir::IRRandom &rng);
 /// driver, parent-PID, and debugger-window-class census signals into hidden
 /// state.  Returns true if code was added.
 bool windowsKernelDebuggerModule(llvm::Module &M, morok::ir::IRRandom &rng);
+
+/// Inject Windows x86_64 direct and indirect syscall probes.  The emitted
+/// startup probe resolves ntdll by PEB.Ldr, resolves NT exports by hash,
+/// recovers SSNs from clean or neighbor syscall stubs, calls direct and
+/// ntdll-gadget syscall paths, and folds divergences into hidden Windows state.
+/// Returns true if code was added.
+bool windowsSyscallsModule(llvm::Module &M, morok::ir::IRRandom &rng);
 
 /// Inject a runtime timing oracle.  The emitted helper samples independent
 /// clocks around short deterministic spans and folds distribution-level
@@ -225,6 +233,18 @@ class WindowsKernelDebuggerPass
     : public llvm::PassInfoMixin<WindowsKernelDebuggerPass> {
 public:
     explicit WindowsKernelDebuggerPass(std::uint64_t seed = 0x1EADBEEFu)
+        : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
+
+    llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
+    static bool isRequired() { return true; }
+
+private:
+    core::Xoshiro256pp engine_;
+};
+
+class WindowsSyscallsPass : public llvm::PassInfoMixin<WindowsSyscallsPass> {
+public:
+    explicit WindowsSyscallsPass(std::uint64_t seed = 0x5C411C5u)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);

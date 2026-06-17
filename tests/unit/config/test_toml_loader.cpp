@@ -281,6 +281,8 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     enabled = true
     [passes.windows_kernel_debugger]
     enabled = true
+    [passes.windows_syscalls]
+    enabled = true
     [passes.timing_oracles]
     enabled = true
     [passes.trap_oracles]
@@ -445,6 +447,7 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.windows_thread_hide.enabled == true);
     CHECK(r.config.passes.windows_anti_attach.enabled == true);
     CHECK(r.config.passes.windows_kernel_debugger.enabled == true);
+    CHECK(r.config.passes.windows_syscalls.enabled == true);
     CHECK(r.config.passes.timing_oracles.enabled == true);
     CHECK(r.config.passes.trap_oracles.enabled == true);
     CHECK(r.config.passes.page_fault_oracles.enabled == true);

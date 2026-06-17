@@ -8268,21 +8268,30 @@ Function *windowsSyscallStubScanner(Module &M) {
     auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
     auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
     auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *neighborGateBB = BasicBlock::Create(ctx, "neighbor.gate", fn);
+    auto *neighborLoopBB = BasicBlock::Create(ctx, "neighbor.loop", fn);
+    auto *neighborBodyBB = BasicBlock::Create(ctx, "neighbor.body", fn);
+    auto *neighborNextBB = BasicBlock::Create(ctx, "neighbor.next", fn);
     auto *retBB = BasicBlock::Create(ctx, "ret", fn);
 
     IRBuilder<> B(entry);
     AllocaInst *ssnSlot = B.CreateAlloca(i32, nullptr, "morok.win.sys.ssn.slot");
     AllocaInst *gadgetSlot =
         B.CreateAlloca(i32, nullptr, "morok.win.sys.gadget.slot");
+    AllocaInst *foundSlot =
+        B.CreateAlloca(i8, nullptr, "morok.win.sys.found.slot");
     B.CreateStore(ConstantInt::get(i32, 0), ssnSlot)->setVolatile(true);
     B.CreateStore(ConstantInt::get(i32, 0), gadgetSlot)->setVolatile(true);
-    B.CreateBr(loopBB);
+    B.CreateStore(ConstantInt::get(i8, 0), foundSlot)->setVolatile(true);
+    B.CreateCondBr(B.CreateICmpNE(stub, ConstantPointerNull::get(ptr),
+                                  "morok.win.sys.scan.stub.present"),
+                   loopBB, retBB);
 
     IRBuilder<> LB(loopBB);
     auto *idx = LB.CreatePHI(i32, 2, "morok.win.sys.scan.idx");
     idx->addIncoming(ConstantInt::get(i32, 0), entry);
-    LB.CreateCondBr(LB.CreateICmpULT(idx, ConstantInt::get(i32, 32)), bodyBB,
-                    retBB);
+    LB.CreateCondBr(LB.CreateICmpULT(idx, ConstantInt::get(i32, 96)), bodyBB,
+                    neighborGateBB);
 
     IRBuilder<> SB(bodyBB);
     Value *idxIp = SB.CreateZExt(idx, ip, "morok.win.sys.scan.idx.ip");
@@ -8304,16 +8313,30 @@ Function *windowsSyscallStubScanner(Module &M) {
     Value *ssn = loadAt(SB, M, i32, stub,
                         SB.CreateAdd(idxIp, ConstantInt::get(ip, 1)),
                         "morok.win.sys.scan.ssn");
+    Value *oldSsn =
+        SB.CreateLoad(i32, ssnSlot, "morok.win.sys.scan.ssn.old");
+    cast<LoadInst>(oldSsn)->setVolatile(true);
     auto *ssnStore = SB.CreateStore(
-        SB.CreateSelect(movEax, ssn, SB.CreateLoad(i32, ssnSlot),
+        SB.CreateSelect(movEax, ssn, oldSsn,
                         "morok.win.sys.scan.ssn.sel"),
         ssnSlot);
     ssnStore->setVolatile(true);
+    Value *oldGadget =
+        SB.CreateLoad(i32, gadgetSlot, "morok.win.sys.scan.gadget.old");
+    cast<LoadInst>(oldGadget)->setVolatile(true);
     auto *gadgetStore = SB.CreateStore(
-        SB.CreateSelect(syscallRet, idx, SB.CreateLoad(i32, gadgetSlot),
+        SB.CreateSelect(syscallRet, idx, oldGadget,
                         "morok.win.sys.scan.gadget.sel"),
         gadgetSlot);
     gadgetStore->setVolatile(true);
+    Value *oldFound =
+        SB.CreateLoad(i8, foundSlot, "morok.win.sys.scan.found.old");
+    cast<LoadInst>(oldFound)->setVolatile(true);
+    auto *foundStore = SB.CreateStore(
+        SB.CreateSelect(movEax, ConstantInt::get(i8, 1), oldFound,
+                        "morok.win.sys.scan.found.sel"),
+        foundSlot);
+    foundStore->setVolatile(true);
     SB.CreateBr(nextBB);
 
     IRBuilder<> NB(nextBB);
@@ -8321,6 +8344,146 @@ Function *windowsSyscallStubScanner(Module &M) {
         NB.CreateAdd(idx, ConstantInt::get(i32, 1), "morok.win.sys.scan.next");
     NB.CreateBr(loopBB);
     idx->addIncoming(nextIdx, nextBB);
+
+    IRBuilder<> GB(neighborGateBB);
+    Value *found =
+        GB.CreateLoad(i8, foundSlot, "morok.win.sys.scan.found.final");
+    cast<LoadInst>(found)->setVolatile(true);
+    GB.CreateCondBr(GB.CreateICmpNE(found, ConstantInt::get(i8, 0),
+                                    "morok.win.sys.scan.hells.ready"),
+                    retBB, neighborLoopBB);
+
+    IRBuilder<> NLB(neighborLoopBB);
+    auto *neighborIdx =
+        NLB.CreatePHI(i32, 2, "morok.win.sys.scan.neighbor.idx");
+    neighborIdx->addIncoming(ConstantInt::get(i32, 1), neighborGateBB);
+    NLB.CreateCondBr(
+        NLB.CreateICmpULE(neighborIdx, ConstantInt::get(i32, 8),
+                          "morok.win.sys.scan.neighbor.limit"),
+        neighborBodyBB, retBB);
+
+    IRBuilder<> HB(neighborBodyBB);
+    Value *neighborSpan =
+        HB.CreateMul(neighborIdx, ConstantInt::get(i32, 32),
+                     "morok.win.sys.scan.neighbor.span");
+    Value *posOff =
+        HB.CreateZExt(neighborSpan, ip, "morok.win.sys.scan.halo.off");
+    Value *negSpan =
+        HB.CreateSub(ConstantInt::get(i32, 0), neighborSpan,
+                     "morok.win.sys.scan.tartarus.span");
+    Value *negOff =
+        HB.CreateSExt(negSpan, ip, "morok.win.sys.scan.tartarus.off");
+    Value *posPtr = gepI8(HB, M, stub, posOff, "morok.win.sys.scan.halo.ptr");
+    Value *negPtr =
+        gepI8(HB, M, stub, negOff, "morok.win.sys.scan.tartarus.ptr");
+
+    Value *posP0 =
+        loadAt(HB, M, i8, posPtr, 0ULL, "morok.win.sys.scan.halo.p0");
+    Value *posP1 =
+        loadAt(HB, M, i8, posPtr, 1, "morok.win.sys.scan.halo.p1");
+    Value *posP2 =
+        loadAt(HB, M, i8, posPtr, 2, "morok.win.sys.scan.halo.p2");
+    Value *posP3 =
+        loadAt(HB, M, i8, posPtr, 3, "morok.win.sys.scan.halo.p3");
+    Value *negP0 =
+        loadAt(HB, M, i8, negPtr, 0ULL, "morok.win.sys.scan.tartarus.p0");
+    Value *negP1 =
+        loadAt(HB, M, i8, negPtr, 1, "morok.win.sys.scan.tartarus.p1");
+    Value *negP2 =
+        loadAt(HB, M, i8, negPtr, 2, "morok.win.sys.scan.tartarus.p2");
+    Value *negP3 =
+        loadAt(HB, M, i8, negPtr, 3, "morok.win.sys.scan.tartarus.p3");
+    Value *posPrologue = HB.CreateAnd(
+        HB.CreateAnd(HB.CreateICmpEQ(posP0, ConstantInt::get(i8, 0x4C)),
+                     HB.CreateICmpEQ(posP1, ConstantInt::get(i8, 0x8B))),
+        HB.CreateAnd(HB.CreateICmpEQ(posP2, ConstantInt::get(i8, 0xD1)),
+                     HB.CreateICmpEQ(posP3, ConstantInt::get(i8, 0xB8))),
+        "morok.win.sys.scan.halo");
+    Value *negPrologue = HB.CreateAnd(
+        HB.CreateAnd(HB.CreateICmpEQ(negP0, ConstantInt::get(i8, 0x4C)),
+                     HB.CreateICmpEQ(negP1, ConstantInt::get(i8, 0x8B))),
+        HB.CreateAnd(HB.CreateICmpEQ(negP2, ConstantInt::get(i8, 0xD1)),
+                     HB.CreateICmpEQ(negP3, ConstantInt::get(i8, 0xB8))),
+        "morok.win.sys.scan.tartarus");
+    Value *posSsn =
+        loadAt(HB, M, i32, posPtr, 4, "morok.win.sys.scan.halo.ssn");
+    Value *negSsn =
+        loadAt(HB, M, i32, negPtr, 4, "morok.win.sys.scan.tartarus.ssn");
+    Value *posCandidate =
+        HB.CreateSub(posSsn, neighborIdx, "morok.win.sys.scan.halo.ssn.derive");
+    Value *negCandidate = HB.CreateAdd(
+        negSsn, neighborIdx, "morok.win.sys.scan.tartarus.ssn.derive");
+    Value *anyNeighbor = HB.CreateOr(posPrologue, negPrologue,
+                                     "morok.win.sys.scan.neighbor.hit");
+    Value *neighborSsn =
+        HB.CreateSelect(posPrologue, posCandidate, negCandidate,
+                        "morok.win.sys.scan.neighbor.ssn");
+    Value *neighborOldSsn =
+        HB.CreateLoad(i32, ssnSlot, "morok.win.sys.scan.neighbor.ssn.old");
+    cast<LoadInst>(neighborOldSsn)->setVolatile(true);
+    HB.CreateStore(HB.CreateSelect(anyNeighbor, neighborSsn, neighborOldSsn,
+                                   "morok.win.sys.scan.neighbor.ssn.sel"),
+                   ssnSlot)
+        ->setVolatile(true);
+
+    Value *posG0 =
+        loadAt(HB, M, i8, posPtr, 18, "morok.win.sys.scan.halo.g0");
+    Value *posG1 =
+        loadAt(HB, M, i8, posPtr, 19, "morok.win.sys.scan.halo.g1");
+    Value *posG2 =
+        loadAt(HB, M, i8, posPtr, 20, "morok.win.sys.scan.halo.g2");
+    Value *negG0 =
+        loadAt(HB, M, i8, negPtr, 18, "morok.win.sys.scan.tartarus.g0");
+    Value *negG1 =
+        loadAt(HB, M, i8, negPtr, 19, "morok.win.sys.scan.tartarus.g1");
+    Value *negG2 =
+        loadAt(HB, M, i8, negPtr, 20, "morok.win.sys.scan.tartarus.g2");
+    Value *posGadget = HB.CreateAnd(
+        posPrologue,
+        HB.CreateAnd(HB.CreateAnd(HB.CreateICmpEQ(posG0, ConstantInt::get(i8, 0x0F)),
+                                  HB.CreateICmpEQ(posG1, ConstantInt::get(i8, 0x05))),
+                     HB.CreateICmpEQ(posG2, ConstantInt::get(i8, 0xC3))),
+        "morok.win.sys.scan.halo.gadget");
+    Value *negGadget = HB.CreateAnd(
+        negPrologue,
+        HB.CreateAnd(HB.CreateAnd(HB.CreateICmpEQ(negG0, ConstantInt::get(i8, 0x0F)),
+                                  HB.CreateICmpEQ(negG1, ConstantInt::get(i8, 0x05))),
+                     HB.CreateICmpEQ(negG2, ConstantInt::get(i8, 0xC3))),
+        "morok.win.sys.scan.tartarus.gadget");
+    Value *posGadgetOff = HB.CreateAdd(
+        neighborSpan, ConstantInt::get(i32, 18),
+        "morok.win.sys.scan.halo.gadget.off");
+    Value *negGadgetOff = HB.CreateSub(
+        ConstantInt::get(i32, 18), neighborSpan,
+        "morok.win.sys.scan.tartarus.gadget.off");
+    Value *anyGadget = HB.CreateOr(posGadget, negGadget,
+                                   "morok.win.sys.scan.neighbor.gadget.hit");
+    Value *neighborGadget =
+        HB.CreateSelect(posGadget, posGadgetOff, negGadgetOff,
+                        "morok.win.sys.scan.neighbor.gadget");
+    Value *neighborOldGadget = HB.CreateLoad(
+        i32, gadgetSlot, "morok.win.sys.scan.neighbor.gadget.old");
+    cast<LoadInst>(neighborOldGadget)->setVolatile(true);
+    HB.CreateStore(HB.CreateSelect(anyGadget, neighborGadget, neighborOldGadget,
+                                   "morok.win.sys.scan.neighbor.gadget.sel"),
+                   gadgetSlot)
+        ->setVolatile(true);
+    Value *neighborOldFound =
+        HB.CreateLoad(i8, foundSlot, "morok.win.sys.scan.neighbor.found.old");
+    cast<LoadInst>(neighborOldFound)->setVolatile(true);
+    HB.CreateStore(HB.CreateSelect(anyNeighbor, ConstantInt::get(i8, 1),
+                                   neighborOldFound,
+                                   "morok.win.sys.scan.neighbor.found.sel"),
+                   foundSlot)
+        ->setVolatile(true);
+    HB.CreateCondBr(anyNeighbor, retBB, neighborNextBB);
+
+    IRBuilder<> NNB(neighborNextBB);
+    Value *nextNeighbor = NNB.CreateAdd(
+        neighborIdx, ConstantInt::get(i32, 1),
+        "morok.win.sys.scan.neighbor.next");
+    NNB.CreateBr(neighborLoopBB);
+    neighborIdx->addIncoming(nextNeighbor, neighborNextBB);
 
     IRBuilder<> RB(retBB);
     Value *ssnOut = RB.CreateLoad(i32, ssnSlot, "morok.win.sys.ssn");
@@ -8354,7 +8517,7 @@ Function *windowsDirectSyscallThunk(Module &M) {
     IRBuilder<> B(entry);
     auto *asmTy = FunctionType::get(ip, {i32, ip, ip, ip, ip}, false);
     InlineAsm *IA = InlineAsm::get(
-        asmTy, "movq %rcx, %r10\nmovl $0, %eax\nsyscall",
+        asmTy, "movq %rcx, %r10\nsyscall",
         "={rax},{eax},{rcx},{rdx},{r8},{r9},~{r10},~{r11},~{memory},"
         "~{dirflag},~{fpsr},~{flags}",
         /*hasSideEffects=*/true);
@@ -8385,13 +8548,17 @@ Function *windowsIndirectSyscallThunk(Module &M) {
     IRBuilder<> B(entry);
     auto *asmTy = FunctionType::get(ip, {i32, ip, ip, ip, ip, ip}, false);
     InlineAsm *IA = InlineAsm::get(
-        asmTy, "movq %rcx, %r10\nmovl $0, %eax\ncallq *$5",
+        asmTy, "movq %rcx, %r10\ncallq *$6",
         "={rax},{eax},{rcx},{rdx},{r8},{r9},r,~{r10},~{r11},~{memory},"
         "~{dirflag},~{fpsr},~{flags}",
         /*hasSideEffects=*/true);
     SmallVector<Value *, 6> args;
-    for (Argument &A : fn->args())
-        args.push_back(&A);
+    args.push_back(fn->getArg(0)); // SSN -> eax
+    args.push_back(fn->getArg(2)); // syscall arg1 -> rcx
+    args.push_back(fn->getArg(3)); // syscall arg2 -> rdx
+    args.push_back(fn->getArg(4)); // syscall arg3 -> r8
+    args.push_back(fn->getArg(5)); // syscall arg4 -> r9
+    args.push_back(fn->getArg(1)); // recycled ntdll syscall;ret gadget
     B.CreateRet(B.CreateCall(asmTy, IA, args, "morok.win.sys.indirect.ret"));
     return fn;
 }
@@ -9687,6 +9854,218 @@ Function *windowsKernelDebuggerProbe(Module &M, GlobalVariable *State,
     return fn;
 }
 
+Function *windowsSyscallsProbe(Module &M, GlobalVariable *State,
+                               ir::IRRandom &rng, const Triple &TT) {
+    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
+        intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.win.syscalls.probe"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.syscalls.probe", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    Function *pebReader = windowsPebReader(M);
+    Function *moduleByHash = windowsLdrModuleByHash(M);
+    Function *resolver = windowsPeExportResolver(M);
+    Function *scanner = windowsSyscallStubScanner(M);
+    Function *direct = windowsDirectSyscallThunk(M);
+    Function *indirect = windowsIndirectSyscallThunk(M);
+    if (!pebReader || !moduleByHash || !resolver || !scanner || !direct ||
+        !indirect)
+        return nullptr;
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *resolveBB = BasicBlock::Create(ctx, "resolve", fn);
+    auto *qsiDirectBB = BasicBlock::Create(ctx, "qsi.direct", fn);
+    auto *qsiIndirectBB = BasicBlock::Create(ctx, "qsi.indirect", fn);
+    auto *closeGateBB = BasicBlock::Create(ctx, "close.gate", fn);
+    auto *closeDirectBB = BasicBlock::Create(ctx, "close.direct", fn);
+    auto *closeIndirectBB = BasicBlock::Create(ctx, "close.indirect", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *retLen =
+        B.CreateAlloca(i32, nullptr, "morok.win.syscalls.retlen");
+    auto *kdInfoTy = ArrayType::get(i8, 2);
+    AllocaInst *kdInfo =
+        B.CreateAlloca(kdInfoTy, nullptr, "morok.win.syscalls.kdinfo");
+    B.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
+    storeAt(B, M, kdInfo, 0, ConstantInt::get(i8, 0),
+            "morok.win.syscalls.kdinfo.init0");
+    storeAt(B, M, kdInfo, 1, ConstantInt::get(i8, 0),
+            "morok.win.syscalls.kdinfo.init1");
+    Value *peb = B.CreateCall(pebReader, {}, "morok.win.syscalls.peb");
+    foldState(B, State, peb, rng.next(), "morok.win.syscalls.peb.mix");
+    B.CreateCondBr(B.CreateICmpNE(peb, ConstantInt::get(ip, 0),
+                                  "morok.win.syscalls.peb.present"),
+                   resolveBB, retBB);
+
+    IRBuilder<> RB(resolveBB);
+    Value *ntdll = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("ntdll.dll"))},
+        "morok.win.syscalls.ntdll");
+    Value *qsi = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtQuerySystemInformation"))},
+        "morok.win.syscalls.ntqsi");
+    Value *ntClose = RB.CreateCall(
+        resolver, {ntdll, ConstantInt::get(i64, fnv1aName("NtClose"))},
+        "morok.win.syscalls.ntclose");
+    Value *qsiPack = RB.CreateCall(
+        scanner, {RB.CreateIntToPtr(qsi, ptr, "morok.win.syscalls.ntqsi.ptr")},
+        "morok.win.syscalls.ntqsi.pack");
+    Value *closePack = RB.CreateCall(
+        scanner,
+        {RB.CreateIntToPtr(ntClose, ptr, "morok.win.syscalls.ntclose.ptr")},
+        "morok.win.syscalls.ntclose.pack");
+    Value *qsiSsn = RB.CreateTrunc(qsiPack, i32, "morok.win.syscalls.ntqsi.ssn");
+    Value *qsiGadget32 =
+        RB.CreateTrunc(RB.CreateLShr(qsiPack, ConstantInt::get(ip, 32)),
+                       i32, "morok.win.syscalls.ntqsi.gadget32");
+    Value *closeSsn =
+        RB.CreateTrunc(closePack, i32, "morok.win.syscalls.ntclose.ssn");
+    Value *closeGadget32 =
+        RB.CreateTrunc(RB.CreateLShr(closePack, ConstantInt::get(ip, 32)),
+                       i32, "morok.win.syscalls.ntclose.gadget32");
+    foldState(RB, State, ntdll, rng.next(), "morok.win.syscalls.ntdll.mix");
+    foldState(RB, State, qsiPack, rng.next(), "morok.win.syscalls.ntqsi.pack.mix");
+    foldState(RB, State, closePack, rng.next(),
+              "morok.win.syscalls.ntclose.pack.mix");
+    Value *qsiReady = RB.CreateAnd(
+        RB.CreateICmpNE(qsi, ConstantInt::get(ip, 0)),
+        RB.CreateICmpNE(qsiSsn, ConstantInt::get(i32, 0)),
+        "morok.win.syscalls.ntqsi.ready");
+    RB.CreateCondBr(qsiReady, qsiDirectBB, closeGateBB);
+
+    IRBuilder<> QB(qsiDirectBB);
+    QB.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
+    storeAt(QB, M, kdInfo, 0, ConstantInt::get(i8, 0),
+            "morok.win.syscalls.kdinfo.direct0");
+    storeAt(QB, M, kdInfo, 1, ConstantInt::get(i8, 0),
+            "morok.win.syscalls.kdinfo.direct1");
+    Value *kdInfoIp =
+        QB.CreatePtrToInt(kdInfo, ip, "morok.win.syscalls.kdinfo.ip");
+    Value *retLenIp =
+        QB.CreatePtrToInt(retLen, ip, "morok.win.syscalls.retlen.ip");
+    auto *directTy = direct->getFunctionType();
+    Value *qsiDirect = QB.CreateCall(
+        directTy, direct,
+        {qsiSsn, ConstantInt::get(ip, 0x23), kdInfoIp,
+         ConstantInt::get(ip, 2), retLenIp},
+        "morok.win.syscalls.ntqsi.direct");
+    Value *qsiDirectStatus =
+        QB.CreateTrunc(qsiDirect, i32, "morok.win.syscalls.ntqsi.direct.i32");
+    Value *kdDirect0 =
+        loadAt(QB, M, i8, kdInfo, 0ULL, "morok.win.syscalls.kd.direct0");
+    Value *kdDirect1 =
+        loadAt(QB, M, i8, kdInfo, 1, "morok.win.syscalls.kd.direct1");
+    foldState(QB, State, qsiDirect, rng.next(),
+              "morok.win.syscalls.ntqsi.direct.mix");
+    foldState(QB, State, kdDirect0, rng.next(),
+              "morok.win.syscalls.kd.direct0.mix");
+    foldState(QB, State, kdDirect1, rng.next(),
+              "morok.win.syscalls.kd.direct1.mix");
+    QB.CreateCondBr(QB.CreateICmpNE(qsiGadget32, ConstantInt::get(i32, 0),
+                                    "morok.win.syscalls.ntqsi.gadget.ready"),
+                    qsiIndirectBB, closeGateBB);
+
+    IRBuilder<> IB(qsiIndirectBB);
+    IB.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
+    storeAt(IB, M, kdInfo, 0, ConstantInt::get(i8, 0),
+            "morok.win.syscalls.kdinfo.indirect0");
+    storeAt(IB, M, kdInfo, 1, ConstantInt::get(i8, 0),
+            "morok.win.syscalls.kdinfo.indirect1");
+    Value *qsiGadget = IB.CreateAdd(
+        qsi,
+        IB.CreateSExt(qsiGadget32, ip, "morok.win.syscalls.ntqsi.gadget.off"),
+        "morok.win.syscalls.ntqsi.gadget");
+    auto *indirectTy = indirect->getFunctionType();
+    Value *qsiIndirect = IB.CreateCall(
+        indirectTy, indirect,
+        {qsiSsn, qsiGadget, ConstantInt::get(ip, 0x23), kdInfoIp,
+         ConstantInt::get(ip, 2), retLenIp},
+        "morok.win.syscalls.ntqsi.indirect");
+    Value *qsiIndirectStatus =
+        IB.CreateTrunc(qsiIndirect, i32, "morok.win.syscalls.ntqsi.indirect.i32");
+    Value *kdIndirect0 =
+        loadAt(IB, M, i8, kdInfo, 0ULL, "morok.win.syscalls.kd.indirect0");
+    Value *kdIndirect1 =
+        loadAt(IB, M, i8, kdInfo, 1, "morok.win.syscalls.kd.indirect1");
+    Value *qsiStatusDiverged =
+        IB.CreateICmpNE(qsiDirectStatus, qsiIndirectStatus,
+                        "morok.win.syscalls.ntqsi.status.diverged");
+    Value *qsiDataDiverged = IB.CreateOr(
+        IB.CreateICmpNE(kdDirect0, kdIndirect0,
+                        "morok.win.syscalls.kd.enabled.diverged"),
+        IB.CreateICmpNE(kdDirect1, kdIndirect1,
+                        "morok.win.syscalls.kd.present.diverged"),
+        "morok.win.syscalls.kd.diverged");
+    foldState(IB, State, qsiIndirect, rng.next(),
+              "morok.win.syscalls.ntqsi.indirect.mix");
+    foldFlag(IB, State, IB.CreateOr(qsiStatusDiverged, qsiDataDiverged,
+                                    "morok.win.syscalls.ntqsi.diverged"),
+             0x38B2E1F46D0A9C57ULL, "morok.win.syscalls.ntqsi.divergence");
+    IB.CreateBr(closeGateBB);
+
+    IRBuilder<> CGB(closeGateBB);
+    Value *closeReady = CGB.CreateAnd(
+        CGB.CreateICmpNE(ntClose, ConstantInt::get(ip, 0)),
+        CGB.CreateICmpNE(closeSsn, ConstantInt::get(i32, 0)),
+        "morok.win.syscalls.ntclose.ready");
+    CGB.CreateCondBr(closeReady, closeDirectBB, retBB);
+
+    IRBuilder<> CB(closeDirectBB);
+    Value *invalidHandle = ConstantInt::get(ip, 0xDEADDEADULL);
+    Value *closeDirect = CB.CreateCall(
+        directTy, direct,
+        {closeSsn, invalidHandle, ConstantInt::get(ip, 0),
+         ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.win.syscalls.ntclose.direct");
+    Value *closeDirectStatus = CB.CreateTrunc(
+        closeDirect, i32, "morok.win.syscalls.ntclose.direct.i32");
+    foldState(CB, State, closeDirect, rng.next(),
+              "morok.win.syscalls.ntclose.direct.mix");
+    CB.CreateCondBr(CB.CreateICmpNE(closeGadget32, ConstantInt::get(i32, 0),
+                                    "morok.win.syscalls.ntclose.gadget.ready"),
+                    closeIndirectBB, retBB);
+
+    IRBuilder<> CIB(closeIndirectBB);
+    Value *closeGadget = CIB.CreateAdd(
+        ntClose,
+        CIB.CreateSExt(closeGadget32, ip,
+                       "morok.win.syscalls.ntclose.gadget.off"),
+        "morok.win.syscalls.ntclose.gadget");
+    Value *closeIndirect = CIB.CreateCall(
+        indirectTy, indirect,
+        {closeSsn, closeGadget, invalidHandle, ConstantInt::get(ip, 0),
+         ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.win.syscalls.ntclose.indirect");
+    Value *closeIndirectStatus = CIB.CreateTrunc(
+        closeIndirect, i32, "morok.win.syscalls.ntclose.indirect.i32");
+    foldState(CIB, State, closeIndirect, rng.next(),
+              "morok.win.syscalls.ntclose.indirect.mix");
+    foldFlag(CIB, State,
+             CIB.CreateICmpNE(closeDirectStatus, closeIndirectStatus,
+                              "morok.win.syscalls.ntclose.diverged"),
+             0xA65C04D3189BE72FULL, "morok.win.syscalls.ntclose.divergence");
+    CIB.CreateBr(retBB);
+
+    IRBuilder<> RetB(retBB);
+    RetB.CreateRetVoid();
+    return fn;
+}
+
 } // namespace
 
 bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
@@ -10203,6 +10582,21 @@ bool windowsKernelDebuggerModule(Module &M, ir::IRRandom &rng) {
     return true;
 }
 
+bool windowsSyscallsModule(Module &M, ir::IRRandom &rng) {
+    const Triple tt(M.getTargetTriple());
+    GlobalVariable *state = windowsPeState(M, rng);
+    Function *probe = windowsSyscallsProbe(M, state, rng, tt);
+    if (!probe)
+        return false;
+
+    Function *ctor = makeCtorShell(M, "morok.win.syscalls");
+    IRBuilder<> B(&ctor->getEntryBlock());
+    B.CreateCall(probe);
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, ctor, 0);
+    return true;
+}
+
 PreservedAnalyses AntiDebuggingPass::run(Module &M, ModuleAnalysisManager &) {
     ir::IRRandom rng(engine_);
     return antiDebuggingModule(M, rng) ? PreservedAnalyses::none()
@@ -10258,6 +10652,13 @@ PreservedAnalyses WindowsKernelDebuggerPass::run(Module &M,
     ir::IRRandom rng(engine_);
     return windowsKernelDebuggerModule(M, rng) ? PreservedAnalyses::none()
                                                : PreservedAnalyses::all();
+}
+
+PreservedAnalyses WindowsSyscallsPass::run(Module &M,
+                                           ModuleAnalysisManager &) {
+    ir::IRRandom rng(engine_);
+    return windowsSyscallsModule(M, rng) ? PreservedAnalyses::none()
+                                         : PreservedAnalyses::all();
 }
 
 PreservedAnalyses TimingOraclePass::run(Module &M, ModuleAnalysisManager &) {

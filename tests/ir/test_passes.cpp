@@ -10589,6 +10589,10 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.mov.eax") >= 1u);
     CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.syscall.ret") >=
           1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.halo") >= 1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.tartarus") >= 1u);
+    CHECK(countNamedInstructions(*Scan,
+                                 "morok.win.sys.scan.neighbor.gadget") >= 1u);
     CHECK(countNamedInstructions(*Veh, "morok.win.veh.code") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
@@ -10805,6 +10809,59 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Probe, "morok.win.kdbg.parent.pid") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.kdbg.window.windbg") >=
           1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("windowsSyscallsModule emits direct and indirect syscall probes") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-pc-windows-msvc"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(7137);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::windowsSyscallsModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.win.syscalls");
+    Function *Probe = M->getFunction("morok.win.syscalls.probe");
+    Function *Peb = M->getFunction("morok.win.peb");
+    Function *Resolve = M->getFunction("morok.win.pe.resolve");
+    Function *Ldr = M->getFunction("morok.win.ldr.module");
+    Function *Scan = M->getFunction("morok.win.sys.scan");
+    Function *Direct = M->getFunction("morok.win.sys.direct");
+    Function *Indirect = M->getFunction("morok.win.sys.indirect");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Probe != nullptr);
+    REQUIRE(Peb != nullptr);
+    REQUIRE(Resolve != nullptr);
+    REQUIRE(Ldr != nullptr);
+    REQUIRE(Scan != nullptr);
+    REQUIRE(Direct != nullptr);
+    REQUIRE(Indirect != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
+    CHECK(M->getFunction("NtQuerySystemInformation") == nullptr);
+    CHECK(M->getFunction("NtClose") == nullptr);
+    CHECK(hasInlineAsmCall(*Peb));
+    CHECK(hasInlineAsmCall(*Direct));
+    CHECK(hasInlineAsmCall(*Indirect));
+    CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.halo") >= 1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.tartarus") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.syscalls.ntdll") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.syscalls.ntqsi.pack") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.syscalls.ntclose.pack") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.syscalls.ntqsi.direct") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.syscalls.ntqsi.indirect") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.syscalls.ntqsi.diverged") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.syscalls.ntclose.direct") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.syscalls.ntclose.indirect") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
