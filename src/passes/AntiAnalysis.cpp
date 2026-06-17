@@ -578,6 +578,18 @@ Value *emitLinuxMprotect(IRBuilder<> &B, Module &M, const Triple &TT,
                                           B.CreateTruncOrBitCast(Prot, i32)});
 }
 
+Value *emitDarwinMprotect(IRBuilder<> &B, Module &M, const Triple &TT,
+                          Value *Addr, Value *Size, Value *Prot) {
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    if (useDirectDarwinSyscalls(TT))
+        return B.CreateTruncOrBitCast(
+            emitDarwinSyscall(B, M, TT, 74, {Addr, Size, Prot}), i32);
+
+    auto *ptr = PointerType::getUnqual(M.getContext());
+    return B.CreateCall(mprotectDecl(M), {B.CreateIntToPtr(Addr, ptr), Size,
+                                          B.CreateTruncOrBitCast(Prot, i32)});
+}
+
 void emitLinuxClose(IRBuilder<> &B, Module &M, const Triple &TT, Value *Fd) {
     std::uint32_t ptraceNr = 0;
     std::uint32_t prctlNr = 0;
@@ -3709,6 +3721,355 @@ Function *addressSpaceCensusProbe(Module &M, ir::IRRandom &rng,
     return windowsVirtualQueryCensusProbe(M);
 }
 
+Function *linuxWxEnforceProbe(Module &M, const Triple &TT) {
+    if (!TT.isOSLinux() || intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.wxorx.linux"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.wxorx.linux", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *baseLoopBB = BasicBlock::Create(ctx, "base.loop", fn);
+    auto *baseBodyBB = BasicBlock::Create(ctx, "base.body", fn);
+    auto *baseNextBB = BasicBlock::Create(ctx, "base.next", fn);
+    auto *protLoopBB = BasicBlock::Create(ctx, "prot.loop", fn);
+    auto *protBodyBB = BasicBlock::Create(ctx, "prot.body", fn);
+    auto *protectBB = BasicBlock::Create(ctx, "protect", fn);
+    auto *protNextBB = BasicBlock::Create(ctx, "prot.next", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *diff = B.CreateAlloca(i64, nullptr, "morok.antihook.wxorx.diff");
+    AllocaInst *baseSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.wxorx.base");
+    B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), baseSlot);
+    FunctionCallee getauxval =
+        M.getOrInsertFunction("getauxval", FunctionType::get(ip, {ip}, false));
+    Value *atPhdr = B.CreateCall(getauxval, {ConstantInt::get(ip, 3)},
+                                 "morok.antihook.wxorx.atphdr");
+    Value *phEnt = B.CreateCall(getauxval, {ConstantInt::get(ip, 4)},
+                                "morok.antihook.wxorx.phent");
+    Value *phNum = B.CreateCall(getauxval, {ConstantInt::get(ip, 5)},
+                                "morok.antihook.wxorx.phnum");
+    Value *pageRaw = B.CreateCall(getauxval, {ConstantInt::get(ip, 6)},
+                                  "morok.antihook.wxorx.pagesz");
+    Value *pageSize = B.CreateSelect(
+        B.CreateICmpUGT(pageRaw, ConstantInt::get(ip, 0)), pageRaw,
+        ConstantInt::get(ip, 4096), "morok.antihook.wxorx.pagesz.v");
+    Value *valid =
+        B.CreateAnd(B.CreateICmpNE(atPhdr, ConstantInt::get(ip, 0)),
+                    B.CreateAnd(B.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56)),
+                                B.CreateICmpUGT(phNum, ConstantInt::get(ip, 0))));
+    B.CreateCondBr(valid, baseLoopBB, retBB);
+
+    IRBuilder<> BLB(baseLoopBB);
+    auto *baseIdx = BLB.CreatePHI(ip, 2, "morok.antihook.wxorx.base.idx");
+    baseIdx->addIncoming(ConstantInt::get(ip, 0), entry);
+    BLB.CreateCondBr(BLB.CreateAnd(BLB.CreateICmpULT(baseIdx, phNum),
+                                   BLB.CreateICmpULT(baseIdx, ConstantInt::get(ip, 128))),
+                     baseBodyBB, protLoopBB);
+
+    IRBuilder<> BBB(baseBodyBB);
+    Value *basePhPtr = BBB.CreateIntToPtr(
+        BBB.CreateAdd(atPhdr, BBB.CreateMul(baseIdx, phEnt)), ptr,
+        "morok.antihook.wxorx.base.ph");
+    Value *baseType = loadAt(BBB, M, i32, basePhPtr, 0ULL,
+                             "morok.antihook.wxorx.base.type");
+    Value *baseVaddr =
+        loadAt(BBB, M, ip, basePhPtr, 16, "morok.antihook.wxorx.base.vaddr");
+    Value *oldBase = BBB.CreateLoad(ip, baseSlot);
+    Value *newBase = BBB.CreateSelect(
+        BBB.CreateICmpEQ(baseType, ConstantInt::get(i32, 6)),
+        BBB.CreateSub(atPhdr, baseVaddr), oldBase,
+        "morok.antihook.wxorx.base.new");
+    BBB.CreateStore(newBase, baseSlot);
+    BBB.CreateBr(baseNextBB);
+
+    IRBuilder<> BNB(baseNextBB);
+    Value *nextBaseIdx =
+        BNB.CreateAdd(baseIdx, ConstantInt::get(ip, 1), "morok.antihook.wxorx.base.next");
+    BNB.CreateBr(baseLoopBB);
+    baseIdx->addIncoming(nextBaseIdx, baseNextBB);
+
+    IRBuilder<> PLB(protLoopBB);
+    auto *phIdx = PLB.CreatePHI(ip, 2, "morok.antihook.wxorx.ph.idx");
+    phIdx->addIncoming(ConstantInt::get(ip, 0), baseLoopBB);
+    PLB.CreateCondBr(PLB.CreateAnd(PLB.CreateICmpULT(phIdx, phNum),
+                                   PLB.CreateICmpULT(phIdx, ConstantInt::get(ip, 128))),
+                     protBodyBB, retBB);
+
+    IRBuilder<> PBB(protBodyBB);
+    Value *phPtr = PBB.CreateIntToPtr(
+        PBB.CreateAdd(atPhdr, PBB.CreateMul(phIdx, phEnt)), ptr,
+        "morok.antihook.wxorx.ph");
+    Value *pType = loadAt(PBB, M, i32, phPtr, 0ULL, "morok.antihook.wxorx.type");
+    Value *pFlags = loadAt(PBB, M, i32, phPtr, 4, "morok.antihook.wxorx.flags");
+    Value *pVaddr = loadAt(PBB, M, ip, phPtr, 16, "morok.antihook.wxorx.vaddr");
+    Value *pMemsz = loadAt(PBB, M, ip, phPtr, 40, "morok.antihook.wxorx.memsz");
+    Value *isLoad = PBB.CreateICmpEQ(pType, ConstantInt::get(i32, 1));
+    Value *isExec =
+        PBB.CreateICmpNE(PBB.CreateAnd(pFlags, ConstantInt::get(i32, 1)),
+                         ConstantInt::get(i32, 0));
+    Value *hasMem = PBB.CreateICmpUGT(pMemsz, ConstantInt::get(ip, 0));
+    PBB.CreateCondBr(PBB.CreateAnd(PBB.CreateAnd(isLoad, isExec), hasMem),
+                     protectBB, protNextBB);
+
+    IRBuilder<> WB(protectBB);
+    Value *base = WB.CreateLoad(ip, baseSlot, "morok.antihook.wxorx.base.v");
+    Value *segStart = WB.CreateAdd(base, pVaddr, "morok.antihook.wxorx.start");
+    Value *segEnd = WB.CreateAdd(segStart, pMemsz, "morok.antihook.wxorx.end");
+    Value *mask = WB.CreateNot(WB.CreateSub(pageSize, ConstantInt::get(ip, 1)),
+                               "morok.antihook.wxorx.mask");
+    Value *pageStart = WB.CreateAnd(segStart, mask, "morok.antihook.wxorx.page");
+    Value *pageEnd = WB.CreateAnd(WB.CreateAdd(segEnd, WB.CreateSub(pageSize, ConstantInt::get(ip, 1))),
+                                  mask, "morok.antihook.wxorx.page.end");
+    Value *protSize = WB.CreateSub(pageEnd, pageStart, "morok.antihook.wxorx.size");
+    Value *rc = emitLinuxMprotect(WB, M, TT, pageStart, protSize,
+                                  ConstantInt::get(ip, 5));
+    rc->setName("morok.antihook.wxorx.mprotect");
+    incrementDiff(WB, diff,
+                  WB.CreateICmpSLT(rc, ConstantInt::getSigned(i32, 0)),
+                  "morok.antihook.wxorx.fail");
+    WB.CreateBr(protNextBB);
+
+    IRBuilder<> PNB(protNextBB);
+    Value *nextPh =
+        PNB.CreateAdd(phIdx, ConstantInt::get(ip, 1), "morok.antihook.wxorx.next");
+    PNB.CreateBr(protLoopBB);
+    phIdx->addIncoming(nextPh, protNextBB);
+
+    IRBuilder<> RB(retBB);
+    emitRetDiff(RB, diff);
+    return fn;
+}
+
+Function *darwinWxEnforceProbe(Module &M, const Triple &TT) {
+    if (!TT.isOSDarwin() || intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.wxorx.darwin"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.wxorx.darwin", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *cmdLoopBB = BasicBlock::Create(ctx, "cmd.loop", fn);
+    auto *cmdBodyBB = BasicBlock::Create(ctx, "cmd.body", fn);
+    auto *protectBB = BasicBlock::Create(ctx, "protect", fn);
+    auto *cmdNextBB = BasicBlock::Create(ctx, "cmd.next", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *diff = B.CreateAlloca(i64, nullptr, "morok.antihook.wxorx.diff");
+    B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
+    FunctionCallee imageHeader = M.getOrInsertFunction(
+        "_dyld_get_image_header", FunctionType::get(ptr, {i32}, false));
+    FunctionCallee imageSlide = M.getOrInsertFunction(
+        "_dyld_get_image_vmaddr_slide", FunctionType::get(ip, {i32}, false));
+    FunctionCallee getpagesize =
+        M.getOrInsertFunction("getpagesize", FunctionType::get(i32, false));
+    Value *hdr = B.CreateCall(imageHeader, {ConstantInt::get(i32, 0)},
+                              "morok.antihook.wxorx.hdr");
+    Value *slide = B.CreateCall(imageSlide, {ConstantInt::get(i32, 0)},
+                                "morok.antihook.wxorx.slide");
+    Value *pageRaw =
+        B.CreateZExt(B.CreateCall(getpagesize, {}, "morok.antihook.wxorx.pagesz"), ip);
+    Value *pageSize = B.CreateSelect(
+        B.CreateICmpUGT(pageRaw, ConstantInt::get(ip, 0)), pageRaw,
+        ConstantInt::get(ip, 4096), "morok.antihook.wxorx.pagesz.v");
+    Value *magic = loadAt(B, M, i32, hdr, 0ULL, "morok.antihook.wxorx.magic");
+    Value *ncmds = loadAt(B, M, i32, hdr, 16, "morok.antihook.wxorx.ncmds");
+    Value *valid =
+        B.CreateAnd(B.CreateICmpNE(hdr, ConstantPointerNull::get(ptr)),
+                    B.CreateICmpEQ(magic, ConstantInt::get(i32, 0xFEEDFACF)));
+    B.CreateCondBr(valid, cmdLoopBB, retBB);
+
+    IRBuilder<> CLB(cmdLoopBB);
+    auto *cmdIdx = CLB.CreatePHI(i32, 2, "morok.antihook.wxorx.cmd.idx");
+    auto *cmdOff = CLB.CreatePHI(ip, 2, "morok.antihook.wxorx.cmd.off");
+    cmdIdx->addIncoming(ConstantInt::get(i32, 0), entry);
+    cmdOff->addIncoming(ConstantInt::get(ip, 32), entry);
+    CLB.CreateCondBr(CLB.CreateAnd(CLB.CreateICmpULT(cmdIdx, ncmds),
+                                   CLB.CreateICmpULT(cmdIdx, ConstantInt::get(i32, 128))),
+                     cmdBodyBB, retBB);
+
+    IRBuilder<> CBB(cmdBodyBB);
+    Value *cmdPtr = gepI8(CBB, M, hdr, cmdOff, "morok.antihook.wxorx.cmd.ptr");
+    Value *cmd = loadAt(CBB, M, i32, cmdPtr, 0ULL, "morok.antihook.wxorx.cmd");
+    Value *cmdSize32 =
+        loadAt(CBB, M, i32, cmdPtr, 4, "morok.antihook.wxorx.cmd.size");
+    Value *cmdSize = CBB.CreateZExt(cmdSize32, ip, "morok.antihook.wxorx.cmd.size.w");
+    Value *vmaddr = loadAt(CBB, M, i64, cmdPtr, 24, "morok.antihook.wxorx.vmaddr");
+    Value *vmsize = loadAt(CBB, M, i64, cmdPtr, 32, "morok.antihook.wxorx.vmsize");
+    Value *initprot =
+        loadAt(CBB, M, i32, cmdPtr, 60, "morok.antihook.wxorx.initprot");
+    Value *isSegment = CBB.CreateICmpEQ(cmd, ConstantInt::get(i32, 0x19));
+    Value *isExec =
+        CBB.CreateICmpNE(CBB.CreateAnd(initprot, ConstantInt::get(i32, 4)),
+                         ConstantInt::get(i32, 0));
+    Value *hasMem = CBB.CreateICmpUGT(vmsize, ConstantInt::get(i64, 0));
+    CBB.CreateCondBr(CBB.CreateAnd(CBB.CreateAnd(isSegment, isExec), hasMem),
+                     protectBB, cmdNextBB);
+
+    IRBuilder<> WB(protectBB);
+    Value *segStart = WB.CreateAdd(slide, vmaddr, "morok.antihook.wxorx.start");
+    Value *segEnd = WB.CreateAdd(segStart, vmsize, "morok.antihook.wxorx.end");
+    Value *mask = WB.CreateNot(WB.CreateSub(pageSize, ConstantInt::get(ip, 1)),
+                               "morok.antihook.wxorx.mask");
+    Value *pageStart = WB.CreateAnd(segStart, mask, "morok.antihook.wxorx.page");
+    Value *pageEnd = WB.CreateAnd(WB.CreateAdd(segEnd, WB.CreateSub(pageSize, ConstantInt::get(ip, 1))),
+                                  mask, "morok.antihook.wxorx.page.end");
+    Value *protSize = WB.CreateSub(pageEnd, pageStart, "morok.antihook.wxorx.size");
+    Value *rc = emitDarwinMprotect(WB, M, TT, pageStart, protSize,
+                                   ConstantInt::get(ip, 5));
+    rc->setName("morok.antihook.wxorx.mprotect");
+    incrementDiff(WB, diff,
+                  WB.CreateICmpSLT(rc, ConstantInt::getSigned(i32, 0)),
+                  "morok.antihook.wxorx.fail");
+    WB.CreateBr(cmdNextBB);
+
+    IRBuilder<> CNB(cmdNextBB);
+    Value *nextCmdIdx =
+        CNB.CreateAdd(cmdIdx, ConstantInt::get(i32, 1), "morok.antihook.wxorx.next");
+    Value *nextCmdOff =
+        CNB.CreateAdd(cmdOff, cmdSize, "morok.antihook.wxorx.cmd.off.next");
+    CNB.CreateBr(cmdLoopBB);
+    cmdIdx->addIncoming(nextCmdIdx, cmdNextBB);
+    cmdOff->addIncoming(nextCmdOff, cmdNextBB);
+
+    IRBuilder<> RB(retBB);
+    emitRetDiff(RB, diff);
+    return fn;
+}
+
+Function *windowsWxEnforceProbe(Module &M) {
+    const Triple TT(M.getTargetTriple());
+    if (!TT.isOSWindows() || intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.wxorx.windows"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.wxorx.windows", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
+    auto *protectBB = BasicBlock::Create(ctx, "protect", fn);
+    auto *protectCallBB = BasicBlock::Create(ctx, "protect.call", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    auto *mbiTy = ArrayType::get(i8, 64);
+    AllocaInst *mbi = B.CreateAlloca(mbiTy, nullptr, "morok.antihook.wxorx.mbi");
+    AllocaInst *oldProt = B.CreateAlloca(i32, nullptr, "morok.antihook.wxorx.old");
+    AllocaInst *diff = B.CreateAlloca(i64, nullptr, "morok.antihook.wxorx.diff");
+    B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
+    FunctionCallee virtualQuery = M.getOrInsertFunction(
+        "VirtualQuery", FunctionType::get(ip, {ptr, ptr, ip}, false));
+    FunctionCallee virtualProtect = M.getOrInsertFunction(
+        "VirtualProtect", FunctionType::get(i32, {ptr, ip, i32, ptr}, false));
+    B.CreateBr(loopBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *iter = LB.CreatePHI(i32, 2, "morok.antihook.wxorx.idx");
+    auto *addr = LB.CreatePHI(ip, 2, "morok.antihook.wxorx.addr");
+    iter->addIncoming(ConstantInt::get(i32, 0), entry);
+    addr->addIncoming(ConstantInt::get(ip, 0), entry);
+    LB.CreateCondBr(LB.CreateICmpULT(iter, ConstantInt::get(i32, 256)), bodyBB,
+                    retBB);
+
+    IRBuilder<> BB(bodyBB);
+    Value *mbiPtr = BB.CreateInBoundsGEP(
+        mbiTy, mbi, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)});
+    Value *rc = BB.CreateCall(virtualQuery,
+                              {BB.CreateIntToPtr(addr, ptr), mbiPtr,
+                               ConstantInt::get(ip, 48)},
+                              "morok.antihook.wxorx.query");
+    BB.CreateCondBr(BB.CreateICmpNE(rc, ConstantInt::get(ip, 0)), protectBB,
+                    retBB);
+
+    IRBuilder<> WB(protectBB);
+    Value *base = loadAt(WB, M, ip, mbi, 0ULL, "morok.antihook.wxorx.base");
+    Value *regionSize =
+        loadAt(WB, M, ip, mbi, 24, "morok.antihook.wxorx.region.size");
+    Value *state = loadAt(WB, M, i32, mbi, 32, "morok.antihook.wxorx.state");
+    Value *protect = loadAt(WB, M, i32, mbi, 36, "morok.antihook.wxorx.protect");
+    Value *committed =
+        WB.CreateICmpNE(WB.CreateAnd(state, ConstantInt::get(i32, 0x1000)),
+                        ConstantInt::get(i32, 0));
+    Value *rwx =
+        WB.CreateICmpNE(WB.CreateAnd(protect, ConstantInt::get(i32, 0xC0)),
+                        ConstantInt::get(i32, 0), "morok.antihook.wxorx.rwx");
+    Value *shouldProtect = WB.CreateAnd(committed, rwx);
+    WB.CreateCondBr(shouldProtect, protectCallBB, nextBB);
+
+    IRBuilder<> VPB(protectCallBB);
+    Value *protectRc =
+        VPB.CreateCall(virtualProtect,
+                       {VPB.CreateIntToPtr(base, ptr), regionSize,
+                        ConstantInt::get(i32, 0x20), oldProt},
+                       "morok.antihook.wxorx.virtualprotect");
+    incrementDiff(VPB, diff,
+                  VPB.CreateICmpEQ(protectRc, ConstantInt::get(i32, 0)),
+                  "morok.antihook.wxorx.fail");
+    VPB.CreateBr(nextBB);
+
+    IRBuilder<> NB(nextBB);
+    Value *step = NB.CreateSelect(NB.CreateICmpUGT(regionSize, ConstantInt::get(ip, 0)),
+                                  regionSize, ConstantInt::get(ip, 0x1000));
+    Value *nextAddr = NB.CreateAdd(addr, step, "morok.antihook.wxorx.next.addr");
+    Value *nextIter =
+        NB.CreateAdd(iter, ConstantInt::get(i32, 1), "morok.antihook.wxorx.next");
+    NB.CreateBr(loopBB);
+    iter->addIncoming(nextIter, nextBB);
+    addr->addIncoming(nextAddr, nextBB);
+
+    IRBuilder<> RB(retBB);
+    emitRetDiff(RB, diff);
+    return fn;
+}
+
+Function *wxEnforceProbe(Module &M, const Triple &TT) {
+    if (Function *linux = linuxWxEnforceProbe(M, TT))
+        return linux;
+    if (Function *darwin = darwinWxEnforceProbe(M, TT))
+        return darwin;
+    return windowsWxEnforceProbe(M);
+}
+
 void emitProloguePatternChecks(IRBuilder<> &B, Module &M, const Triple &TT,
                                GlobalVariable *State,
                                const std::vector<Function *> &Targets,
@@ -4375,6 +4736,14 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
         foldFlag(B, state,
                  B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0)),
                  0xD1C9A03F76542BE8ULL, "morok.antihook.fixup.changed");
+    }
+    if (Function *wx = wxEnforceProbe(M, tt)) {
+        Value *diff = B.CreateCall(wx, {}, "morok.antihook.wxorx.diff");
+        foldState(B, state, diff, 0x14E2B7C95A680D3FULL,
+                  "morok.antihook.wxorx");
+        foldFlag(B, state,
+                 B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0)),
+                 0xD8F31C6A4B927E50ULL, "morok.antihook.wxorx.changed");
     }
     if (Function *census = addressSpaceCensusProbe(M, rng, tt)) {
         Value *diff = B.CreateCall(census, {}, "morok.antihook.census.diff");

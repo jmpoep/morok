@@ -1077,6 +1077,13 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   that flags committed guard/NOACCESS/RWX pages and private executable mappings;
   deeper PE loader-list reconciliation remains tied to the later Windows/PE
   foundation.
+  A companion W^X enforcer re-protects executable load segments before the
+  census: Linux walks `AT_PHDR` program headers and uses direct x86_64
+  `mprotect` where available, macOS walks the main Mach-O `LC_SEGMENT_64`
+  commands and uses direct x86_64 Darwin `mprotect` where available, and Windows
+  uses `VirtualQuery`/`VirtualProtect` to downgrade committed RWX regions to
+  execute-read.  Protection failures are folded into the same delayed anti-hook
+  state instead of branching to an immediate exit.
 - TimingOracle emits a private constructor helper that samples several short
   volatile spans with two clock sources.  x86 targets use serialized `rdtscp`
   paired with a raw OS clock; Darwin targets use `mach_absolute_time` and

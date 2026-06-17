@@ -8902,11 +8902,14 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Rx != nullptr);
     Function *Maps = M->getFunction("morok.antihook.maps.linux");
     REQUIRE(Maps != nullptr);
+    Function *Wx = M->getFunction("morok.antihook.wxorx.linux");
+    REQUIRE(Wx != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.mac.targets", true) != nullptr);
     CHECK(hasInlineAsmCall(*Clean));
     CHECK(hasInlineAsmCall(*Got));
     CHECK(hasInlineAsmCall(*Maps));
+    CHECK(hasInlineAsmCall(*Wx));
     CHECK(M->getFunction("dlsym") != nullptr);
     CHECK(M->getFunction("getenv") != nullptr);
     CHECK(M->getFunction("readlink") == nullptr);
@@ -8924,6 +8927,7 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.mprotect") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.rx") >= 1u);
     CHECK(countNamedInstructions(*Rx, "morok.antihook.got.map.seg.hit") >= 1u);
+    CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.mprotect") >= 1u);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.rwx") >= 1u);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.anonymous.exec") >=
           1u);
@@ -8956,6 +8960,8 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Text != nullptr);
     Function *Vm = M->getFunction("morok.antihook.vm.darwin");
     REQUIRE(Vm != nullptr);
+    Function *Wx = M->getFunction("morok.antihook.wxorx.darwin");
+    REQUIRE(Wx != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.mac.targets", true) != nullptr);
     CHECK(M->getFunction("morok.antihook.got.plt") == nullptr);
@@ -8977,6 +8983,7 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Fixups, "morok.antihook.fixup.text") >= 1u);
     CHECK(countNamedInstructions(*Text, "morok.antihook.macho.text.hit") >=
           1u);
+    CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.mprotect") >= 1u);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.vm.rwx") >= 1u);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.vm.private.exec") >= 1u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
@@ -8987,6 +8994,7 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getFunction("_dyld_get_image_vmaddr_slide") != nullptr);
     CHECK(M->getFunction("mach_vm_region") != nullptr);
     CHECK(M->getFunction("mach_port_deallocate") != nullptr);
+    CHECK(M->getFunction("getpagesize") != nullptr);
     CHECK(M->getGlobalVariable("mach_task_self_") != nullptr);
     CHECK_FALSE(hasReadableByteString(*M, "MSHookFunction"));
     CHECK_FALSE(verifyModule(*M, &errs()));
@@ -9005,9 +9013,14 @@ define i32 @main() { ret i32 0 }
 
     Function *Vm = M->getFunction("morok.antihook.vm.windows");
     REQUIRE(Vm != nullptr);
+    Function *Wx = M->getFunction("morok.antihook.wxorx.windows");
+    REQUIRE(Wx != nullptr);
     CHECK(M->getFunction("VirtualQuery") != nullptr);
+    CHECK(M->getFunction("VirtualProtect") != nullptr);
     CHECK(M->getFunction("dlsym") == nullptr);
     CHECK(M->getFunction("exit") == nullptr);
+    CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.virtualprotect") >=
+          1u);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.win.rwx") >= 1u);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.win.private") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
