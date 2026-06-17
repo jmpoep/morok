@@ -16,7 +16,10 @@
 
 #include "llvm/ADT/StringRef.h"
 
+#include <cstdint>
+
 namespace llvm {
+class GlobalVariable;
 class IRBuilderBase;
 class Module;
 class Value;
@@ -25,6 +28,27 @@ class Value;
 namespace morok::ir {
 
 class IRRandom;
+
+/// Number of distinct keystream generators `keystreamValue`/`emitKeystream`
+/// can produce (selected by `variant`).
+constexpr unsigned kKeystreamVariants = 3;
+
+/// Pass-time keystream value for position `j`, given the runtime key `k0`, the
+/// odd multiplier `mul`, and the generator `variant` (< kKeystreamVariants).
+/// Pure 64-bit wraparound arithmetic with an exact IR analogue (emitKeystream),
+/// so ciphertext built with this is recovered byte-for-byte by the emitted IR.
+std::uint64_t keystreamValue(unsigned variant, std::uint64_t k0,
+                             std::uint32_t j, std::uint64_t mul);
+
+/// Emit the i64 keystream value for position `j` from the runtime key `K0` —
+/// the exact IR mirror of keystreamValue.
+llvm::Value *emitKeystream(llvm::IRBuilderBase &B, unsigned variant,
+                           llvm::Value *K0, std::uint32_t j, std::uint64_t mul);
+
+/// The shared per-module runtime key: a private *mutable* i64 global holding a
+/// random value, meant to be read with a volatile load (so the optimizer cannot
+/// fold keystream-derived values back to plaintext).  Created on first use.
+llvm::GlobalVariable *cloakSeed(llvm::Module &M, IRRandom &rng);
 
 /// Emit, at `B`'s current insertion point, an inline per-site decryption of the
 /// C symbol name `symbol` into a fresh stack buffer, and return an `i8*` to the

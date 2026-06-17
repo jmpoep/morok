@@ -3,10 +3,18 @@
 // Morok — modular LLVM IR obfuscator.
 //
 // morok/passes/StringEncryption.cpp
+//
+// Every eligible private byte-array string is encrypted with its OWN cipher:
+// a per-string keystream generator (one of several), XOR- or ADD-combined, with
+// per-string key material.  Each string also gets its OWN decryptor — a separate
+// global constructor that recovers exactly that string in place, with the
+// keystream inlined (no shared multiply/decrypt helper).  So there is no single
+// place that decrypts every string, no two strings share an encryption, and a
+// decompiler sees N unrelated startup routines rather than one tell-all loop.
 
 #include "morok/passes/StringEncryption.hpp"
 
-#include "morok/core/Galois8.hpp"
+#include "morok/ir/SymbolCloak.hpp"
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -22,48 +30,11 @@ using namespace llvm;
 
 namespace morok::passes {
 
-namespace gf8 = core::gf8;
-
 namespace {
 
 constexpr std::uint64_t kMaxEncryptedStrings = 64;
 constexpr std::uint64_t kMaxEncryptedStringBytes = 1024;
 constexpr std::uint64_t kMaxEncryptedTotalBytes = 4096;
-
-// Emit (once) an internal GF(2^8) multiply mirroring morok::core::gf8::mul:
-// shift-and-add over xtime with the AES reduction polynomial, unrolled 8×.
-Function *getOrCreateGf8Mul(Module &M) {
-    if (Function *existing = M.getFunction("morok.gf8mul"))
-        return existing;
-    LLVMContext &ctx = M.getContext();
-    auto *i8 = Type::getInt8Ty(ctx);
-    auto *ft = FunctionType::get(i8, {i8, i8}, false);
-    auto *f =
-        Function::Create(ft, GlobalValue::InternalLinkage, "morok.gf8mul", &M);
-    f->addFnAttr(Attribute::AlwaysInline);
-
-    BasicBlock *bb = BasicBlock::Create(ctx, "entry", f);
-    IRBuilder<> B(bb);
-    Value *a = f->getArg(0);
-    Value *b = f->getArg(1);
-    Value *zero = ConstantInt::get(i8, 0);
-    Value *r = zero;
-    for (int i = 0; i < 8; ++i) {
-        Value *bitSet =
-            B.CreateICmpNE(B.CreateAnd(b, ConstantInt::get(i8, 1)), zero);
-        r = B.CreateXor(r, B.CreateSelect(bitSet, a, zero));
-        Value *hiSet =
-            B.CreateICmpNE(B.CreateAnd(a, ConstantInt::get(i8, 0x80)), zero);
-        Value *shifted = B.CreateShl(a, ConstantInt::get(i8, 1));
-        a = B.CreateXor(
-            shifted,
-            B.CreateSelect(hiSet, ConstantInt::get(i8, gf8::kReductionPoly),
-                           zero));
-        b = B.CreateLShr(b, ConstantInt::get(i8, 1));
-    }
-    B.CreateRet(r);
-    return f;
-}
 
 bool eligible(const GlobalVariable &gv) {
     if (!gv.hasInitializer() || !gv.hasLocalLinkage())
@@ -81,11 +52,12 @@ bool eligible(const GlobalVariable &gv) {
            cda->getNumElements() > 0;
 }
 
-struct Encrypted {
-    GlobalVariable *data; // now-mutable ciphertext (decrypted in place)
-    GlobalVariable *pads; // k1 one-time pads
-    GlobalVariable *invs; // k2^{-1} multipliers
-    std::uint64_t length;
+// The per-string cipher recipe; chosen independently for every string.
+struct Cipher {
+    unsigned variant = 0;   // keystream generator
+    bool add = false;       // ADD vs XOR combine
+    std::uint64_t key = 0;  // per-string xor into the module seed
+    std::uint64_t mul = 1;  // per-string odd multiplier
 };
 
 } // namespace
@@ -97,6 +69,8 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
 
     LLVMContext &ctx = M.getContext();
     auto *i8 = Type::getInt8Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *voidTy = Type::getVoidTy(ctx);
 
     std::vector<GlobalVariable *> targets;
     targets.reserve(kMaxEncryptedStrings);
@@ -117,65 +91,70 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
             selectedBytes += n;
         }
     }
+    if (targets.empty())
+        return false;
 
-    std::vector<Encrypted> encrypted;
+    // One runtime-opaque module seed underlies every per-string key; reading it
+    // with a volatile load keeps the optimizer from folding ciphertext to text.
+    GlobalVariable *seed = ir::cloakSeed(M, rng);
+    const std::uint64_t seedVal =
+        cast<ConstantInt>(seed->getInitializer())->getZExtValue();
+
+    bool changed = false;
     for (GlobalVariable *gv : targets) {
         const auto *cda = cast<ConstantDataArray>(gv->getInitializer());
         StringRef raw = cda->getRawDataValues();
         const std::uint64_t n = cda->getNumElements();
 
-        std::vector<std::uint8_t> ct(n), pads(n), invs(n);
-        for (std::uint64_t i = 0; i < n; ++i) {
-            auto p = static_cast<std::uint8_t>(raw[i]);
-            auto k1 = static_cast<std::uint8_t>(rng.next());
-            std::uint8_t k2 = 0;
-            while (k2 == 0)
-                k2 = static_cast<std::uint8_t>(rng.next());
-            ct[i] = gf8::encryptByte(p, k1, k2);
-            pads[i] = k1;
-            invs[i] = gf8::inv(k2);
-        }
+        Cipher c;
+        c.variant = rng.range(ir::kKeystreamVariants);
+        c.add = rng.range(2) == 0;
+        c.key = rng.next();
+        c.mul = rng.next() | 1ull;
+        const std::uint64_t k0 = seedVal ^ c.key;
 
+        std::vector<std::uint8_t> ct(n);
+        for (std::uint64_t i = 0; i < n; ++i) {
+            const auto ks = static_cast<std::uint8_t>(
+                ir::keystreamValue(c.variant, k0,
+                                   static_cast<std::uint32_t>(i), c.mul) &
+                0xFFu);
+            const auto p = static_cast<std::uint8_t>(raw[i]);
+            ct[i] = c.add ? static_cast<std::uint8_t>(p + ks)
+                          : static_cast<std::uint8_t>(p ^ ks);
+        }
         gv->setInitializer(
             ConstantDataArray::get(ctx, ArrayRef<std::uint8_t>(ct)));
-        gv->setConstant(false); // mutated in place by the decryptor
+        gv->setConstant(false); // mutated in place by this string's decryptor
 
-        auto mkKey = [&](ArrayRef<std::uint8_t> bytes, const char *name) {
-            Constant *init = ConstantDataArray::get(ctx, bytes);
-            return new GlobalVariable(M, init->getType(), /*isConstant=*/true,
-                                      GlobalValue::PrivateLinkage, init, name);
-        };
-        encrypted.push_back(
-            {gv, mkKey(pads, "morok.k1"), mkKey(invs, "morok.k2inv"), n});
-    }
-
-    if (encrypted.empty())
-        return false;
-
-    Function *gf8mul = getOrCreateGf8Mul(M);
-    auto *decFn =
-        Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
-                         GlobalValue::InternalLinkage, "morok.strdec", &M);
-    IRBuilder<> B(BasicBlock::Create(ctx, "entry", decFn));
-    for (const Encrypted &e : encrypted) {
-        for (std::uint64_t i = 0; i < e.length; ++i) {
-            Value *dataPtr = B.CreateConstInBoundsGEP2_64(
-                e.data->getValueType(), e.data, 0, i);
-            Value *c = B.CreateLoad(i8, dataPtr);
-            Value *inv =
-                B.CreateLoad(i8, B.CreateConstInBoundsGEP2_64(
-                                     e.invs->getValueType(), e.invs, 0, i));
-            Value *pad =
-                B.CreateLoad(i8, B.CreateConstInBoundsGEP2_64(
-                                     e.pads->getValueType(), e.pads, 0, i));
-            Value *plain = B.CreateXor(B.CreateCall(gf8mul, {c, inv}), pad);
-            B.CreateStore(plain, dataPtr);
+        // A decryptor unique to this string: recover its bytes in place with the
+        // keystream inlined, then return.  Each gets its own constructor.
+        auto *decFn = Function::Create(FunctionType::get(voidTy, false),
+                                       GlobalValue::InternalLinkage,
+                                       "morok.strdec", &M);
+        IRBuilder<> B(BasicBlock::Create(ctx, "entry", decFn));
+        Value *seedLoad = B.CreateLoad(i64, seed, /*isVolatile=*/true);
+        Value *rtKey = B.CreateXor(seedLoad, ConstantInt::get(i64, c.key));
+        for (std::uint64_t i = 0; i < n; ++i) {
+            Value *ks = ir::emitKeystream(B, c.variant, rtKey,
+                                          static_cast<std::uint32_t>(i), c.mul);
+            Value *ksByte = B.CreateTrunc(ks, i8);
+            Value *ptr = B.CreateConstInBoundsGEP2_64(gv->getValueType(), gv, 0,
+                                                      i);
+            Value *cipher = B.CreateLoad(i8, ptr);
+            Value *plain = c.add ? B.CreateSub(cipher, ksByte)
+                                 : B.CreateXor(cipher, ksByte);
+            B.CreateStore(plain, ptr);
         }
-    }
-    B.CreateRetVoid();
+        B.CreateRetVoid();
 
-    appendToGlobalCtors(M, decFn, /*Priority=*/0);
-    return true;
+        // Vary the constructor priority so the decryptors do not appear as one
+        // contiguous block running back-to-back.
+        appendToGlobalCtors(M, decFn,
+                            static_cast<int>(rng.range(40000)) + 1);
+        changed = true;
+    }
+    return changed;
 }
 
 PreservedAnalyses StringEncryptionPass::run(Module &M,

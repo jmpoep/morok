@@ -33,13 +33,10 @@ constexpr std::uint64_t kSplit1 = 0xBF58476D1CE4E5B9ULL;
 constexpr std::uint64_t kSplit2 = 0x94D049BB133111EBULL;
 constexpr std::uint64_t kXorMul = 0x2545F4914F6CDD1DULL;
 
-constexpr unsigned kVariants = 3;
+} // namespace
 
-// Pure 64-bit wraparound keystream value for position `j`, given the per-site
-// runtime key `k0` and odd multiplier `mul`.  Each variant has an exact i64 IR
-// analogue (emitKeystream).
-std::uint64_t keystream(unsigned variant, std::uint64_t k0, std::uint32_t j,
-                        std::uint64_t mul) {
+std::uint64_t keystreamValue(unsigned variant, std::uint64_t k0,
+                             std::uint32_t j, std::uint64_t mul) {
     std::uint64_t t = k0 + static_cast<std::uint64_t>(j + 1) * mul;
     switch (variant) {
     case 1: // splitmix64 finalizer
@@ -97,7 +94,7 @@ Value *emitKeystream(IRBuilderBase &B, unsigned variant, Value *K0,
 // value, always read with a volatile load.  Mutable + volatile is the
 // established anti-fold pattern — the optimizer must treat the loaded value as
 // unknown, so the keystream never folds back to readable text.
-GlobalVariable *getSeed(Module &M, IRRandom &rng) {
+GlobalVariable *cloakSeed(Module &M, IRRandom &rng) {
     if (GlobalVariable *Existing =
             M.getGlobalVariable("morok.cloak.seed", /*AllowInternal=*/true))
         return Existing;
@@ -110,19 +107,17 @@ GlobalVariable *getSeed(Module &M, IRRandom &rng) {
     return GV;
 }
 
-} // namespace
-
 Value *emitCloakedSymbol(IRBuilderBase &B, Module &M, StringRef symbol,
                          IRRandom &rng) {
     auto *I8 = Type::getInt8Ty(M.getContext());
     auto *I64 = Type::getInt64Ty(M.getContext());
 
-    GlobalVariable *Seed = getSeed(M, rng);
+    GlobalVariable *Seed = cloakSeed(M, rng);
     const std::uint64_t SeedVal =
         cast<ConstantInt>(Seed->getInitializer())->getZExtValue();
 
     // Per-site choices: keystream variant, combine operation, and key material.
-    const unsigned Variant = rng.range(kVariants);
+    const unsigned Variant = rng.range(kKeystreamVariants);
     const bool AddCombine = rng.range(2) == 0;
     const std::uint64_t SiteKey = rng.next();
     const std::uint64_t Mul = rng.next() | 1ull;
@@ -137,7 +132,7 @@ Value *emitCloakedSymbol(IRBuilderBase &B, Module &M, StringRef symbol,
     CipherBytes.reserve(Len);
     for (std::uint32_t j = 0; j < Len; ++j) {
         const auto Ks =
-            static_cast<std::uint8_t>(keystream(Variant, K0, j, Mul) & 0xFFu);
+            static_cast<std::uint8_t>(keystreamValue(Variant, K0, j, Mul) & 0xFFu);
         const auto Plain = static_cast<std::uint8_t>(Bytes[j]);
         const auto C = AddCombine ? static_cast<std::uint8_t>(Plain + Ks)
                                   : static_cast<std::uint8_t>(Plain ^ Ks);
