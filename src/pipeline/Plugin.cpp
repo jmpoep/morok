@@ -57,6 +57,7 @@
 #include "morok/passes/TraceKeying.hpp"
 #include "morok/passes/TypePunning.hpp"
 #include "morok/passes/UniformPrimitiveLowering.hpp"
+#include "morok/passes/VTableIntegrity.hpp"
 #include "morok/passes/Virtualization.hpp"
 #include "morok/passes/VectorObfuscation.hpp"
 #include "morok/pipeline/Scheduler.hpp"
@@ -240,6 +241,10 @@ PassPluginLibraryInfo getPluginInfo() {
                         }
                         if (name == "morok-decoystr") {
                             MPM.addPass(passes::DecoyStringsPass());
+                            return true;
+                        }
+                        if (name == "morok-vtable") {
+                            MPM.addPass(passes::VTableIntegrityPass());
                             return true;
                         }
                         return false;

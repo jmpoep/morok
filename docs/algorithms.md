@@ -71,6 +71,28 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   Caps are sized only to bound pathological inputs (≤ 8192 strings, ≤ 1 MiB per
   string, ≤ 8 MiB per module), not to leave strings in the clear.
 
+## VTable integrity — Itanium ABI virtual-dispatch guards
+- The pass recognizes C++ Itanium ABI vtables (`_ZTV*`) and flattens pointer
+  entries by byte offset.  Vptr address points are harvested from constructor
+  stores first, with a conservative fallback that treats only the first function
+  entry after two non-function metadata entries as an address point.
+- Recognized dispatch sites are the common LLVM shapes `load vptr -> gep slot
+  -> load target -> indirect call`, covering both pointer-index GEPs and
+  byte-offset GEPs.  Arbitrary indirect calls without a loaded object vptr are
+  ignored.
+- The emitted private tables store expected vptr address points, slot offsets,
+  expected targets, and deterministic per-entry cookies.  Each guarded call
+  invokes `morok.vti.verify(vptr, slot, target)` immediately before dispatch.
+  The verifier matches vptr+slot, recomputes a mixed pointer/slot/cookie hash
+  for the live and expected target, and traps on mismatch or unknown vptr.
+- Direct caps bound harvesting to 256 address points and 1024 guard entries, so
+  pathological C++ modules cannot explode memory or IR size.  Generated
+  `morok.vti.*` helpers are eligible for the scheduler's sensitive-helper
+  hardening shell.
+- Scheduler placement is after StringEnc/FCO and before VM/per-function
+  transforms.  At that point strings/imports have been handled, while virtual
+  dispatch still has recognizable vptr/slot load structure.
+
 ## Constant encryption — `core/XorShare`, `core/Feistel`
 - Pipeline: `origC ─[Feistel if feistel && bits>=16]→ workC ─[k-share XOR or single XOR]→ shares`.
   Runtime reverses: XOR-fold shares → workC → inverse Feistel → origC.
@@ -1049,8 +1071,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   can be small in IR instruction count but expensive to lower into a decryptor.
 - Direct pass caps bound standalone growth for substitution, MBA, table
   arithmetic, DFI, uniform/dispatcherless CFG routing, constant encryption,
-  pointer laundering, vector lifting, FCO, and FunctionWrapper, so those passes
-  remain finite even when invoked outside the scheduler.
+  pointer laundering, vector lifting, FCO, VTableIntegrity, and FunctionWrapper,
+  so those passes remain finite even when invoked outside the scheduler.
 - IR-stage post-link contracts are emitted as retained `morok.postlink.*`
   manifests rather than implicit placeholder globals; downstream patchers should
   consume those records and update the referenced region/expected globals.
@@ -1062,6 +1084,6 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   they can clone or generate dense IR.
 
 ## Scheduler order (to preserve semantics)
-AntiHook → AntiClassDump → AntiDebug → TimingOracle → TrapOracle → StringEnc → FCO(fn) → Virtualization → HashSelfDecrypt → per-fn{ Split, BCF, OptAmp, Sub,
+AntiHook → AntiClassDump → AntiDebug → TimingOracle → TrapOracle → StringEnc → FCO(fn) → VTableIntegrity → Virtualization → HashSelfDecrypt → per-fn{ Split, BCF, OptAmp, Sub,
 MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare, ConstEnc, IndirectBranch } → SensitiveHelperHardening → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
 FeatureElimination (strip debug/names) → cleanup marker decls.

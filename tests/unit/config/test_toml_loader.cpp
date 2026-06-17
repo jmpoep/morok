@@ -42,6 +42,15 @@ TEST_CASE("decoy_strings toggle is parsed") {
     CHECK(r.config.passes.decoy_strings.enabled == true);
 }
 
+TEST_CASE("vtable_integrity toggle is parsed") {
+    const auto r = loadFromString(R"(
+    [passes.vtable_integrity]
+    enabled = true
+  )");
+    REQUIRE(r.ok);
+    CHECK(r.config.passes.vtable_integrity.enabled == true);
+}
+
 TEST_CASE("a tuning section does not disable a preset-enabled pass") {
     // Regression: a [passes.X] section that only tunes a parameter must NOT
     // reset the pass's other preset-provided fields (notably `enabled`).  The

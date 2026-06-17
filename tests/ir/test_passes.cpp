@@ -52,6 +52,7 @@
 #include "morok/passes/TraceKeying.hpp"
 #include "morok/passes/TypePunning.hpp"
 #include "morok/passes/UniformPrimitiveLowering.hpp"
+#include "morok/passes/VTableIntegrity.hpp"
 #include "morok/passes/VectorObfuscation.hpp"
 #include "morok/passes/Virtualization.hpp"
 #include "morok/pipeline/Scheduler.hpp"
@@ -8405,6 +8406,97 @@ entry:
          /*anchor_probability=*/0, /*max_anchors=*/0},
         rng));
     CHECK(countGlobals(*M, "morok.poly.salt") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("vtableIntegrityModule guards Itanium virtual dispatches") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target datalayout = "e-p:64:64"
+@_ZTV4Base = linkonce_odr unnamed_addr constant { [4 x ptr] } { [4 x ptr] [ptr null, ptr null, ptr @virt0, ptr @virt1] }
+
+define i32 @virt0(ptr %this) {
+entry:
+  ret i32 7
+}
+
+define i32 @virt1(ptr %this) {
+entry:
+  ret i32 11
+}
+
+define void @ctor(ptr %obj) {
+entry:
+  store ptr getelementptr inbounds ({ [4 x ptr] }, ptr @_ZTV4Base, i64 0, i32 0, i64 2), ptr %obj
+  ret void
+}
+
+define i32 @dispatch_ptr_gep(ptr %obj) {
+entry:
+  %vptr = load ptr, ptr %obj
+  %slotp = getelementptr ptr, ptr %vptr, i64 1
+  %fn = load ptr, ptr %slotp
+  %r = call i32 %fn(ptr %obj)
+  ret i32 %r
+}
+
+define i32 @dispatch_byte_gep(ptr %obj) {
+entry:
+  %vptr = load ptr, ptr %obj
+  %slotp = getelementptr i8, ptr %vptr, i64 0
+  %fn = load ptr, ptr %slotp
+  %r = call i32 %fn(ptr %obj)
+  ret i32 %r
+}
+)ir");
+
+    CHECK(morok::passes::vtableIntegrityModule(*M));
+    CHECK(M->getFunction("morok.vti.verify") != nullptr);
+    CHECK(countUserCallsTo(*M, "morok.vti.verify") == 2u);
+    CHECK(countGlobals(*M, "morok.vti.") == 4u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("vtableIntegrityModule ignores non-vptr indirect calls") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target datalayout = "e-p:64:64"
+define i32 @callback(ptr %slot) {
+entry:
+  %fn = load ptr, ptr %slot
+  %r = call i32 %fn()
+  ret i32 %r
+}
+)ir");
+
+    CHECK_FALSE(morok::passes::vtableIntegrityModule(*M));
+    CHECK(M->getFunction("morok.vti.verify") == nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("vtableIntegrityModule skips mismatched slot call types") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target datalayout = "e-p:64:64"
+@_ZTV4Base = linkonce_odr unnamed_addr constant { [3 x ptr] } { [3 x ptr] [ptr null, ptr null, ptr @virt0] }
+
+define i32 @virt0(ptr %this) {
+entry:
+  ret i32 7
+}
+
+define i64 @callback_table(ptr %obj) {
+entry:
+  %tbl = load ptr, ptr %obj
+  %slotp = getelementptr ptr, ptr %tbl, i64 0
+  %fn = load ptr, ptr %slotp
+  %r = call i64 %fn()
+  ret i64 %r
+}
+)ir");
+
+    CHECK_FALSE(morok::passes::vtableIntegrityModule(*M));
+    CHECK(M->getFunction("morok.vti.verify") == nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

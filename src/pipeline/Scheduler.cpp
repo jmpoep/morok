@@ -52,6 +52,7 @@
 #include "morok/passes/TraceKeying.hpp"
 #include "morok/passes/TypePunning.hpp"
 #include "morok/passes/UniformPrimitiveLowering.hpp"
+#include "morok/passes/VTableIntegrity.hpp"
 #include "morok/passes/VectorObfuscation.hpp"
 #include "morok/passes/Virtualization.hpp"
 
@@ -181,7 +182,8 @@ bool hasSensitiveGeneratedPrefix(StringRef Name) {
            Name.starts_with("morok.mg.diff.") ||
            Name.starts_with("morok.antidbg") ||
            Name.starts_with("morok.antihook") ||
-           Name.starts_with("morok.timing") || Name.starts_with("morok.trap");
+           Name.starts_with("morok.vti.") || Name.starts_with("morok.timing") ||
+           Name.starts_with("morok.trap");
 }
 
 bool isSensitiveGeneratedFunction(const Function &F) {
@@ -320,6 +322,12 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         passes::FcoParams fp;
         changed |= passes::functionCallObfuscateModule(M, fp, rng);
     }
+
+    // C++ virtual dispatch still has recognizable vptr/slot load shapes here.
+    // Guard those call sites before VM/per-function transforms obscure them.
+    if (InitialModuleGrowthOk &&
+        config_.passes.vtable_integrity.enabled.value_or(false))
+        changed |= passes::vtableIntegrityModule(M);
 
     // VM lifting must run before block splitting / flattening make
     // straight-line functions ineligible.  The generated morok.* helpers are

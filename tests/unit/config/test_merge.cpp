@@ -207,6 +207,7 @@ TEST_CASE("merge handles every pass family") {
     src.timing_oracles.enabled = true;
     src.trap_oracles.enabled = true;
     src.decoy_strings.enabled = true;
+    src.vtable_integrity.enabled = true;
     merge(dst, src);
     CHECK(dst.split.splits == 8u);
     CHECK(dst.stack_coalesce.enabled == true);
@@ -349,4 +350,5 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.timing_oracles.enabled == true);
     CHECK(dst.trap_oracles.enabled == true);
     CHECK(dst.decoy_strings.enabled == true);
+    CHECK(dst.vtable_integrity.enabled == true);
 }

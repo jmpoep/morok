@@ -363,6 +363,7 @@ struct PassConfig {
     ToggleConfig timing_oracles;
     ToggleConfig trap_oracles;
     ToggleConfig decoy_strings;
+    ToggleConfig vtable_integrity;
 
     struct FuncWrapConfig {
         Opt<bool> enabled;
