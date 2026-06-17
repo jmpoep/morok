@@ -95,10 +95,12 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ needs.prep.outputs.llvm_ref }}-${{ github.run_id }}
+          # Key on the LLVM recipe (composite action) so any recipe change busts
+          # sccache too — otherwise its preprocessor-cache-mode can return stale
+          # objects built against a previous config (e.g. a different ABI value).
+          key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-llvm/action.yml') }}-${{ github.run_id }}
           restore-keys: |
-            sccache-${{ runner.os }}-${{ runner.arch }}-${{ needs.prep.outputs.llvm_ref }}-
-            sccache-${{ runner.os }}-${{ runner.arch }}-
+            sccache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-llvm/action.yml') }}-
 
       - name: Setup LLVM trunk
         id: llvm
@@ -175,7 +177,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ needs.prep.outputs.llvm_ref }}-${{ github.run_id }}
+          key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-llvm/action.yml') }}-${{ github.run_id }}
 
       - name: sccache stats
         if: always()

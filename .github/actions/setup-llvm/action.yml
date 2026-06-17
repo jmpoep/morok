@@ -14,7 +14,7 @@ inputs:
   cache-version:
     description: "Bump to invalidate every LLVM install cache (recipe changes)."
     required: false
-    default: "v4"
+    default: "v5"
 
 outputs:
   install-prefix:
