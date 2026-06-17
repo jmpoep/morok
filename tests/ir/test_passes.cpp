@@ -8684,6 +8684,9 @@ entry:
     CHECK(M->getFunction("ptrace") != nullptr);
     CHECK(M->getFunction("prctl") != nullptr);
     CHECK(hasCallWithI32Arg0(*M, "prctl", 22u));
+    CHECK(M->getFunction("syscall") != nullptr);
+    CHECK(hasCallWithI32Arg0(*M, "syscall", 444u));
+    CHECK(hasCallWithI32Arg0(*M, "syscall", 446u));
     CHECK(M->getFunction("pthread_create") != nullptr);
     CHECK(M->getFunction("pthread_detach") != nullptr);
     CHECK(M->getFunction("open") != nullptr);

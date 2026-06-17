@@ -974,8 +974,11 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   available, and once-gated randomized calls inserted into user functions so
   debugger evidence is sampled from both constructors and normal execution paths
   without repeatedly running expensive probes in hot loops.  On Linux, the
-  startup path also installs a seccomp-BPF filter that kills `ptrace` requests
-  other than Morok's own `PTRACE_TRACEME` re-arm and kills
+  startup path also applies a Landlock ruleset, when the kernel supports it, to
+  deny destructive filesystem rights (writes, creates, removes, renames,
+  truncates, and device ioctls by ABI level) while keeping reads/exec available.
+  It then installs a seccomp-BPF filter that kills `ptrace` requests other than
+  Morok's own `PTRACE_TRACEME` re-arm and kills
   `process_vm_readv`/`process_vm_writev` in the protected process lineage.
 - TimingOracle emits a private constructor helper that samples several short
   volatile spans with two clock sources.  x86 targets use serialized `rdtscp`

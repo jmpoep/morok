@@ -428,6 +428,109 @@ bool linuxSyscallNumbers(const Triple &TT, std::uint32_t &Ptrace,
     }
 }
 
+bool linuxLandlockSyscalls(const Triple &TT, std::uint32_t &CreateRuleset,
+                           std::uint32_t &RestrictSelf) {
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+    case Triple::aarch64:
+        CreateRuleset = 444;
+        RestrictSelf = 446;
+        return true;
+    default:
+        return false;
+    }
+}
+
+FunctionCallee syscallDecl(Module &M) {
+    auto *ip = intPtrTy(M);
+    return M.getOrInsertFunction("syscall", FunctionType::get(ip, {ip}, true));
+}
+
+void emitLinuxLandlockSandbox(IRBuilder<> &B, Module &M, GlobalVariable *State,
+                              const Triple &TT) {
+    std::uint32_t createRulesetNr = 0;
+    std::uint32_t restrictSelfNr = 0;
+    if (!linuxLandlockSyscalls(TT, createRulesetNr, restrictSelfNr))
+        return;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    Function *ctor = B.GetInsertBlock()->getParent();
+
+    constexpr std::uint32_t kCreateRulesetVersion = 1;
+    constexpr std::uint64_t kWriteFile = 1ULL << 1;
+    constexpr std::uint64_t kRemoveDir = 1ULL << 4;
+    constexpr std::uint64_t kRemoveFile = 1ULL << 5;
+    constexpr std::uint64_t kMakeChar = 1ULL << 6;
+    constexpr std::uint64_t kMakeDir = 1ULL << 7;
+    constexpr std::uint64_t kMakeReg = 1ULL << 8;
+    constexpr std::uint64_t kMakeSock = 1ULL << 9;
+    constexpr std::uint64_t kMakeFifo = 1ULL << 10;
+    constexpr std::uint64_t kMakeBlock = 1ULL << 11;
+    constexpr std::uint64_t kMakeSym = 1ULL << 12;
+    constexpr std::uint64_t kRefer = 1ULL << 13;
+    constexpr std::uint64_t kTruncate = 1ULL << 14;
+    constexpr std::uint64_t kIoctlDev = 1ULL << 15;
+    constexpr std::uint64_t kBaseHandled =
+        kWriteFile | kRemoveDir | kRemoveFile | kMakeChar | kMakeDir |
+        kMakeReg | kMakeSock | kMakeFifo | kMakeBlock | kMakeSym;
+
+    FunctionCallee syscallFn = syscallDecl(M);
+    Value *version = B.CreateCall(
+        syscallFn,
+        {ConstantInt::get(ip, createRulesetNr), ConstantPointerNull::get(ptr),
+         ConstantInt::get(ip, 0), ConstantInt::get(ip, kCreateRulesetVersion)},
+        "morok.landlock.abi");
+    foldState(B, State, version, 0x3A1E58C96D2740B5ULL, "morok.landlock.abi");
+
+    auto *applyBB = BasicBlock::Create(ctx, "morok.landlock.apply", ctor);
+    auto *contBB = BasicBlock::Create(ctx, "morok.landlock.cont", ctor);
+    B.CreateCondBr(B.CreateICmpSGT(version, ConstantInt::get(ip, 0)), applyBB,
+                   contBB);
+
+    IRBuilder<> LB(applyBB);
+    Value *handled = ConstantInt::get(i64, kBaseHandled);
+    handled =
+        LB.CreateSelect(LB.CreateICmpUGE(version, ConstantInt::get(ip, 2)),
+                        LB.CreateOr(handled, ConstantInt::get(i64, kRefer)),
+                        handled, "morok.landlock.handled.refer");
+    handled =
+        LB.CreateSelect(LB.CreateICmpUGE(version, ConstantInt::get(ip, 3)),
+                        LB.CreateOr(handled, ConstantInt::get(i64, kTruncate)),
+                        handled, "morok.landlock.handled.truncate");
+    handled =
+        LB.CreateSelect(LB.CreateICmpUGE(version, ConstantInt::get(ip, 5)),
+                        LB.CreateOr(handled, ConstantInt::get(i64, kIoctlDev)),
+                        handled, "morok.landlock.handled.ioctl");
+
+    auto *attrTy = StructType::get(i64);
+    auto *attr =
+        LB.CreateAlloca(attrTy, nullptr, "morok.landlock.ruleset.attr");
+    LB.CreateStore(handled, LB.CreateStructGEP(attrTy, attr, 0));
+
+    Value *fd =
+        LB.CreateCall(syscallFn,
+                      {ConstantInt::get(ip, createRulesetNr), attr,
+                       ConstantInt::get(ip, 8), ConstantInt::get(ip, 0)},
+                      "morok.landlock.fd");
+    Value *restrictRc = LB.CreateCall(
+        syscallFn,
+        {ConstantInt::get(ip, restrictSelfNr), fd, ConstantInt::get(ip, 0)},
+        "morok.landlock.restrict");
+    foldState(LB, State, fd, 0x7124D8C90AE53B6FULL, "morok.landlock.fd");
+    foldState(LB, State, restrictRc, 0xE95B2D47A6813C0BULL,
+              "morok.landlock.restrict");
+    foldFlag(LB, State,
+             LB.CreateICmpEQ(restrictRc, ConstantInt::getSigned(ip, 0)),
+             0xC64FB9182D70A5E3ULL, "morok.landlock.active");
+    LB.CreateCall(closeDecl(M), {LB.CreateTruncOrBitCast(fd, LB.getInt32Ty())});
+    LB.CreateBr(contBB);
+
+    B.SetInsertPoint(contBB);
+}
+
 void emitLinuxSeccompFilter(IRBuilder<> &B, Module &M, const Triple &TT) {
     std::uint32_t ptraceNr = 0;
     std::uint32_t readvNr = 0;
@@ -594,6 +697,7 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
     foldFlag(B, State, B.CreateICmpNE(status, ConstantInt::get(i32, 0)),
              0xA4756E49F2D31219ULL, "morok.antidbg.status");
     foldState(B, State, stat4, 0xDA942042E4DD58B5ULL, "morok.antidbg.stat4");
+    emitLinuxLandlockSandbox(B, M, State, TT);
     emitLinuxSeccompFilter(B, M, TT);
 
     Function *watch = linuxWatchThread(M, statusFn, statFn, State);
