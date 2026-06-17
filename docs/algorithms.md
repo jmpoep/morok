@@ -1115,7 +1115,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   offsets.
 - AntiClassDump / WindowsPEFoundation / WindowsPebHeapDebug /
   WindowsDebugObject / WindowsThreadHide / AntiDebugging / AntiHooking /
-  WindowsAntiAttach / TimingOracle / TrapOracle / PageFaultTlbOracle /
+  WindowsAntiAttach / WindowsKernelDebugger / TimingOracle / TrapOracle /
+  PageFaultTlbOracle /
   CacheTimingOracle / MicroarchitecturalCanary: platform anti-analysis
   (module passes). AntiDebugging combines startup checks with a mutable hidden
   state word, platform-specific recheck helpers, pthread watchdogs where
@@ -1198,6 +1199,13 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   imports, flips code pages writable long enough to patch remote-breakin into a
   tail jump to `ExitProcess(1)` and `DbgBreakPoint` into `ret`, then folds
   invalid-handle `NtClose`/`CloseHandle` probe results into the same state.
+  WindowsKernelDebugger reads `SharedUserData.KdDebuggerEnabled`/
+  `KdDebuggerNotPresent`, queries
+  `NtQuerySystemInformation(SystemKernelDebuggerInformation)`, samples
+  `SystemModuleInformation` count, folds the parent PID from
+  `NtQueryInformationProcess(ProcessBasicInformation)`, and, if `user32.dll` is
+  already loaded, checks cloaked debugger window classes through hashed
+  `FindWindowA`.
   AntiHooking also emits a clean-copy byte-diff checker for POSIX targets.  The
   checker resolves the current executable path, maps a fresh read-only copy of
   the on-disk ELF or Mach-O image, applies the runtime load bias/slide, compares
@@ -1401,6 +1409,6 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   they can clone or generate dense IR.
 
 ## Scheduler order (to preserve semantics)
-Virtualization(user) → HashSelfDecrypt → AntiHook → AntiClassDump → WindowsPEFoundation → WindowsPebHeapDebug → WindowsDebugObject → WindowsThreadHide → WindowsAntiAttach → AntiDebug → TimingOracle → TrapOracle → PageFaultTlbOracle → CacheTimingOracle → MicroarchitecturalCanary → StringEnc → FCO(fn) → VTableIntegrity → per-fn{ Split, BCF, OptAmp, Sub,
+Virtualization(user) → HashSelfDecrypt → AntiHook → AntiClassDump → WindowsPEFoundation → WindowsPebHeapDebug → WindowsDebugObject → WindowsThreadHide → WindowsAntiAttach → WindowsKernelDebugger → AntiDebug → TimingOracle → TrapOracle → PageFaultTlbOracle → CacheTimingOracle → MicroarchitecturalCanary → StringEnc → FCO(fn) → VTableIntegrity → per-fn{ Split, BCF, OptAmp, Sub,
 MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare, ConstEnc, IndirectBranch } → ProtectionHelperVM → SensitiveHelperHardening → Nanomites → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
 MisleadingMetadata → FeatureElimination (strip debug/names) → cleanup marker decls.

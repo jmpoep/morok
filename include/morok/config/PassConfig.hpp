@@ -372,6 +372,7 @@ struct PassConfig {
     ToggleConfig windows_debug_object;
     ToggleConfig windows_thread_hide;
     ToggleConfig windows_anti_attach;
+    ToggleConfig windows_kernel_debugger;
     ToggleConfig timing_oracles;
     ToggleConfig trap_oracles;
     ToggleConfig page_fault_oracles;

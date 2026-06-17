@@ -252,6 +252,10 @@ PassPluginLibraryInfo getPluginInfo() {
                             MPM.addPass(passes::WindowsAntiAttachPass());
                             return true;
                         }
+                        if (name == "morok-winkdbg") {
+                            MPM.addPass(passes::WindowsKernelDebuggerPass());
+                            return true;
+                        }
                         if (name == "morok-timing") {
                             MPM.addPass(passes::TimingOraclePass());
                             return true;

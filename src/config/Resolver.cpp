@@ -303,6 +303,8 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.windows_debug_object.enabled, src.windows_debug_object.enabled);
     mergeOpt(dst.windows_thread_hide.enabled, src.windows_thread_hide.enabled);
     mergeOpt(dst.windows_anti_attach.enabled, src.windows_anti_attach.enabled);
+    mergeOpt(dst.windows_kernel_debugger.enabled,
+             src.windows_kernel_debugger.enabled);
     mergeOpt(dst.timing_oracles.enabled, src.timing_oracles.enabled);
     mergeOpt(dst.trap_oracles.enabled, src.trap_oracles.enabled);
     mergeOpt(dst.page_fault_oracles.enabled, src.page_fault_oracles.enabled);

@@ -10769,6 +10769,45 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("windowsKernelDebuggerModule emits kernel debugger census probes") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-pc-windows-msvc"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(7131);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::windowsKernelDebuggerModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.win.kdbg");
+    Function *Probe = M->getFunction("morok.win.kdbg.probe");
+    Function *Peb = M->getFunction("morok.win.peb");
+    Function *Resolve = M->getFunction("morok.win.pe.resolve");
+    Function *Ldr = M->getFunction("morok.win.ldr.module");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Probe != nullptr);
+    REQUIRE(Peb != nullptr);
+    REQUIRE(Resolve != nullptr);
+    REQUIRE(Ldr != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
+    CHECK(M->getFunction("NtQuerySystemInformation") == nullptr);
+    CHECK(M->getFunction("NtQueryInformationProcess") == nullptr);
+    CHECK(M->getFunction("FindWindowA") == nullptr);
+    CHECK(hasInlineAsmCall(*Peb));
+    CHECK(countNamedInstructions(*Probe, "morok.win.kdbg.shared.enabled") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.kdbg.system.kd.status") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.kdbg.system.modules.status") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.kdbg.parent.pid") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.kdbg.window.windbg") >=
+          1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("timingOracleModule emits x86 rdtscp and raw clock probes") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

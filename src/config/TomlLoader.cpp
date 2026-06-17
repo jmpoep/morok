@@ -460,6 +460,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseToggle(*t, pc.windows_thread_hide);
     if (auto *t = p["windows_anti_attach"].as_table())
         parseToggle(*t, pc.windows_anti_attach);
+    if (auto *t = p["windows_kernel_debugger"].as_table())
+        parseToggle(*t, pc.windows_kernel_debugger);
     if (auto *t = p["timing_oracles"].as_table())
         parseToggle(*t, pc.timing_oracles);
     if (auto *t = p["trap_oracles"].as_table())

@@ -9499,6 +9499,194 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
     return fn;
 }
 
+Function *windowsKernelDebuggerProbe(Module &M, GlobalVariable *State,
+                                     ir::IRRandom &rng, const Triple &TT) {
+    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
+        intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.win.kdbg.probe"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.kdbg.probe", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    Function *pebReader = windowsPebReader(M);
+    Function *moduleByHash = windowsLdrModuleByHash(M);
+    Function *resolver = windowsPeExportResolver(M);
+    if (!pebReader || !moduleByHash || !resolver)
+        return nullptr;
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *resolveBB = BasicBlock::Create(ctx, "resolve", fn);
+    auto *qsiBB = BasicBlock::Create(ctx, "qsi", fn);
+    auto *qipGateBB = BasicBlock::Create(ctx, "qip.gate", fn);
+    auto *qipBB = BasicBlock::Create(ctx, "qip", fn);
+    auto *windowGateBB = BasicBlock::Create(ctx, "window.gate", fn);
+    auto *windowBB = BasicBlock::Create(ctx, "window", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    auto *kdPtr = B.CreateIntToPtr(ConstantInt::get(ip, 0x7FFE02D4ULL), ptr,
+                                   "morok.win.kdbg.shared.ptr");
+    Value *kdEnabled =
+        loadAt(B, M, i8, kdPtr, 0ULL, "morok.win.kdbg.shared.enabled");
+    Value *kdNotPresent =
+        loadAt(B, M, i8, kdPtr, 1, "morok.win.kdbg.shared.not.present");
+    Value *sharedHit = B.CreateOr(
+        B.CreateICmpNE(kdEnabled, ConstantInt::get(i8, 0),
+                       "morok.win.kdbg.shared.enabled.hit"),
+        B.CreateICmpEQ(kdNotPresent, ConstantInt::get(i8, 0),
+                       "morok.win.kdbg.shared.present.hit"),
+        "morok.win.kdbg.shared.hit");
+    foldState(B, State, kdEnabled, rng.next(),
+              "morok.win.kdbg.shared.enabled.mix");
+    foldState(B, State, kdNotPresent, rng.next(),
+              "morok.win.kdbg.shared.not.present.mix");
+    foldFlag(B, State, sharedHit, 0xB1DE6A540C92F731ULL,
+             "morok.win.kdbg.shared");
+
+    Value *peb = B.CreateCall(pebReader, {}, "morok.win.kdbg.peb");
+    B.CreateCondBr(B.CreateICmpNE(peb, ConstantInt::get(ip, 0),
+                                  "morok.win.kdbg.peb.present"),
+                   resolveBB, retBB);
+
+    IRBuilder<> RB(resolveBB);
+    AllocaInst *retLen = RB.CreateAlloca(i32, nullptr, "morok.win.kdbg.retlen");
+    auto *kdInfoTy = ArrayType::get(i8, 2);
+    auto *pbiTy = ArrayType::get(i8, 48);
+    auto *moduleTy = ArrayType::get(i8, 4096);
+    AllocaInst *kdInfo =
+        RB.CreateAlloca(kdInfoTy, nullptr, "morok.win.kdbg.info");
+    AllocaInst *pbi = RB.CreateAlloca(pbiTy, nullptr, "morok.win.kdbg.pbi");
+    AllocaInst *modules =
+        RB.CreateAlloca(moduleTy, nullptr, "morok.win.kdbg.modules");
+    Value *ntdll = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("ntdll.dll"))},
+        "morok.win.kdbg.ntdll");
+    Value *user32 = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("user32.dll"))},
+        "morok.win.kdbg.user32");
+    Value *qsi = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtQuerySystemInformation"))},
+        "morok.win.kdbg.ntqsi");
+    Value *qip = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtQueryInformationProcess"))},
+        "morok.win.kdbg.ntqip");
+    Value *findWindow = RB.CreateCall(
+        resolver, {user32, ConstantInt::get(i64, fnv1aName("FindWindowA"))},
+        "morok.win.kdbg.findwindow");
+    foldState(RB, State, qsi, rng.next(), "morok.win.kdbg.ntqsi.mix");
+    foldState(RB, State, qip, rng.next(), "morok.win.kdbg.ntqip.mix");
+    RB.CreateCondBr(RB.CreateICmpNE(qsi, ConstantInt::get(ip, 0),
+                                    "morok.win.kdbg.ntqsi.ready"),
+                    qsiBB, qipGateBB);
+
+    IRBuilder<> SB(qsiBB);
+    auto *qsiTy = FunctionType::get(i32, {i32, ptr, i32, ptr}, false);
+    Value *qsiPtr = SB.CreateIntToPtr(qsi, ptr, "morok.win.kdbg.ntqsi.ptr");
+    Value *kdStatus = SB.CreateCall(
+        qsiTy, qsiPtr,
+        {ConstantInt::get(i32, 0x23), kdInfo, ConstantInt::get(i32, 2),
+         retLen},
+        "morok.win.kdbg.system.kd.status");
+    Value *sysKdEnabled =
+        loadAt(SB, M, i8, kdInfo, 0ULL, "morok.win.kdbg.system.kd.enabled");
+    Value *sysKdNotPresent =
+        loadAt(SB, M, i8, kdInfo, 1, "morok.win.kdbg.system.kd.not.present");
+    Value *kdOk = SB.CreateICmpSGE(kdStatus, ConstantInt::get(i32, 0),
+                                   "morok.win.kdbg.system.kd.ok");
+    Value *sysKdHit = SB.CreateAnd(
+        kdOk,
+        SB.CreateOr(SB.CreateICmpNE(sysKdEnabled, ConstantInt::get(i8, 0)),
+                    SB.CreateICmpEQ(sysKdNotPresent, ConstantInt::get(i8, 0)),
+                    "morok.win.kdbg.system.kd.bits"),
+        "morok.win.kdbg.system.kd.hit");
+    foldState(SB, State, kdStatus, rng.next(),
+              "morok.win.kdbg.system.kd.status.mix");
+    foldFlag(SB, State, sysKdHit, 0x794A0FE2D51B36C8ULL,
+             "morok.win.kdbg.system.kd");
+
+    Value *moduleStatus = SB.CreateCall(
+        qsiTy, qsiPtr,
+        {ConstantInt::get(i32, 0x0B), modules, ConstantInt::get(i32, 4096),
+         retLen},
+        "morok.win.kdbg.system.modules.status");
+    Value *moduleCount =
+        loadAt(SB, M, i32, modules, 0ULL, "morok.win.kdbg.system.modules.count");
+    foldState(SB, State, moduleStatus, rng.next(),
+              "morok.win.kdbg.system.modules.status.mix");
+    foldState(SB, State, moduleCount, rng.next(),
+              "morok.win.kdbg.system.modules.count.mix");
+    SB.CreateBr(qipGateBB);
+
+    IRBuilder<> QG(qipGateBB);
+    QG.CreateCondBr(QG.CreateICmpNE(qip, ConstantInt::get(ip, 0),
+                                    "morok.win.kdbg.ntqip.ready"),
+                    qipBB, windowGateBB);
+
+    IRBuilder<> PB(qipBB);
+    auto *qipTy = FunctionType::get(i32, {ptr, i32, ptr, i32, ptr}, false);
+    Value *qipStatus = PB.CreateCall(
+        qipTy, PB.CreateIntToPtr(qip, ptr, "morok.win.kdbg.ntqip.ptr"),
+        {PB.CreateIntToPtr(ConstantInt::getSigned(ip, -1), ptr),
+         ConstantInt::get(i32, 0), pbi, ConstantInt::get(i32, 48), retLen},
+        "morok.win.kdbg.parent.status");
+    Value *parentPid =
+        loadAt(PB, M, ip, pbi, 40, "morok.win.kdbg.parent.pid");
+    foldState(PB, State, qipStatus, rng.next(),
+              "morok.win.kdbg.parent.status.mix");
+    foldState(PB, State, parentPid, rng.next(),
+              "morok.win.kdbg.parent.pid.mix");
+    PB.CreateBr(windowGateBB);
+
+    IRBuilder<> WG(windowGateBB);
+    WG.CreateCondBr(WG.CreateICmpNE(findWindow, ConstantInt::get(ip, 0),
+                                    "morok.win.kdbg.findwindow.ready"),
+                    windowBB, retBB);
+
+    IRBuilder<> WB(windowBB);
+    auto *findTy = FunctionType::get(ptr, {ptr, ptr}, false);
+    Value *findPtr =
+        WB.CreateIntToPtr(findWindow, ptr, "morok.win.kdbg.findwindow.ptr");
+    Value *windbg = ir::emitCloakedSymbol(WB, M, "WinDbgFrameClass", rng);
+    Value *olly = ir::emitCloakedSymbol(WB, M, "OLLYDBG", rng);
+    Value *qt = ir::emitCloakedSymbol(WB, M, "Qt5QWindowIcon", rng);
+    Value *w0 = WB.CreateCall(findTy, findPtr,
+                              {windbg, ConstantPointerNull::get(ptr)},
+                              "morok.win.kdbg.window.windbg");
+    Value *w1 = WB.CreateCall(findTy, findPtr,
+                              {olly, ConstantPointerNull::get(ptr)},
+                              "morok.win.kdbg.window.olly");
+    Value *w2 = WB.CreateCall(findTy, findPtr,
+                              {qt, ConstantPointerNull::get(ptr)},
+                              "morok.win.kdbg.window.qt");
+    Value *windowHit = WB.CreateOr(
+        WB.CreateICmpNE(w0, ConstantPointerNull::get(ptr)),
+        WB.CreateOr(WB.CreateICmpNE(w1, ConstantPointerNull::get(ptr)),
+                    WB.CreateICmpNE(w2, ConstantPointerNull::get(ptr))),
+        "morok.win.kdbg.window.hit");
+    foldFlag(WB, State, windowHit, 0xC52F6B9038D41EA7ULL,
+             "morok.win.kdbg.window");
+    WB.CreateBr(retBB);
+
+    IRBuilder<> RetB(retBB);
+    RetB.CreateRetVoid();
+    return fn;
+}
+
 } // namespace
 
 bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
@@ -10000,6 +10188,21 @@ bool windowsAntiAttachModule(Module &M, ir::IRRandom &rng) {
     return true;
 }
 
+bool windowsKernelDebuggerModule(Module &M, ir::IRRandom &rng) {
+    const Triple tt(M.getTargetTriple());
+    GlobalVariable *state = windowsPeState(M, rng);
+    Function *probe = windowsKernelDebuggerProbe(M, state, rng, tt);
+    if (!probe)
+        return false;
+
+    Function *ctor = makeCtorShell(M, "morok.win.kdbg");
+    IRBuilder<> B(&ctor->getEntryBlock());
+    B.CreateCall(probe);
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, ctor, 0);
+    return true;
+}
+
 PreservedAnalyses AntiDebuggingPass::run(Module &M, ModuleAnalysisManager &) {
     ir::IRRandom rng(engine_);
     return antiDebuggingModule(M, rng) ? PreservedAnalyses::none()
@@ -10048,6 +10251,13 @@ PreservedAnalyses WindowsAntiAttachPass::run(Module &M,
     ir::IRRandom rng(engine_);
     return windowsAntiAttachModule(M, rng) ? PreservedAnalyses::none()
                                            : PreservedAnalyses::all();
+}
+
+PreservedAnalyses WindowsKernelDebuggerPass::run(Module &M,
+                                                 ModuleAnalysisManager &) {
+    ir::IRRandom rng(engine_);
+    return windowsKernelDebuggerModule(M, rng) ? PreservedAnalyses::none()
+                                               : PreservedAnalyses::all();
 }
 
 PreservedAnalyses TimingOraclePass::run(Module &M, ModuleAnalysisManager &) {
