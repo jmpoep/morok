@@ -6563,16 +6563,24 @@ GlobalVariable *schroOldActionGlobal(Module &M, StringRef Name,
     return gv;
 }
 
+void storeNamedSiginfoAction(IRBuilder<> &B, Module &M, AllocaInst *Action,
+                             Function *Handler,
+                             const SchroFaultLayout &Layout,
+                             const Twine &Prefix) {
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    zeroActionBytes(B, M, Action, Layout.sigactionSize);
+    B.CreateStore(Handler,
+                  gepI8(B, M, Action, constIp(M, 0), Prefix + ".handler"));
+    B.CreateStore(ConstantInt::get(i32, Layout.saSiginfo),
+                  gepI8(B, M, Action, constIp(M, Layout.flagsOffset),
+                        Prefix + ".flags"));
+}
+
 void storeTargetSiginfoAction(IRBuilder<> &B, Module &M, AllocaInst *Action,
                               Function *Handler,
                               const SchroFaultLayout &Layout) {
-    auto *i32 = Type::getInt32Ty(M.getContext());
-    zeroActionBytes(B, M, Action, Layout.sigactionSize);
-    B.CreateStore(Handler, gepI8(B, M, Action, constIp(M, 0),
-                                 "morok.antihook.schro.sa.handler"));
-    B.CreateStore(ConstantInt::get(i32, Layout.saSiginfo),
-                  gepI8(B, M, Action, constIp(M, Layout.flagsOffset),
-                        "morok.antihook.schro.sa.flags"));
+    storeNamedSiginfoAction(B, M, Action, Handler, Layout,
+                            "morok.antihook.schro.sa");
 }
 
 void storeCodeByte(IRBuilder<> &B, Module &M, Value *Page,
@@ -6919,6 +6927,473 @@ Function *schrodingerPageProbe(Module &M, GlobalVariable *State,
     return fn;
 }
 
+GlobalVariable *pageFaultTlbState(Module &M, ir::IRRandom &rng) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.pftlb.state", /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i64, rng.next()), "morok.pftlb.state");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *pageFaultTlbBaseGlobal(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.pftlb.base", /*AllowInternal=*/true))
+        return existing;
+    auto *ip = intPtrTy(M);
+    auto *gv = new GlobalVariable(
+        M, ip, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(ip, 0), "morok.pftlb.base");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *pageFaultTlbSizeGlobal(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.pftlb.size", /*AllowInternal=*/true))
+        return existing;
+    auto *ip = intPtrTy(M);
+    auto *gv = new GlobalVariable(
+        M, ip, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(ip, 0), "morok.pftlb.size");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *pageFaultTlbPageSizeGlobal(Module &M) {
+    if (auto *existing = M.getGlobalVariable("morok.pftlb.page.size",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *ip = intPtrTy(M);
+    auto *gv = new GlobalVariable(
+        M, ip, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(ip, 0), "morok.pftlb.page.size");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *pageFaultTlbArmedGlobal(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.pftlb.armed", /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i32, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i32, 0),
+                                  "morok.pftlb.armed");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *pageFaultTlbHitsGlobal(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.pftlb.hits", /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i32, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i32, 0),
+                                  "morok.pftlb.hits");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+void emitPageFaultTlbMunmap(IRBuilder<> &B, Module &M, const Triple &TT,
+                            Value *Mapped, Value *Size) {
+    if (TT.isOSLinux()) {
+        emitLinuxMunmap(B, M, TT, Mapped, Size);
+        return;
+    }
+    if (TT.isOSDarwin()) {
+        emitDarwinMunmap(
+            B, M, TT,
+            B.CreateIntToPtr(Mapped, PointerType::getUnqual(M.getContext())),
+            Size);
+    }
+}
+
+Function *pageFaultTlbSignalHandler(Module &M, GlobalVariable *State,
+                                    Function *Probe, const Triple &TT,
+                                    const SchroFaultLayout &Layout) {
+    if (Function *existing = M.getFunction("morok.pftlb.handler"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(
+        FunctionType::get(Type::getVoidTy(ctx), {i32, ptr, ptr}, false),
+        GlobalValue::PrivateLinkage, "morok.pftlb.handler", &M);
+    fn->setDSOLocal(true);
+    Argument *sig = fn->getArg(0);
+    sig->setName("sig");
+    Argument *info = fn->getArg(1);
+    info->setName("info");
+    Argument *uctx = fn->getArg(2);
+    uctx->setName("uctx");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loadFaultBB = BasicBlock::Create(ctx, "fault.addr", fn);
+    auto *checkCtxBB = BasicBlock::Create(ctx, "ctx.check", fn);
+    auto *loadPcBB = BasicBlock::Create(ctx, "pc.load", fn);
+    auto *loadDarwinPcBB = BasicBlock::Create(ctx, "pc.darwin", fn);
+    auto *classifyBB = BasicBlock::Create(ctx, "classify", fn);
+    auto *oursBB = BasicBlock::Create(ctx, "ours", fn);
+    auto *restoreBB = BasicBlock::Create(ctx, "restore", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "done", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *pcSlot = B.CreateAlloca(ip, nullptr, "morok.pftlb.pc.slot");
+    AllocaInst *faultSlot =
+        B.CreateAlloca(ip, nullptr, "morok.pftlb.fault.slot");
+    B.CreateStore(ConstantInt::get(ip, 0), pcSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), faultSlot)->setVolatile(true);
+    B.CreateCondBr(B.CreateICmpNE(info, ConstantPointerNull::get(ptr)),
+                   loadFaultBB, checkCtxBB);
+
+    IRBuilder<> FB(loadFaultBB);
+    Value *faultAddr =
+        loadAt(FB, M, ip, info, Layout.siginfoAddrOffset, "morok.pftlb.fault");
+    FB.CreateStore(faultAddr, faultSlot)->setVolatile(true);
+    FB.CreateBr(checkCtxBB);
+
+    IRBuilder<> CB(checkCtxBB);
+    CB.CreateCondBr(CB.CreateICmpNE(uctx, ConstantPointerNull::get(ptr)),
+                    loadPcBB, classifyBB);
+
+    IRBuilder<> PB(loadPcBB);
+    if (Layout.darwinMcontext) {
+        Value *mctx =
+            loadAt(PB, M, ptr, uctx, Layout.darwinMcontextOffset,
+                   "morok.pftlb.mcontext");
+        PB.CreateCondBr(PB.CreateICmpNE(mctx, ConstantPointerNull::get(ptr)),
+                        loadDarwinPcBB, classifyBB);
+
+        IRBuilder<> DPB(loadDarwinPcBB);
+        Value *pc =
+            loadAt(DPB, M, ip, mctx, Layout.darwinPcOffset, "morok.pftlb.pc");
+        DPB.CreateStore(pc, pcSlot)->setVolatile(true);
+        DPB.CreateBr(classifyBB);
+    } else {
+        Value *pc =
+            loadAt(PB, M, ip, uctx, Layout.linuxPcSlotOffset, "morok.pftlb.pc");
+        PB.CreateStore(pc, pcSlot)->setVolatile(true);
+        PB.CreateBr(classifyBB);
+        IRBuilder<> DPB(loadDarwinPcBB);
+        DPB.CreateUnreachable();
+    }
+
+    IRBuilder<> KB(classifyBB);
+    Value *base =
+        KB.CreateLoad(ip, pageFaultTlbBaseGlobal(M), "morok.pftlb.base.v");
+    cast<LoadInst>(base)->setVolatile(true);
+    Value *size =
+        KB.CreateLoad(ip, pageFaultTlbSizeGlobal(M), "morok.pftlb.size.v");
+    cast<LoadInst>(size)->setVolatile(true);
+    Value *pageSize = KB.CreateLoad(ip, pageFaultTlbPageSizeGlobal(M),
+                                    "morok.pftlb.page.size.v");
+    cast<LoadInst>(pageSize)->setVolatile(true);
+    Value *fault = KB.CreateLoad(ip, faultSlot, "morok.pftlb.fault.v");
+    cast<LoadInst>(fault)->setVolatile(true);
+    Value *end = KB.CreateAdd(base, size, "morok.pftlb.end");
+    Value *baseReady =
+        KB.CreateAnd(KB.CreateICmpNE(base, ConstantInt::get(ip, 0)),
+                     KB.CreateICmpNE(pageSize, ConstantInt::get(ip, 0)),
+                     "morok.pftlb.ready");
+    Value *inRange =
+        KB.CreateAnd(baseReady,
+                     KB.CreateAnd(KB.CreateICmpUGE(fault, base),
+                                  KB.CreateICmpULT(fault, end)),
+                     "morok.pftlb.fault.in.range");
+    KB.CreateCondBr(inRange, oursBB, restoreBB);
+
+    IRBuilder<> OB(oursBB);
+    Value *pc = OB.CreateLoad(ip, pcSlot, "morok.pftlb.pc.v");
+    cast<LoadInst>(pc)->setVolatile(true);
+    Value *offset = OB.CreateSub(fault, base, "morok.pftlb.fault.offset");
+    Value *pageIndex = OB.CreateUDiv(offset, pageSize, "morok.pftlb.page.idx");
+    Value *faultPage =
+        OB.CreateAdd(base, OB.CreateMul(pageIndex, pageSize),
+                     "morok.pftlb.fault.page");
+    Value *rc = emitPosixMprotect(OB, M, TT, faultPage, pageSize,
+                                  ConstantInt::get(ip, 3));
+    rc->setName("morok.pftlb.mprotect.page");
+    auto *oldHits =
+        OB.CreateLoad(i32, pageFaultTlbHitsGlobal(M), "morok.pftlb.hits.old");
+    oldHits->setVolatile(true);
+    Value *nextHits =
+        OB.CreateAdd(oldHits, ConstantInt::get(i32, 1), "morok.pftlb.hits.next");
+    OB.CreateStore(nextHits, pageFaultTlbHitsGlobal(M))->setVolatile(true);
+    Value *armed =
+        OB.CreateLoad(i32, pageFaultTlbArmedGlobal(M), "morok.pftlb.armed.v");
+    cast<LoadInst>(armed)->setVolatile(true);
+    Value *probeStart = OB.CreatePtrToInt(Probe, ip, "morok.pftlb.probe.start");
+    Value *probeEnd =
+        OB.CreateAdd(probeStart, ConstantInt::get(ip, 16384),
+                     "morok.pftlb.probe.end");
+    Value *ripOk = OB.CreateAnd(OB.CreateICmpUGE(pc, probeStart),
+                                OB.CreateICmpULT(pc, probeEnd),
+                                "morok.pftlb.rip.allowed");
+    Value *armedOk = OB.CreateICmpEQ(armed, ConstantInt::get(i32, 1),
+                                     "morok.pftlb.armed.allowed");
+    Value *unexpected =
+        OB.CreateNot(OB.CreateAnd(ripOk, armedOk), "morok.pftlb.unexpected");
+    foldState(OB, State, fault, 0xD28F4A3C91E7B605ULL, "morok.pftlb.fault.mix");
+    foldState(OB, State, pc, 0x8A39C7514D20E6B3ULL, "morok.pftlb.pc.mix");
+    foldState(OB, State, nextHits, 0x41E6BD90A3C8572FULL,
+              "morok.pftlb.hits.mix");
+    foldFlag(OB, State, unexpected, 0xE5074B2D6C91A83FULL,
+             "morok.pftlb.unexpected.fault");
+    OB.CreateBr(doneBB);
+
+    IRBuilder<> XB(restoreBB);
+    Value *isBus = XB.CreateICmpEQ(sig, ConstantInt::getSigned(i32, Layout.sigBus),
+                                   "morok.pftlb.sigbus");
+    GlobalVariable *oldSegv =
+        schroOldActionGlobal(M, "morok.pftlb.old.segv", Layout.sigactionSize);
+    GlobalVariable *oldBus =
+        schroOldActionGlobal(M, "morok.pftlb.old.bus", Layout.sigactionSize);
+    Value *oldAction = XB.CreateSelect(isBus, static_cast<Value *>(oldBus),
+                                       static_cast<Value *>(oldSegv),
+                                       "morok.pftlb.old.action");
+    XB.CreateCall(sigactionDecl(M),
+                  {sig, oldAction, ConstantPointerNull::get(ptr)},
+                  "morok.pftlb.restore.foreign");
+    XB.CreateBr(doneBB);
+
+    IRBuilder<> DB(doneBB);
+    DB.CreateRetVoid();
+    return fn;
+}
+
+Function *pageFaultTlbProbe(Module &M, GlobalVariable *State,
+                            ir::IRRandom &rng, const Triple &TT) {
+    SchroFaultLayout layout;
+    if (intPtrTy(M)->getBitWidth() != 64 || !schroFaultLayout(TT, layout))
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.pftlb.oracle"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.pftlb.oracle", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    constexpr std::uint32_t kPageCount = 5;
+    const std::uint32_t mapAnon = TT.isOSDarwin() ? 0x1000u : 0x20u;
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *installBusBB = BasicBlock::Create(ctx, "install.bus", fn);
+    auto *restoreSegvBB = BasicBlock::Create(ctx, "restore.segv", fn);
+    auto *protectBB = BasicBlock::Create(ctx, "protect", fn);
+    auto *touchBB = BasicBlock::Create(ctx, "touch", fn);
+    auto *analyzeBB = BasicBlock::Create(ctx, "analyze", fn);
+    auto *restoreAllBB = BasicBlock::Create(ctx, "restore.all", fn);
+    auto *unmapBB = BasicBlock::Create(ctx, "unmap", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    Value *pageSize = nullptr;
+    if (TT.isOSDarwin()) {
+        FunctionCallee getpagesize =
+            M.getOrInsertFunction("getpagesize", FunctionType::get(i32, false));
+        pageSize =
+            B.CreateZExt(B.CreateCall(getpagesize, {}, "morok.pftlb.pagesz"),
+                         ip);
+    } else {
+        pageSize = ConstantInt::get(ip, 4096);
+    }
+    Value *regionSize =
+        B.CreateMul(pageSize, ConstantInt::get(ip, kPageCount),
+                    "morok.pftlb.region.size");
+    Value *mapped = emitPosixAnonMmapAddr(
+        B, M, TT, regionSize, ConstantInt::get(ip, 3),
+        ConstantInt::get(ip, 2u | mapAnon), "morok.pftlb.mmap");
+    mapped->setName("morok.pftlb.mmap");
+    Value *mappedOk = B.CreateAnd(
+        B.CreateICmpUGT(mapped, ConstantInt::get(ip, 4096)),
+        B.CreateICmpNE(mapped, ConstantInt::get(ip, ~0ULL)),
+        "morok.pftlb.mapped");
+    B.CreateCondBr(mappedOk, installBusBB, retBB);
+
+    IRBuilder<> IB(installBusBB);
+    IB.CreateStore(mapped, pageFaultTlbBaseGlobal(M))->setVolatile(true);
+    IB.CreateStore(regionSize, pageFaultTlbSizeGlobal(M))->setVolatile(true);
+    IB.CreateStore(pageSize, pageFaultTlbPageSizeGlobal(M))->setVolatile(true);
+    IB.CreateStore(ConstantInt::get(i32, 0), pageFaultTlbArmedGlobal(M))
+        ->setVolatile(true);
+    IB.CreateStore(ConstantInt::get(i32, 0), pageFaultTlbHitsGlobal(M))
+        ->setVolatile(true);
+    for (std::uint32_t i = 0; i < kPageCount; ++i) {
+        Value *page =
+            IB.CreateAdd(mapped, IB.CreateMul(pageSize, ConstantInt::get(ip, i)),
+                         "morok.pftlb.page");
+        emitSchroCodeIsland(IB, M, TT, page, rng);
+    }
+
+    Function *handler = pageFaultTlbSignalHandler(M, State, fn, TT, layout);
+    auto *actionTy = ArrayType::get(i8, layout.sigactionSize);
+    AllocaInst *action = IB.CreateAlloca(actionTy, nullptr, "morok.pftlb.sa");
+    storeNamedSiginfoAction(IB, M, action, handler, layout, "morok.pftlb.sa");
+    FunctionCallee sigactionFn = sigactionDecl(M);
+    GlobalVariable *oldSegv =
+        schroOldActionGlobal(M, "morok.pftlb.old.segv", layout.sigactionSize);
+    GlobalVariable *oldBus =
+        schroOldActionGlobal(M, "morok.pftlb.old.bus", layout.sigactionSize);
+    Value *segvRc =
+        IB.CreateCall(sigactionFn,
+                      {ConstantInt::getSigned(i32, layout.sigSegv), action,
+                       oldSegv},
+                      "morok.pftlb.sigaction.segv");
+    IB.CreateCondBr(IB.CreateICmpEQ(segvRc, ConstantInt::get(i32, 0)),
+                    protectBB, unmapBB);
+
+    IRBuilder<> PB(protectBB);
+    Value *busRc =
+        PB.CreateCall(sigactionFn,
+                      {ConstantInt::getSigned(i32, layout.sigBus), action,
+                       oldBus},
+                      "morok.pftlb.sigaction.bus");
+    PB.CreateCondBr(PB.CreateICmpEQ(busRc, ConstantInt::get(i32, 0)), touchBB,
+                    restoreSegvBB);
+
+    IRBuilder<> RSB(restoreSegvBB);
+    RSB.CreateCall(sigactionFn,
+                   {ConstantInt::getSigned(i32, layout.sigSegv), oldSegv,
+                    ConstantPointerNull::get(ptr)},
+                   "morok.pftlb.restore.segv");
+    RSB.CreateBr(unmapBB);
+
+    IRBuilder<> TB(touchBB);
+    Value *noneRc = emitPosixMprotect(TB, M, TT, mapped, regionSize,
+                                      ConstantInt::get(ip, 0));
+    noneRc->setName("morok.pftlb.mprotect.none");
+    TB.CreateCondBr(
+        TB.CreateICmpEQ(noneRc, ConstantInt::get(i32, 0),
+                        "morok.pftlb.none.ok"),
+        analyzeBB, restoreAllBB);
+
+    IRBuilder<> AB(analyzeBB);
+    AB.CreateStore(ConstantInt::get(i32, 1), pageFaultTlbArmedGlobal(M))
+        ->setVolatile(true);
+    auto *mixSlot = AB.CreateAlloca(i64, nullptr, "morok.pftlb.touch.mix.slot");
+    AB.CreateStore(ConstantInt::get(i64, rng.next()), mixSlot)
+        ->setVolatile(true);
+    Value *primaryStart =
+        emitTimingPrimaryClock(AB, M, TT, "morok.pftlb.primary.start");
+    Value *secondaryStart =
+        emitTimingSecondaryClock(AB, M, TT, "morok.pftlb.secondary.start");
+
+    for (std::uint32_t i = 0; i < kPageCount; ++i) {
+        Value *offset =
+            AB.CreateAdd(AB.CreateMul(pageSize, ConstantInt::get(ip, i)),
+                         ConstantInt::get(ip, (i * 13u) & 63u),
+                         "morok.pftlb.touch.offset");
+        Value *addr = AB.CreateAdd(mapped, offset, "morok.pftlb.touch.addr");
+        Value *bytePtr = AB.CreateIntToPtr(addr, ptr, "morok.pftlb.touch.ptr");
+        auto *byte = AB.CreateLoad(i8, bytePtr, "morok.pftlb.fault.byte");
+        byte->setVolatile(true);
+        byte->setAlignment(Align(1));
+        auto *oldMix =
+            AB.CreateLoad(i64, mixSlot, "morok.pftlb.touch.mix.old");
+        oldMix->setVolatile(true);
+        Value *mixed = AB.CreateXor(
+            AB.CreateMul(oldMix, ConstantInt::get(i64, rng.next() | 1ULL)),
+            AB.CreateZExt(byte, i64), "morok.pftlb.touch.mix");
+        AB.CreateStore(mixed, mixSlot)->setVolatile(true);
+    }
+
+    Value *primaryEnd =
+        emitTimingPrimaryClock(AB, M, TT, "morok.pftlb.primary.end");
+    Value *secondaryEnd =
+        emitTimingSecondaryClock(AB, M, TT, "morok.pftlb.secondary.end");
+    AB.CreateStore(ConstantInt::get(i32, 0), pageFaultTlbArmedGlobal(M))
+        ->setVolatile(true);
+    auto *hits =
+        AB.CreateLoad(i32, pageFaultTlbHitsGlobal(M), "morok.pftlb.hits.final");
+    hits->setVolatile(true);
+    auto *mix = AB.CreateLoad(i64, mixSlot, "morok.pftlb.touch.mix.final");
+    mix->setVolatile(true);
+    Value *primaryDelta =
+        AB.CreateSub(primaryEnd, primaryStart, "morok.pftlb.primary.delta");
+    Value *secondaryDelta =
+        AB.CreateSub(secondaryEnd, secondaryStart, "morok.pftlb.secondary.delta");
+    const bool hasCycleClock = isX86Target(TT);
+    const std::uint64_t primaryThreshold =
+        hasCycleClock ? 75000000ULL : 35000000ULL;
+    constexpr std::uint64_t secondaryThreshold = 35000000ULL;
+    Value *missing =
+        AB.CreateICmpULT(hits, ConstantInt::get(i32, kPageCount),
+                         "morok.pftlb.faults.missing");
+    Value *extra = AB.CreateICmpUGT(hits, ConstantInt::get(i32, kPageCount + 1),
+                                    "morok.pftlb.faults.extra");
+    Value *primarySlow =
+        AB.CreateICmpUGT(primaryDelta, ConstantInt::get(i64, primaryThreshold),
+                         "morok.pftlb.primary.slow");
+    Value *secondarySlow = AB.CreateICmpUGT(
+        secondaryDelta, ConstantInt::get(i64, secondaryThreshold),
+        "morok.pftlb.secondary.slow");
+    Value *slow =
+        AB.CreateOr(primarySlow, secondarySlow, "morok.pftlb.sample.slow");
+    Value *diverged =
+        AB.CreateXor(primarySlow, secondarySlow, "morok.pftlb.sample.diverged");
+    foldState(AB, State, mix, 0xB39A6D51C8027E4FULL, "morok.pftlb.touch.mix");
+    foldState(AB, State, hits, 0x7C0E49D2A58B6311ULL, "morok.pftlb.hits");
+    foldState(AB, State, primaryDelta, 0x2A61E50F9D4C837BULL,
+              "morok.pftlb.primary.delta");
+    foldState(AB, State, secondaryDelta, 0xC4D81729E63B5A90ULL,
+              "morok.pftlb.secondary.delta");
+    foldFlag(AB, State, missing, 0x916B03D5E24A7F8CULL,
+             "morok.pftlb.pattern.missing");
+    foldFlag(AB, State, extra, 0x4E7A92C80D5B31F6ULL,
+             "morok.pftlb.pattern.extra");
+    foldFlag(AB, State, slow, 0xA71D38E52F94C60BULL,
+             "morok.pftlb.pattern.slow");
+    foldFlag(AB, State, diverged, 0x6C52E9B1478D0A3FULL,
+             "morok.pftlb.pattern.diverged");
+    AB.CreateBr(restoreAllBB);
+
+    IRBuilder<> RAB(restoreAllBB);
+    RAB.CreateCall(sigactionFn,
+                   {ConstantInt::getSigned(i32, layout.sigSegv), oldSegv,
+                    ConstantPointerNull::get(ptr)},
+                   "morok.pftlb.restore.all.segv");
+    RAB.CreateCall(sigactionFn,
+                   {ConstantInt::getSigned(i32, layout.sigBus), oldBus,
+                    ConstantPointerNull::get(ptr)},
+                   "morok.pftlb.restore.all.bus");
+    RAB.CreateBr(unmapBB);
+
+    IRBuilder<> UB(unmapBB);
+    emitPosixMprotect(UB, M, TT, mapped, regionSize, ConstantInt::get(ip, 3))
+        ->setName("morok.pftlb.mprotect.rw.cleanup");
+    emitPageFaultTlbMunmap(UB, M, TT, mapped, regionSize);
+    UB.CreateStore(ConstantInt::get(ip, 0), pageFaultTlbBaseGlobal(M))
+        ->setVolatile(true);
+    UB.CreateStore(ConstantInt::get(ip, 0), pageFaultTlbSizeGlobal(M))
+        ->setVolatile(true);
+    UB.CreateStore(ConstantInt::get(ip, 0), pageFaultTlbPageSizeGlobal(M))
+        ->setVolatile(true);
+    UB.CreateStore(ConstantInt::get(i32, 0), pageFaultTlbArmedGlobal(M))
+        ->setVolatile(true);
+    UB.CreateBr(retBB);
+
+    IRBuilder<> RB(retBB);
+    RB.CreateRetVoid();
+    return fn;
+}
+
 } // namespace
 
 bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
@@ -7022,6 +7497,21 @@ bool trapOracleModule(Module &M, ir::IRRandom &rng) {
         B.CreateCall(signalDecl(M),
                      {ConstantInt::get(i32, kSigTrap), oldHandler});
     }
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, ctor, 0);
+    return true;
+}
+
+bool pageFaultTlbOracleModule(Module &M, ir::IRRandom &rng) {
+    const Triple tt(M.getTargetTriple());
+    GlobalVariable *state = pageFaultTlbState(M, rng);
+    Function *oracle = pageFaultTlbProbe(M, state, rng, tt);
+    if (!oracle)
+        return false;
+
+    Function *ctor = makeCtorShell(M, "morok.pftlb");
+    IRBuilder<> B(&ctor->getEntryBlock());
+    B.CreateCall(oracle);
     B.CreateRetVoid();
     appendToGlobalCtors(M, ctor, 0);
     return true;
@@ -7313,6 +7803,13 @@ PreservedAnalyses TrapOraclePass::run(Module &M, ModuleAnalysisManager &) {
     ir::IRRandom rng(engine_);
     return trapOracleModule(M, rng) ? PreservedAnalyses::none()
                                     : PreservedAnalyses::all();
+}
+
+PreservedAnalyses PageFaultTlbOraclePass::run(Module &M,
+                                              ModuleAnalysisManager &) {
+    ir::IRRandom rng(engine_);
+    return pageFaultTlbOracleModule(M, rng) ? PreservedAnalyses::none()
+                                            : PreservedAnalyses::all();
 }
 
 } // namespace morok::passes

@@ -369,6 +369,7 @@ struct PassConfig {
     ToggleConfig anti_class_dump;
     ToggleConfig timing_oracles;
     ToggleConfig trap_oracles;
+    ToggleConfig page_fault_oracles;
     ToggleConfig decoy_strings;
     ToggleConfig vtable_integrity;
 

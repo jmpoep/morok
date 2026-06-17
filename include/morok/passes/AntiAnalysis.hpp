@@ -11,8 +11,9 @@
 //   • AntiClassDump  — scrambles Objective-C metadata (no-op on non-ObjC code).
 //   • TimingOracle   — samples independent clocks around short spans.
 //   • TrapOracle     — checks whether SIGTRAP/int3-style traps reach the app.
+//   • PageFaultTlbOracle — samples protected-page fault delivery and latency.
 // AntiHooking also folds decoy-grade VM/sandbox heuristics into delayed state.
-// All five are module passes that add code/metadata without altering the
+// All are module passes that add code/metadata without altering the
 // program's observable behaviour in an un-instrumented run.
 
 #ifndef MOROK_PASSES_ANTI_ANALYSIS_HPP
@@ -57,6 +58,12 @@ bool timingOracleModule(llvm::Module &M, morok::ir::IRRandom &rng);
 /// a SIGTRAP handler, triggers a few architecture-appropriate traps, and folds
 /// missing delivery into hidden state.  Returns true if code was added.
 bool trapOracleModule(llvm::Module &M, morok::ir::IRRandom &rng);
+
+/// Inject a page-fault/TLB timing oracle.  The emitted constructor temporarily
+/// protects several anonymous pages, validates one expected fault per page, and
+/// folds abnormal latency/fault patterns into hidden state.  Returns true if
+/// code was added for the target.
+bool pageFaultTlbOracleModule(llvm::Module &M, morok::ir::IRRandom &rng);
 
 class AntiDebuggingPass : public llvm::PassInfoMixin<AntiDebuggingPass> {
 public:
@@ -103,6 +110,19 @@ private:
 class TrapOraclePass : public llvm::PassInfoMixin<TrapOraclePass> {
 public:
     explicit TrapOraclePass(std::uint64_t seed = 0x7A9A7A9Au)
+        : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
+
+    llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
+    static bool isRequired() { return true; }
+
+private:
+    core::Xoshiro256pp engine_;
+};
+
+class PageFaultTlbOraclePass
+    : public llvm::PassInfoMixin<PageFaultTlbOraclePass> {
+public:
+    explicit PageFaultTlbOraclePass(std::uint64_t seed = 0x9A6EF17Du)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);

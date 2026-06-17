@@ -10625,6 +10625,60 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("pageFaultTlbOracleModule emits Linux fault/timing probe") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(887);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::pageFaultTlbOracleModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.pftlb");
+    Function *Oracle = M->getFunction("morok.pftlb.oracle");
+    Function *Handler = M->getFunction("morok.pftlb.handler");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Oracle != nullptr);
+    REQUIRE(Handler != nullptr);
+    CHECK(Handler->arg_size() == 3);
+    CHECK(M->getGlobalVariable("morok.pftlb.state", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.pftlb.hits", true) != nullptr);
+    CHECK(M->getFunction("sigaction") != nullptr);
+    CHECK(M->getFunction("clock_gettime") != nullptr);
+    CHECK(hasInlineAsmCall(*Oracle));
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.mprotect.none") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.primary.delta") >= 1u);
+    CHECK(countNamedInstructions(*Handler, "morok.pftlb.mprotect.page") >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("pageFaultTlbOracleModule emits Darwin mach-backed fault probe") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "arm64-apple-macosx13.0.0"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(888);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::pageFaultTlbOracleModule(*M, rng));
+
+    Function *Oracle = M->getFunction("morok.pftlb.oracle");
+    Function *Handler = M->getFunction("morok.pftlb.handler");
+    REQUIRE(Oracle != nullptr);
+    REQUIRE(Handler != nullptr);
+    CHECK(M->getFunction("mach_absolute_time") != nullptr);
+    CHECK(M->getFunction("clock_gettime") != nullptr);
+    CHECK(M->getFunction("sigaction") != nullptr);
+    CHECK(M->getFunction("getpagesize") != nullptr);
+    CHECK_FALSE(hasInlineAsmCall(*Oracle));
+    CHECK(countNamedInstructions(*Handler, "morok.pftlb.pc") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.pattern.slow") >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("nanomitesModule lowers conditional branches to trap-mediated "
           "indirectbr") {
     LLVMContext ctx;

@@ -240,6 +240,10 @@ PassPluginLibraryInfo getPluginInfo() {
                             MPM.addPass(passes::TrapOraclePass());
                             return true;
                         }
+                        if (name == "morok-pftlb") {
+                            MPM.addPass(passes::PageFaultTlbOraclePass());
+                            return true;
+                        }
                         if (name == "morok-nanomites") {
                             MPM.addPass(passes::NanomitesPass());
                             return true;

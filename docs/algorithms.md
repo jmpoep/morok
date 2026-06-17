@@ -1113,8 +1113,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   performs the indirect call. Invokes and non-Linux-x86_64 targets avoid this
   exception path rather than guessing platform-specific exception-context
   offsets.
-- AntiClassDump / AntiDebugging / AntiHooking / TimingOracle / TrapOracle:
-  platform anti-analysis
+- AntiClassDump / AntiDebugging / AntiHooking / TimingOracle / TrapOracle /
+  PageFaultTlbOracle: platform anti-analysis
   (module passes). AntiDebugging combines startup checks with a mutable hidden
   state word, platform-specific recheck helpers, pthread watchdogs where
   available, and once-gated randomized calls inserted into user functions so
@@ -1293,6 +1293,17 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   `SIGILL`, advancing RIP over `icebp` when emulators such as Orb report byte
   `0xf1` as a non-resumable illegal instruction.  Windows `INT 2Dh`/VEH
   coverage remains gated on the future Windows foundation.
+- PageFaultTlbOracle is an opt-in POSIX constructor for triples with known
+  `ucontext_t` layouts.  It maps several private pages, lays down
+  architecture-shaped code islands, temporarily installs `SA_SIGINFO`
+  `SIGSEGV`/`SIGBUS` handlers, protects the region to `PROT_NONE`, and touches
+  one offset per page while sampling the existing primary/secondary clocks.  The
+  handler validates the fault address against the oracle region, reopens only
+  the faulting page, counts expected deliveries, and folds unexpected PC/armed
+  state, missing/extra faults, slow spans, and divergent clocks into
+  `morok.pftlb.state`.  The previous handlers are restored and the pages are
+  unmapped before the constructor returns; this is deliberately a
+  distribution-level signal rather than an immediate kill switch.
 - Nanomites lower selected conditional branches to a volatile predicate
   materialization followed by a synchronous `SIGTRAP` site.  The original
   condition no longer controls a direct branch; a `sigaction` `SA_SIGINFO`
@@ -1342,6 +1353,6 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   they can clone or generate dense IR.
 
 ## Scheduler order (to preserve semantics)
-Virtualization(user) → HashSelfDecrypt → AntiHook → AntiClassDump → AntiDebug → TimingOracle → TrapOracle → StringEnc → FCO(fn) → VTableIntegrity → per-fn{ Split, BCF, OptAmp, Sub,
+Virtualization(user) → HashSelfDecrypt → AntiHook → AntiClassDump → AntiDebug → TimingOracle → TrapOracle → PageFaultTlbOracle → StringEnc → FCO(fn) → VTableIntegrity → per-fn{ Split, BCF, OptAmp, Sub,
 MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare, ConstEnc, IndirectBranch } → ProtectionHelperVM → SensitiveHelperHardening → Nanomites → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
 MisleadingMetadata → FeatureElimination (strip debug/names) → cleanup marker decls.
