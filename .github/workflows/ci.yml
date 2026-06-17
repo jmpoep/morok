@@ -143,8 +143,12 @@ jobs:
               # CMake orders some Morok static libs after the LLVM libs they
               # depend on; GNU ld is single-pass and leaves those cross-archive
               # references undefined (ld64/lld-link rescan automatically). Wrap
-              # the whole link in a group so GNU ld rescans.
+              # the whole link in a group so GNU ld rescans. --end-group is
+              # appended to every link via STANDARD_LIBRARIES, so --start-group
+              # must open it for every link kind (exe + the plugin MODULE).
               -DCMAKE_EXE_LINKER_FLAGS=-Wl,--start-group
+              -DCMAKE_MODULE_LINKER_FLAGS=-Wl,--start-group
+              -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--start-group
               -DCMAKE_CXX_STANDARD_LIBRARIES=-Wl,--end-group
             )
           fi
