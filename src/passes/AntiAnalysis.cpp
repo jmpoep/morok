@@ -131,9 +131,15 @@ Value *loadAt(IRBuilderBase &B, Module &M, Type *Ty, Value *Base, Value *Offset,
     return loadUnaligned(B, Ty, gepI8(B, M, Base, Offset, Name + ".ptr"), Name);
 }
 
+// NB: the integer-offset parameter is `unsigned long long`, not std::uint64_t.
+// A `0ULL` argument is both a null-pointer constant and an integer literal; with
+// std::uint64_t (which is `unsigned long`, not `unsigned long long`, on LP64
+// Linux) the call is ambiguous between this overload and the Value* one. Using
+// `unsigned long long` makes `0ULL` an exact match on every platform.
 Value *loadAt(IRBuilderBase &B, Module &M, Type *Ty, Value *Base,
-              std::uint64_t Offset, const Twine &Name = "") {
-    return loadAt(B, M, Ty, Base, constIp(M, Offset), Name);
+              unsigned long long Offset, const Twine &Name = "") {
+    return loadAt(B, M, Ty, Base, constIp(M, static_cast<std::uint64_t>(Offset)),
+                  Name);
 }
 
 void incrementDiff(IRBuilderBase &B, AllocaInst *Diff, Value *Flag,
