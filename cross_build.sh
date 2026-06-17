@@ -151,11 +151,12 @@ else
   MOROK_CONFIG=(-mllvm "-morok-preset=$PRESET")
 fi
 
+# Obfuscation flags shared by every target, MINUS the preset/config selection
+# (which a target may need to override — see build_linux for static links).
 COMMON=(
   "$OPT_LEVEL" "${STD[@]}"
   -fpass-plugin="$PLUGIN"
   -mllvm -morok
-  "${MOROK_CONFIG[@]}"
   -mllvm "-morok-seed=$SEED"
   "$SRC"
 )
@@ -200,16 +201,32 @@ build_linux() {
   local arch="${LINUX_TARGET%%-*}"
   local static_flag=()
   local static_suffix=""
+  local morok_cfg=("${MOROK_CONFIG[@]}")
   if [ "$LINUX_STATIC" -eq 1 ]; then
     static_flag=(-static)
     static_suffix="-static"
+    # A static binary has no dynamic linker, so dlsym(RTLD_DEFAULT, …) returns
+    # null at runtime — the dlsym-based call obfuscation would then jump to a
+    # null pointer and crash at startup.  It also hides nothing for a static
+    # link (there is no dynamic import table).  Disable it via a derived config
+    # layered on the chosen preset/config.
+    local static_cfg="$OUT_DIR/.morok-static-$STEM.toml"
+    {
+      if [ -n "$CONFIG" ]; then
+        cat "$CONFIG"
+      else
+        printf '[global]\npreset = "%s"\n' "$PRESET"
+      fi
+      printf '\n[passes.function_call_obfuscate]\nenabled = false\n'
+    } >"$static_cfg"
+    morok_cfg=(-mllvm "-morok-config=$static_cfg")
   fi
 
   local out="$OUT_DIR/$STEM-linux-$arch$static_suffix"
   echo ">> linux $LINUX_TARGET -> $out"
   "$COMPILER" "--target=$LINUX_TARGET" "--sysroot=$sysroot" \
     "-B$tool_bin" "-B$gcc_lib_dir" "-B$crt_dir" "-L$gcc_lib_dir" \
-    "${static_flag[@]}" "${COMMON[@]}" -o "$out"
+    "${static_flag[@]}" "${morok_cfg[@]}" "${COMMON[@]}" -o "$out"
   strip_linux "$out"
   OUTPUTS+=("$out")
 }
@@ -255,7 +272,8 @@ build_macos() {
     local out="$OUT_DIR/$STEM-macos-$suffix"
     echo ">> macos $suffix -> $out"
     "$COMPILER" "${target_args[@]}" -isysroot "$sdk" \
-      -mmacosx-version-min="$MACOS_MIN" "${COMMON[@]}" -o "$out"
+      -mmacosx-version-min="$MACOS_MIN" "${MOROK_CONFIG[@]}" "${COMMON[@]}" \
+      -o "$out"
     strip_macos "$out"
     OUTPUTS+=("$out")
   done
