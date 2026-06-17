@@ -1005,6 +1005,14 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   memory and from the freshly mapped image.  Any MAC mismatch is folded into
   the same delayed anti-hook state, so mid-body patches are caught before the
   full byte scan reports segment drift.
+  On Linux, AntiHooking also walks the main ELF dynamic table's `DT_JMPREL`
+  PLT relocations at runtime, volatile-loads each GOT/PLT slot, and verifies the
+  resolved target lands inside an executable `PT_LOAD` segment from the main
+  image or a loader `link_map` module discovered through `DT_DEBUG`.  When the
+  binary advertises `BIND_NOW` and the slot lies in `PT_GNU_RELRO`, the checker
+  re-applies read-only protection to the slot page with an inline x86_64
+  `mprotect` syscall path; bad targets or failed reprotection are folded into
+  delayed anti-hook state.
 - TimingOracle emits a private constructor helper that samples several short
   volatile spans with two clock sources.  x86 targets use serialized `rdtscp`
   paired with a raw OS clock; Darwin targets use `mach_absolute_time` and

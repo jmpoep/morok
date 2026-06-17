@@ -8653,20 +8653,30 @@ define i32 @main() { ret i32 0 }
 
     Function *Clean = M->getFunction("morok.antihook.clean.elf");
     REQUIRE(Clean != nullptr);
+    Function *Got = M->getFunction("morok.antihook.got.plt");
+    REQUIRE(Got != nullptr);
+    Function *Rx = M->getFunction("morok.antihook.elf.rx");
+    REQUIRE(Rx != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.mac.targets", true) != nullptr);
     CHECK(hasInlineAsmCall(*Clean));
+    CHECK(hasInlineAsmCall(*Got));
     CHECK(M->getFunction("dlsym") != nullptr);
     CHECK(M->getFunction("readlink") == nullptr);
     CHECK(M->getFunction("open") == nullptr);
     CHECK(M->getFunction("lseek") == nullptr);
     CHECK(M->getFunction("mmap") == nullptr);
     CHECK(M->getFunction("munmap") == nullptr);
+    CHECK(M->getFunction("mprotect") == nullptr);
     CHECK(M->getFunction("close") == nullptr);
     CHECK(M->getFunction("syscall") == nullptr);
     CHECK(countNamedInstructions(*Clean, "morok.antihook.mac.mem.mix") >= 1u);
     CHECK(countNamedInstructions(*Clean, "morok.antihook.mac.file.mix") >=
           1u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.rel.offset") >= 1u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.mprotect") >= 1u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.rx") >= 1u);
+    CHECK(countNamedInstructions(*Rx, "morok.antihook.got.map.seg.hit") >= 1u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
                                  "morok.antihook.prologue.x86.hit") >= 1u);
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/exe"));
@@ -8689,6 +8699,7 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Clean != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.mac.targets", true) != nullptr);
+    CHECK(M->getFunction("morok.antihook.got.plt") == nullptr);
     CHECK(hasInlineAsmCall(*Clean));
     CHECK(M->getFunction("dlsym") == nullptr);
     CHECK(M->getFunction("open") == nullptr);

@@ -453,6 +453,15 @@ FunctionCallee munmapDecl(Module &M) {
                                  FunctionType::get(i32, {ptr, ip}, false));
 }
 
+FunctionCallee mprotectDecl(Module &M) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *ip = intPtrTy(M);
+    return M.getOrInsertFunction("mprotect",
+                                 FunctionType::get(i32, {ptr, ip, i32}, false));
+}
+
 bool linuxCleanCopySyscalls(const Triple &TT, std::uint32_t &Readlink,
                             std::uint32_t &Lseek, std::uint32_t &Mmap,
                             std::uint32_t &Munmap) {
@@ -545,6 +554,22 @@ void emitLinuxMunmap(IRBuilder<> &B, Module &M, const Triple &TT, Value *Addr,
     B.CreateCall(
         munmapDecl(M),
         {B.CreateIntToPtr(Addr, PointerType::getUnqual(M.getContext())), Size});
+}
+
+Value *emitLinuxMprotect(IRBuilder<> &B, Module &M, const Triple &TT,
+                         Value *Addr, Value *Size, Value *Prot) {
+    std::uint32_t mprotectNr = 0;
+    if (TT.getArch() == Triple::x86_64)
+        mprotectNr = 10;
+    if (useDirectLinuxSyscalls(TT) && mprotectNr != 0)
+        return B.CreateTruncOrBitCast(
+            emitLinuxSyscall(B, M, TT, mprotectNr, {Addr, Size, Prot}),
+            Type::getInt32Ty(M.getContext()));
+
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *ptr = PointerType::getUnqual(M.getContext());
+    return B.CreateCall(mprotectDecl(M), {B.CreateIntToPtr(Addr, ptr), Size,
+                                          B.CreateTruncOrBitCast(Prot, i32)});
 }
 
 void emitLinuxClose(IRBuilder<> &B, Module &M, const Triple &TT, Value *Fd) {
@@ -1944,6 +1969,508 @@ void emitFunctionMacLoop(IRBuilder<> &B, Module &M, Function *Fn,
     idx->addIncoming(next, nextBB);
 }
 
+Value *normalizeElfAddress(IRBuilderBase &B, Module &M, Value *Base,
+                           Value *Addr, const Twine &Name) {
+    auto *ip = intPtrTy(M);
+    Value *zero = ConstantInt::get(ip, 0);
+    Value *needsBias = B.CreateAnd(
+        B.CreateICmpNE(Addr, zero),
+        B.CreateAnd(B.CreateICmpNE(Base, zero), B.CreateICmpULT(Addr, Base)));
+    return B.CreateSelect(needsBias, B.CreateAdd(Base, Addr), Addr, Name);
+}
+
+Value *emitElfExecSegmentHit(IRBuilder<> &B, Module &M, Value *Target,
+                             Value *RuntimeBase, Value *PhPtr,
+                             const Twine &Name) {
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *ip = intPtrTy(M);
+    Value *pType = loadAt(B, M, i32, PhPtr, 0ULL, Name + ".type");
+    Value *pFlags = loadAt(B, M, i32, PhPtr, 4, Name + ".flags");
+    Value *pVaddr = loadAt(B, M, ip, PhPtr, 16, Name + ".vaddr");
+    Value *pMemsz = loadAt(B, M, ip, PhPtr, 40, Name + ".memsz");
+    Value *segStart = B.CreateAdd(RuntimeBase, pVaddr, Name + ".start");
+    Value *segEnd = B.CreateAdd(segStart, pMemsz, Name + ".end");
+    Value *isLoad =
+        B.CreateICmpEQ(pType, ConstantInt::get(i32, 1), Name + ".load");
+    Value *isExec =
+        B.CreateICmpNE(B.CreateAnd(pFlags, ConstantInt::get(i32, 1)),
+                       ConstantInt::get(i32, 0), Name + ".exec");
+    Value *hasBytes =
+        B.CreateICmpUGT(pMemsz, ConstantInt::get(ip, 0), Name + ".bytes");
+    Value *inRange =
+        B.CreateAnd(B.CreateICmpUGE(Target, segStart),
+                    B.CreateICmpULT(Target, segEnd), Name + ".range");
+    return B.CreateAnd(B.CreateAnd(isLoad, isExec),
+                       B.CreateAnd(hasBytes, inRange), Name + ".hit");
+}
+
+Function *linuxGotTargetInRx(Module &M) {
+    if (Function *existing = M.getFunction("morok.antihook.elf.rx"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+
+    auto *fn = Function::Create(
+        FunctionType::get(i32, {ip, ip, ip, ip, ip, ptr}, false),
+        GlobalValue::PrivateLinkage, "morok.antihook.elf.rx", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    auto *target = fn->getArg(0);
+    target->setName("target");
+    auto *atPhdr = fn->getArg(1);
+    atPhdr->setName("phdr");
+    auto *phNum = fn->getArg(2);
+    phNum->setName("phnum");
+    auto *phEnt = fn->getArg(3);
+    phEnt->setName("phent");
+    auto *selfBase = fn->getArg(4);
+    selfBase->setName("base");
+    auto *debug = fn->getArg(5);
+    debug->setName("debug");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *selfLoopBB = BasicBlock::Create(ctx, "self.loop", fn);
+    auto *selfBodyBB = BasicBlock::Create(ctx, "self.body", fn);
+    auto *selfNextBB = BasicBlock::Create(ctx, "self.next", fn);
+    auto *mapInitBB = BasicBlock::Create(ctx, "map.init", fn);
+    auto *mapFirstBB = BasicBlock::Create(ctx, "map.first", fn);
+    auto *mapLoopBB = BasicBlock::Create(ctx, "map.loop", fn);
+    auto *mapBodyBB = BasicBlock::Create(ctx, "map.body", fn);
+    auto *mapHeaderBB = BasicBlock::Create(ctx, "map.header", fn);
+    auto *mapPhInitBB = BasicBlock::Create(ctx, "map.ph.init", fn);
+    auto *mapPhLoopBB = BasicBlock::Create(ctx, "map.ph.loop", fn);
+    auto *mapPhBodyBB = BasicBlock::Create(ctx, "map.ph.body", fn);
+    auto *mapPhNextBB = BasicBlock::Create(ctx, "map.ph.next", fn);
+    auto *mapNextBB = BasicBlock::Create(ctx, "map.next", fn);
+    auto *ret1BB = BasicBlock::Create(ctx, "ret1", fn);
+    auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
+
+    IRBuilder<> EB(entry);
+    Value *hasSelfPhdr =
+        EB.CreateAnd(EB.CreateICmpNE(atPhdr, ConstantInt::get(ip, 0)),
+                     EB.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56)),
+                     "morok.antihook.got.self.phdr");
+    EB.CreateCondBr(hasSelfPhdr, selfLoopBB, mapInitBB);
+
+    IRBuilder<> SLB(selfLoopBB);
+    auto *selfIdx = SLB.CreatePHI(ip, 2, "morok.antihook.got.self.idx");
+    selfIdx->addIncoming(ConstantInt::get(ip, 0), entry);
+    Value *selfInRange =
+        SLB.CreateAnd(SLB.CreateICmpULT(selfIdx, phNum),
+                      SLB.CreateICmpULT(selfIdx, ConstantInt::get(ip, 128)));
+    SLB.CreateCondBr(selfInRange, selfBodyBB, mapInitBB);
+
+    IRBuilder<> SBB(selfBodyBB);
+    Value *selfPhPtr =
+        SBB.CreateIntToPtr(SBB.CreateAdd(atPhdr, SBB.CreateMul(selfIdx, phEnt)),
+                           ptr, "morok.antihook.got.self.ph");
+    SBB.CreateCondBr(emitElfExecSegmentHit(SBB, M, target, selfBase, selfPhPtr,
+                                           "morok.antihook.got.self.seg"),
+                     ret1BB, selfNextBB);
+
+    IRBuilder<> SNB(selfNextBB);
+    Value *selfNext = SNB.CreateAdd(selfIdx, ConstantInt::get(ip, 1),
+                                    "morok.antihook.got.self.next");
+    SNB.CreateBr(selfLoopBB);
+    selfIdx->addIncoming(selfNext, selfNextBB);
+
+    IRBuilder<> MIB(mapInitBB);
+    MIB.CreateCondBr(MIB.CreateICmpNE(debug, ConstantPointerNull::get(ptr)),
+                     mapFirstBB, ret0BB);
+
+    IRBuilder<> MFB(mapFirstBB);
+    Value *initialMap =
+        MFB.CreateLoad(ptr,
+                       gepI8(MFB, M, debug, ConstantInt::get(ip, 8),
+                             "morok.antihook.got.rdebug.map"),
+                       "morok.antihook.got.map.first");
+    MFB.CreateBr(mapLoopBB);
+
+    IRBuilder<> MLB(mapLoopBB);
+    auto *map = MLB.CreatePHI(ptr, 2, "morok.antihook.got.map");
+    auto *mapCount = MLB.CreatePHI(ip, 2, "morok.antihook.got.map.count");
+    map->addIncoming(initialMap, mapFirstBB);
+    mapCount->addIncoming(ConstantInt::get(ip, 0), mapFirstBB);
+    Value *mapActive =
+        MLB.CreateAnd(MLB.CreateICmpNE(map, ConstantPointerNull::get(ptr)),
+                      MLB.CreateICmpULT(mapCount, ConstantInt::get(ip, 64)),
+                      "morok.antihook.got.map.active");
+    MLB.CreateCondBr(mapActive, mapBodyBB, ret0BB);
+
+    IRBuilder<> MBB(mapBodyBB);
+    Value *mapBase =
+        loadAt(MBB, M, ip, map, 0ULL, "morok.antihook.got.map.base");
+    Value *nextMap = MBB.CreateLoad(ptr,
+                                    gepI8(MBB, M, map, ConstantInt::get(ip, 24),
+                                          "morok.antihook.got.map.next.ptr"),
+                                    "morok.antihook.got.map.next");
+    MBB.CreateCondBr(MBB.CreateICmpNE(mapBase, ConstantInt::get(ip, 0)),
+                     mapHeaderBB, mapNextBB);
+
+    IRBuilder<> MHB(mapHeaderBB);
+    Value *mapHdr =
+        MHB.CreateIntToPtr(mapBase, ptr, "morok.antihook.got.map.hdr");
+    Value *magic =
+        loadAt(MHB, M, i32, mapHdr, 0ULL, "morok.antihook.got.map.magic");
+    MHB.CreateCondBr(MHB.CreateICmpEQ(magic, ConstantInt::get(i32, 0x464C457F)),
+                     mapPhInitBB, mapNextBB);
+
+    IRBuilder<> MPIB(mapPhInitBB);
+    Value *mapPhOff =
+        loadAt(MPIB, M, i64, mapHdr, 32, "morok.antihook.got.map.phoff");
+    Value *mapPhEntRaw =
+        loadAt(MPIB, M, i16, mapHdr, 54, "morok.antihook.got.map.phentsize");
+    Value *mapPhNumRaw =
+        loadAt(MPIB, M, i16, mapHdr, 56, "morok.antihook.got.map.phnum");
+    Value *mapPhEnt =
+        MPIB.CreateZExt(mapPhEntRaw, ip, "morok.antihook.got.map.phent");
+    Value *mapPhNum =
+        MPIB.CreateZExt(mapPhNumRaw, ip, "morok.antihook.got.map.phnum.w");
+    Value *mapPhValid =
+        MPIB.CreateAnd(MPIB.CreateICmpUGE(mapPhEnt, ConstantInt::get(ip, 56)),
+                       MPIB.CreateICmpUGT(mapPhNum, ConstantInt::get(ip, 0)),
+                       "morok.antihook.got.map.ph.valid");
+    MPIB.CreateCondBr(mapPhValid, mapPhLoopBB, mapNextBB);
+
+    IRBuilder<> MPLB(mapPhLoopBB);
+    auto *mapPhIdx = MPLB.CreatePHI(ip, 2, "morok.antihook.got.map.ph.idx");
+    mapPhIdx->addIncoming(ConstantInt::get(ip, 0), mapPhInitBB);
+    Value *mapPhInRange =
+        MPLB.CreateAnd(MPLB.CreateICmpULT(mapPhIdx, mapPhNum),
+                       MPLB.CreateICmpULT(mapPhIdx, ConstantInt::get(ip, 128)));
+    MPLB.CreateCondBr(mapPhInRange, mapPhBodyBB, mapNextBB);
+
+    IRBuilder<> MPBB(mapPhBodyBB);
+    Value *mapPhPtr = MPBB.CreateIntToPtr(
+        MPBB.CreateAdd(
+            mapBase,
+            MPBB.CreateAdd(mapPhOff, MPBB.CreateMul(mapPhIdx, mapPhEnt))),
+        ptr, "morok.antihook.got.map.ph");
+    MPBB.CreateCondBr(emitElfExecSegmentHit(MPBB, M, target, mapBase, mapPhPtr,
+                                            "morok.antihook.got.map.seg"),
+                      ret1BB, mapPhNextBB);
+
+    IRBuilder<> MPNB(mapPhNextBB);
+    Value *mapPhNext = MPNB.CreateAdd(mapPhIdx, ConstantInt::get(ip, 1),
+                                      "morok.antihook.got.map.ph.next");
+    MPNB.CreateBr(mapPhLoopBB);
+    mapPhIdx->addIncoming(mapPhNext, mapPhNextBB);
+
+    IRBuilder<> MNB(mapNextBB);
+    Value *nextMapCount = MNB.CreateAdd(mapCount, ConstantInt::get(ip, 1),
+                                        "morok.antihook.got.map.count.next");
+    MNB.CreateBr(mapLoopBB);
+    map->addIncoming(nextMap, mapNextBB);
+    mapCount->addIncoming(nextMapCount, mapNextBB);
+
+    IRBuilder<> R1(ret1BB);
+    R1.CreateRet(ConstantInt::get(i32, 1));
+
+    IRBuilder<> R0(ret0BB);
+    R0.CreateRet(ConstantInt::get(i32, 0));
+    return fn;
+}
+
+Function *linuxGotPltProbe(Module &M, const Triple &TT) {
+    if (!TT.isOSLinux())
+        return nullptr;
+    if (intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.got.plt"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *rxCheck = linuxGotTargetInRx(M);
+
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.got.plt", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *phLoopBB = BasicBlock::Create(ctx, "ph.loop", fn);
+    auto *phBodyBB = BasicBlock::Create(ctx, "ph.body", fn);
+    auto *phNextBB = BasicBlock::Create(ctx, "ph.next", fn);
+    auto *dynPrepBB = BasicBlock::Create(ctx, "dyn.prep", fn);
+    auto *dynLoopBB = BasicBlock::Create(ctx, "dyn.loop", fn);
+    auto *dynBodyBB = BasicBlock::Create(ctx, "dyn.body", fn);
+    auto *dynNextBB = BasicBlock::Create(ctx, "dyn.next", fn);
+    auto *relPrepBB = BasicBlock::Create(ctx, "rel.prep", fn);
+    auto *relLoopBB = BasicBlock::Create(ctx, "rel.loop", fn);
+    auto *relBodyBB = BasicBlock::Create(ctx, "rel.body", fn);
+    auto *protectBB = BasicBlock::Create(ctx, "rel.protect", fn);
+    auto *relNextBB = BasicBlock::Create(ctx, "rel.next", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *diff = B.CreateAlloca(i64, nullptr, "morok.antihook.got.diff");
+    AllocaInst *baseSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.got.base");
+    AllocaInst *dynVaddrSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.got.dynamic.vaddr");
+    AllocaInst *relroVaddrSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.got.relro.vaddr");
+    AllocaInst *relroMemszSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.got.relro.memsz");
+    AllocaInst *jmpRelSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.got.jmprel");
+    AllocaInst *pltRelSzSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.got.pltrelsz");
+    AllocaInst *pltRelSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.got.pltrel");
+    AllocaInst *debugSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.got.debug");
+    AllocaInst *bindNowSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.got.bindnow");
+    AllocaInst *flagsSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.got.flags");
+    AllocaInst *flags1Slot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.got.flags1");
+    for (AllocaInst *slot :
+         {diff, baseSlot, dynVaddrSlot, relroVaddrSlot, relroMemszSlot,
+          jmpRelSlot, pltRelSzSlot, pltRelSlot, debugSlot, bindNowSlot,
+          flagsSlot, flags1Slot})
+        B.CreateStore(ConstantInt::get(ip, 0), slot);
+
+    FunctionCallee getauxval =
+        M.getOrInsertFunction("getauxval", FunctionType::get(ip, {ip}, false));
+    Value *atPhdr =
+        B.CreateCall(getauxval, {ConstantInt::get(ip, 3)}, "morok.got.atphdr");
+    Value *phEnt =
+        B.CreateCall(getauxval, {ConstantInt::get(ip, 4)}, "morok.got.phent");
+    Value *phNum =
+        B.CreateCall(getauxval, {ConstantInt::get(ip, 5)}, "morok.got.phnum");
+    Value *pageRaw =
+        B.CreateCall(getauxval, {ConstantInt::get(ip, 6)}, "morok.got.pagesz");
+    Value *pageSize = B.CreateSelect(
+        B.CreateICmpUGT(pageRaw, ConstantInt::get(ip, 0)), pageRaw,
+        ConstantInt::get(ip, 4096), "morok.antihook.got.pagesz");
+    Value *validPhdr = B.CreateAnd(
+        B.CreateICmpNE(atPhdr, ConstantInt::get(ip, 0)),
+        B.CreateAnd(B.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56)),
+                    B.CreateICmpUGT(phNum, ConstantInt::get(ip, 0))));
+    B.CreateCondBr(validPhdr, phLoopBB, retBB);
+
+    IRBuilder<> PLB(phLoopBB);
+    auto *phIdx = PLB.CreatePHI(ip, 2, "morok.antihook.got.ph.idx");
+    phIdx->addIncoming(ConstantInt::get(ip, 0), entry);
+    Value *phInRange =
+        PLB.CreateAnd(PLB.CreateICmpULT(phIdx, phNum),
+                      PLB.CreateICmpULT(phIdx, ConstantInt::get(ip, 128)));
+    PLB.CreateCondBr(phInRange, phBodyBB, dynPrepBB);
+
+    IRBuilder<> PBB(phBodyBB);
+    Value *phPtr =
+        PBB.CreateIntToPtr(PBB.CreateAdd(atPhdr, PBB.CreateMul(phIdx, phEnt)),
+                           ptr, "morok.antihook.got.ph.ptr");
+    Value *pType = loadAt(PBB, M, Type::getInt32Ty(ctx), phPtr, 0ULL,
+                          "morok.antihook.got.ph.type");
+    Value *pVaddr =
+        loadAt(PBB, M, ip, phPtr, 16, "morok.antihook.got.ph.vaddr");
+    Value *pMemsz =
+        loadAt(PBB, M, ip, phPtr, 40, "morok.antihook.got.ph.memsz");
+    Value *baseOld =
+        PBB.CreateLoad(ip, baseSlot, "morok.antihook.got.base.old");
+    Value *baseNew = PBB.CreateSelect(
+        PBB.CreateICmpEQ(pType, ConstantInt::get(Type::getInt32Ty(ctx), 6)),
+        PBB.CreateSub(atPhdr, pVaddr), baseOld, "morok.antihook.got.base.new");
+    PBB.CreateStore(baseNew, baseSlot);
+    Value *dynOld =
+        PBB.CreateLoad(ip, dynVaddrSlot, "morok.antihook.got.dynamic.old");
+    Value *dynNew = PBB.CreateSelect(
+        PBB.CreateICmpEQ(pType, ConstantInt::get(Type::getInt32Ty(ctx), 2)),
+        pVaddr, dynOld, "morok.antihook.got.dynamic.new");
+    PBB.CreateStore(dynNew, dynVaddrSlot);
+    Value *relroOld =
+        PBB.CreateLoad(ip, relroVaddrSlot, "morok.antihook.got.relro.old");
+    Value *relroMemszOld =
+        PBB.CreateLoad(ip, relroMemszSlot, "morok.antihook.got.relro.mem.old");
+    Value *isRelro = PBB.CreateICmpEQ(
+        pType, ConstantInt::get(Type::getInt32Ty(ctx), 0x6474E552));
+    PBB.CreateStore(PBB.CreateSelect(isRelro, pVaddr, relroOld),
+                    relroVaddrSlot);
+    PBB.CreateStore(PBB.CreateSelect(isRelro, pMemsz, relroMemszOld),
+                    relroMemszSlot);
+    PBB.CreateBr(phNextBB);
+
+    IRBuilder<> PNB(phNextBB);
+    Value *phNext = PNB.CreateAdd(phIdx, ConstantInt::get(ip, 1),
+                                  "morok.antihook.got.ph.next");
+    PNB.CreateBr(phLoopBB);
+    phIdx->addIncoming(phNext, phNextBB);
+
+    IRBuilder<> DPB(dynPrepBB);
+    Value *base = DPB.CreateLoad(ip, baseSlot, "morok.antihook.got.base.final");
+    Value *dynVaddr =
+        DPB.CreateLoad(ip, dynVaddrSlot, "morok.antihook.got.dynamic.final");
+    Value *dynAddr =
+        DPB.CreateAdd(base, dynVaddr, "morok.antihook.got.dynamic.addr");
+    DPB.CreateCondBr(DPB.CreateICmpNE(dynVaddr, ConstantInt::get(ip, 0)),
+                     dynLoopBB, retBB);
+
+    IRBuilder<> DLB(dynLoopBB);
+    auto *dynIdx = DLB.CreatePHI(ip, 2, "morok.antihook.got.dynamic.idx");
+    dynIdx->addIncoming(ConstantInt::get(ip, 0), dynPrepBB);
+    DLB.CreateCondBr(DLB.CreateICmpULT(dynIdx, ConstantInt::get(ip, 256)),
+                     dynBodyBB, relPrepBB);
+
+    IRBuilder<> DBB(dynBodyBB);
+    Value *dynPtr = DBB.CreateIntToPtr(
+        DBB.CreateAdd(dynAddr, DBB.CreateMul(dynIdx, ConstantInt::get(ip, 16))),
+        ptr, "morok.antihook.got.dynamic.ptr");
+    Value *tag = loadAt(DBB, M, i64, dynPtr, 0ULL, "morok.antihook.got.dtag");
+    Value *val = loadAt(DBB, M, i64, dynPtr, 8, "morok.antihook.got.dval");
+    auto storeIfTag = [&](AllocaInst *Slot, std::uint64_t Tag) {
+        Value *old = DBB.CreateLoad(ip, Slot);
+        DBB.CreateStore(
+            DBB.CreateSelect(DBB.CreateICmpEQ(tag, ConstantInt::get(i64, Tag)),
+                             val, old),
+            Slot);
+    };
+    storeIfTag(pltRelSzSlot, 2);        // DT_PLTRELSZ
+    storeIfTag(jmpRelSlot, 23);         // DT_JMPREL
+    storeIfTag(pltRelSlot, 20);         // DT_PLTREL
+    storeIfTag(debugSlot, 21);          // DT_DEBUG
+    storeIfTag(bindNowSlot, 24);        // DT_BIND_NOW
+    storeIfTag(flagsSlot, 30);          // DT_FLAGS
+    storeIfTag(flags1Slot, 0x6FFFFFFB); // DT_FLAGS_1
+    Value *bindNowOld = DBB.CreateLoad(ip, bindNowSlot);
+    DBB.CreateStore(
+        DBB.CreateSelect(DBB.CreateICmpEQ(tag, ConstantInt::get(i64, 24)),
+                         ConstantInt::get(ip, 1), bindNowOld),
+        bindNowSlot);
+    DBB.CreateCondBr(DBB.CreateICmpEQ(tag, ConstantInt::get(i64, 0)), relPrepBB,
+                     dynNextBB);
+
+    IRBuilder<> DNB(dynNextBB);
+    Value *dynNext = DNB.CreateAdd(dynIdx, ConstantInt::get(ip, 1),
+                                   "morok.antihook.got.dynamic.next");
+    DNB.CreateBr(dynLoopBB);
+    dynIdx->addIncoming(dynNext, dynNextBB);
+
+    IRBuilder<> RPB(relPrepBB);
+    Value *jmpRelRaw =
+        RPB.CreateLoad(ip, jmpRelSlot, "morok.antihook.got.jmprel.raw");
+    Value *jmpRel = normalizeElfAddress(RPB, M, base, jmpRelRaw,
+                                        "morok.antihook.got.jmprel.addr");
+    Value *pltRelSz =
+        RPB.CreateLoad(ip, pltRelSzSlot, "morok.antihook.got.pltrelsz.final");
+    Value *pltRel =
+        RPB.CreateLoad(ip, pltRelSlot, "morok.antihook.got.pltrel.final");
+    Value *debugRaw =
+        RPB.CreateLoad(ip, debugSlot, "morok.antihook.got.debug.raw");
+    Value *debugPtr =
+        RPB.CreateIntToPtr(debugRaw, ptr, "morok.antihook.got.debug.ptr");
+    Value *isRela = RPB.CreateICmpEQ(pltRel, ConstantInt::get(ip, 7),
+                                     "morok.antihook.got.rela");
+    Value *isRel = RPB.CreateICmpEQ(pltRel, ConstantInt::get(ip, 17),
+                                    "morok.antihook.got.rel");
+    Value *entrySize = RPB.CreateSelect(isRela, ConstantInt::get(ip, 24),
+                                        ConstantInt::get(ip, 16),
+                                        "morok.antihook.got.rel.ent");
+    Value *relCount =
+        RPB.CreateUDiv(pltRelSz, entrySize, "morok.antihook.got.rel.count");
+    Value *flags = RPB.CreateLoad(ip, flagsSlot, "morok.antihook.got.flags.v");
+    Value *flags1 =
+        RPB.CreateLoad(ip, flags1Slot, "morok.antihook.got.flags1.v");
+    Value *bindNow =
+        RPB.CreateLoad(ip, bindNowSlot, "morok.antihook.got.bindnow.v");
+    Value *hasNow = RPB.CreateOr(
+        RPB.CreateOr(
+            RPB.CreateICmpNE(bindNow, ConstantInt::get(ip, 0)),
+            RPB.CreateICmpNE(RPB.CreateAnd(flags, ConstantInt::get(ip, 8)),
+                             ConstantInt::get(ip, 0))),
+        RPB.CreateICmpNE(RPB.CreateAnd(flags1, ConstantInt::get(ip, 1)),
+                         ConstantInt::get(ip, 0)),
+        "morok.antihook.got.now");
+    Value *validRelocs = RPB.CreateAnd(
+        RPB.CreateICmpNE(jmpRelRaw, ConstantInt::get(ip, 0)),
+        RPB.CreateAnd(RPB.CreateICmpUGT(pltRelSz, ConstantInt::get(ip, 0)),
+                      RPB.CreateOr(isRela, isRel)),
+        "morok.antihook.got.valid");
+    RPB.CreateCondBr(validRelocs, relLoopBB, retBB);
+
+    IRBuilder<> RLB(relLoopBB);
+    auto *relIdx = RLB.CreatePHI(ip, 2, "morok.antihook.got.rel.idx");
+    relIdx->addIncoming(ConstantInt::get(ip, 0), relPrepBB);
+    Value *relInRange =
+        RLB.CreateAnd(RLB.CreateICmpULT(relIdx, relCount),
+                      RLB.CreateICmpULT(relIdx, ConstantInt::get(ip, 4096)));
+    RLB.CreateCondBr(relInRange, relBodyBB, retBB);
+
+    IRBuilder<> RBB(relBodyBB);
+    Value *relPtr = RBB.CreateIntToPtr(
+        RBB.CreateAdd(jmpRel, RBB.CreateMul(relIdx, entrySize)), ptr,
+        "morok.antihook.got.rel.ptr");
+    Value *relOff =
+        loadAt(RBB, M, i64, relPtr, 0ULL, "morok.antihook.got.rel.offset");
+    Value *slotAddr =
+        normalizeElfAddress(RBB, M, base, relOff, "morok.antihook.got.slot");
+    Value *slotPtr =
+        RBB.CreateIntToPtr(slotAddr, ptr, "morok.antihook.got.slot.ptr");
+    auto *targetPtr = RBB.CreateLoad(ptr, slotPtr, "morok.antihook.got.target");
+    targetPtr->setVolatile(true);
+    Value *targetAddr =
+        RBB.CreatePtrToInt(targetPtr, ip, "morok.antihook.got.target.addr");
+    Value *rxOk = RBB.CreateCall(
+        rxCheck, {targetAddr, atPhdr, phNum, phEnt, base, debugPtr},
+        "morok.antihook.got.rx");
+    incrementDiff(
+        RBB, diff,
+        RBB.CreateICmpEQ(rxOk, ConstantInt::get(Type::getInt32Ty(ctx), 0)),
+        "morok.antihook.got.violation");
+
+    Value *relroV =
+        RBB.CreateLoad(ip, relroVaddrSlot, "morok.antihook.got.relro.v");
+    Value *relroSize =
+        RBB.CreateLoad(ip, relroMemszSlot, "morok.antihook.got.relro.sz");
+    Value *relroStart =
+        RBB.CreateAdd(base, relroV, "morok.antihook.got.relro.start");
+    Value *relroEnd =
+        RBB.CreateAdd(relroStart, relroSize, "morok.antihook.got.relro.end");
+    Value *slotInRelro = RBB.CreateAnd(
+        RBB.CreateAnd(hasNow,
+                      RBB.CreateICmpNE(relroV, ConstantInt::get(ip, 0))),
+        RBB.CreateAnd(RBB.CreateICmpUGE(slotAddr, relroStart),
+                      RBB.CreateICmpULT(slotAddr, relroEnd)),
+        "morok.antihook.got.protect");
+    RBB.CreateCondBr(slotInRelro, protectBB, relNextBB);
+
+    IRBuilder<> PRB(protectBB);
+    Value *pageMask =
+        PRB.CreateNot(PRB.CreateSub(pageSize, ConstantInt::get(ip, 1)),
+                      "morok.antihook.got.page.mask");
+    Value *pageStart =
+        PRB.CreateAnd(slotAddr, pageMask, "morok.antihook.got.page");
+    Value *mprotectRc = emitLinuxMprotect(PRB, M, TT, pageStart, pageSize,
+                                          ConstantInt::get(ip, 1));
+    mprotectRc->setName("morok.antihook.got.mprotect");
+    incrementDiff(PRB, diff,
+                  PRB.CreateICmpSLT(mprotectRc, ConstantInt::getSigned(
+                                                    Type::getInt32Ty(ctx), 0)),
+                  "morok.antihook.got.mprotect.fail");
+    PRB.CreateBr(relNextBB);
+
+    IRBuilder<> RNB(relNextBB);
+    Value *relNext = RNB.CreateAdd(relIdx, ConstantInt::get(ip, 1),
+                                   "morok.antihook.got.rel.next");
+    RNB.CreateBr(relLoopBB);
+    relIdx->addIncoming(relNext, relNextBB);
+
+    IRBuilder<> RB(retBB);
+    emitRetDiff(RB, diff);
+    return fn;
+}
+
 void emitProloguePatternChecks(IRBuilder<> &B, Module &M, const Triple &TT,
                                GlobalVariable *State,
                                const std::vector<Function *> &Targets,
@@ -2477,6 +3004,13 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
                  B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0)),
                  0x48C3F3A9127DE40BULL, "morok.antihook.clean.changed");
         prologueTargets.push_back(clean);
+    }
+    if (Function *got = linuxGotPltProbe(M, tt)) {
+        Value *diff = B.CreateCall(got, {}, "morok.antihook.got.diff");
+        foldState(B, state, diff, 0xF93A8B7C62D514E1ULL, "morok.antihook.got");
+        foldFlag(B, state,
+                 B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0)),
+                 0xB17D4E23C9A5806FULL, "morok.antihook.got.changed");
     }
     emitProloguePatternChecks(B, M, tt, state, prologueTargets, rng);
 
