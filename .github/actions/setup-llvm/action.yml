@@ -180,3 +180,10 @@ runs:
         echo "$prefix/bin" >> "$GITHUB_PATH"
         echo "LLVM_DIR=${{ steps.vars.outputs.llvm_dir }}" >> "$GITHUB_ENV"
         "${{ steps.vars.outputs.clang }}" --version
+        echo "::group::ABI debug"
+        grep -H "define LLVM_ENABLE_ABI_BREAKING_CHECKS" "$prefix/include/llvm/Config/abi-breaking.h" 2>/dev/null || true
+        if [ "$RUNNER_OS" != "Windows" ] && command -v nm >/dev/null 2>&1; then
+          echo "TransformUtils DemoteRegToStack iterator type:"
+          nm -C "$prefix/lib/libLLVMTransformUtils.a" 2>/dev/null | grep "DemoteRegToStack" | grep -oE "ilist_iterator(_w_bits)?" | sort -u || echo "  (not found)"
+        fi
+        echo "::endgroup::"
