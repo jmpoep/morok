@@ -10721,6 +10721,54 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("windowsAntiAttachModule emits remote-breakin patch probes") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-pc-windows-msvc"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(7127);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::windowsAntiAttachModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.win.attach");
+    Function *Probe = M->getFunction("morok.win.attach.probe");
+    Function *PatchRet = M->getFunction("morok.win.attach.patch.ret");
+    Function *PatchRemote = M->getFunction("morok.win.attach.patch.remote");
+    Function *Invalid = M->getFunction("morok.win.attach.invalid");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Probe != nullptr);
+    REQUIRE(PatchRet != nullptr);
+    REQUIRE(PatchRemote != nullptr);
+    REQUIRE(Invalid != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
+    CHECK(M->getFunction("DbgUiRemoteBreakin") == nullptr);
+    CHECK(M->getFunction("DbgBreakPoint") == nullptr);
+    CHECK(M->getFunction("ExitProcess") == nullptr);
+    CHECK(M->getFunction("CloseHandle") == nullptr);
+    CHECK(M->getFunction("NtClose") == nullptr);
+    CHECK(countNamedInstructions(*Probe, "morok.win.attach.remote.breakin") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.attach.dbg.breakpoint") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.attach.ntprotect") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.patch.remote.status") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.attach.patch.ret.status") >=
+          1u);
+    CHECK(countNamedInstructions(*Invalid, "morok.win.attach.ntclose.invalid") >=
+          1u);
+    CHECK(countNamedInstructions(*Invalid,
+                                 "morok.win.attach.closehandle.invalid") >= 1u);
+    CHECK(countNamedInstructions(*PatchRet,
+                                 "morok.win.attach.patch.ret.protect") >= 1u);
+    CHECK(countNamedInstructions(*PatchRemote,
+                                 "morok.win.attach.patch.remote.protect") >=
+          1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("timingOracleModule emits x86 rdtscp and raw clock probes") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

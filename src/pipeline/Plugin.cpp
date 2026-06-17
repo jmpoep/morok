@@ -248,6 +248,10 @@ PassPluginLibraryInfo getPluginInfo() {
                             MPM.addPass(passes::WindowsThreadHidePass());
                             return true;
                         }
+                        if (name == "morok-winattach") {
+                            MPM.addPass(passes::WindowsAntiAttachPass());
+                            return true;
+                        }
                         if (name == "morok-timing") {
                             MPM.addPass(passes::TimingOraclePass());
                             return true;

@@ -9151,6 +9151,354 @@ Function *windowsThreadHideProbe(Module &M, GlobalVariable *State,
     return fn;
 }
 
+Function *windowsPatchRetHelper(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.attach.patch.ret"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i32, {ip, ip}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.attach.patch.ret", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *target = fn->getArg(0);
+    target->setName("target");
+    Argument *protect = fn->getArg(1);
+    protect->setName("protect");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *protectBB = BasicBlock::Create(ctx, "protect", fn);
+    auto *writeBB = BasicBlock::Create(ctx, "write", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *baseSlot = B.CreateAlloca(ip, nullptr, "morok.win.attach.base");
+    AllocaInst *sizeSlot = B.CreateAlloca(ip, nullptr, "morok.win.attach.size");
+    AllocaInst *oldProt =
+        B.CreateAlloca(i32, nullptr, "morok.win.attach.oldprot");
+    B.CreateCondBr(B.CreateAnd(B.CreateICmpNE(target, ConstantInt::get(ip, 0)),
+                               B.CreateICmpNE(protect, ConstantInt::get(ip, 0)),
+                               "morok.win.attach.patch.ret.ready"),
+                   protectBB, retBB);
+
+    IRBuilder<> PB(protectBB);
+    PB.CreateStore(target, baseSlot)->setVolatile(true);
+    PB.CreateStore(ConstantInt::get(ip, 1), sizeSlot)->setVolatile(true);
+    auto *protectTy = FunctionType::get(i32, {ptr, ptr, ptr, i32, ptr}, false);
+    Value *protectPtr =
+        PB.CreateIntToPtr(protect, ptr, "morok.win.attach.protect.ptr");
+    Value *status = PB.CreateCall(
+        protectTy, protectPtr,
+        {PB.CreateIntToPtr(ConstantInt::getSigned(ip, -1), ptr), baseSlot,
+         sizeSlot, ConstantInt::get(i32, 0x40), oldProt},
+        "morok.win.attach.patch.ret.protect");
+    PB.CreateCondBr(PB.CreateICmpSGE(status, ConstantInt::get(i32, 0),
+                                    "morok.win.attach.patch.ret.protect.ok"),
+                    writeBB, retBB);
+
+    IRBuilder<> WB(writeBB);
+    Value *targetPtr =
+        WB.CreateIntToPtr(target, ptr, "morok.win.attach.patch.ret.ptr");
+    storeAt(WB, M, targetPtr, 0, ConstantInt::get(i8, 0xC3),
+            "morok.win.attach.patch.ret.byte");
+    Value *oldProtValue =
+        WB.CreateLoad(i32, oldProt, "morok.win.attach.patch.ret.oldprot");
+    cast<LoadInst>(oldProtValue)->setVolatile(true);
+    WB.CreateStore(target, baseSlot)->setVolatile(true);
+    WB.CreateStore(ConstantInt::get(ip, 1), sizeSlot)->setVolatile(true);
+    Value *restore = WB.CreateCall(
+        protectTy, protectPtr,
+        {WB.CreateIntToPtr(ConstantInt::getSigned(ip, -1), ptr), baseSlot,
+         sizeSlot, oldProtValue, oldProt},
+        "morok.win.attach.patch.ret.restore");
+    WB.CreateBr(retBB);
+
+    IRBuilder<> RB(retBB);
+    auto *result = RB.CreatePHI(i32, 3, "morok.win.attach.patch.ret.result");
+    result->addIncoming(ConstantInt::getSigned(i32, -1), entry);
+    result->addIncoming(status, protectBB);
+    result->addIncoming(restore, writeBB);
+    RB.CreateRet(result);
+    return fn;
+}
+
+Function *windowsPatchRemoteBreakinHelper(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.attach.patch.remote"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i32, {ip, ip, ip}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.attach.patch.remote", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *target = fn->getArg(0);
+    target->setName("target");
+    Argument *exitProcess = fn->getArg(1);
+    exitProcess->setName("exit_process");
+    Argument *protect = fn->getArg(2);
+    protect->setName("protect");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *protectBB = BasicBlock::Create(ctx, "protect", fn);
+    auto *writeBB = BasicBlock::Create(ctx, "write", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *baseSlot = B.CreateAlloca(ip, nullptr, "morok.win.attach.base");
+    AllocaInst *sizeSlot = B.CreateAlloca(ip, nullptr, "morok.win.attach.size");
+    AllocaInst *oldProt =
+        B.CreateAlloca(i32, nullptr, "morok.win.attach.oldprot");
+    Value *ready = B.CreateAnd(
+        B.CreateICmpNE(target, ConstantInt::get(ip, 0)),
+        B.CreateAnd(B.CreateICmpNE(exitProcess, ConstantInt::get(ip, 0)),
+                    B.CreateICmpNE(protect, ConstantInt::get(ip, 0)),
+                    "morok.win.attach.patch.remote.funcs"),
+        "morok.win.attach.patch.remote.ready");
+    B.CreateCondBr(ready, protectBB, retBB);
+
+    IRBuilder<> PB(protectBB);
+    PB.CreateStore(target, baseSlot)->setVolatile(true);
+    PB.CreateStore(ConstantInt::get(ip, 19), sizeSlot)->setVolatile(true);
+    auto *protectTy = FunctionType::get(i32, {ptr, ptr, ptr, i32, ptr}, false);
+    Value *protectPtr =
+        PB.CreateIntToPtr(protect, ptr, "morok.win.attach.protect.ptr");
+    Value *status = PB.CreateCall(
+        protectTy, protectPtr,
+        {PB.CreateIntToPtr(ConstantInt::getSigned(ip, -1), ptr), baseSlot,
+         sizeSlot, ConstantInt::get(i32, 0x40), oldProt},
+        "morok.win.attach.patch.remote.protect");
+    PB.CreateCondBr(
+        PB.CreateICmpSGE(status, ConstantInt::get(i32, 0),
+                         "morok.win.attach.patch.remote.protect.ok"),
+        writeBB, retBB);
+
+    IRBuilder<> WB(writeBB);
+    Value *targetPtr =
+        WB.CreateIntToPtr(target, ptr, "morok.win.attach.patch.remote.ptr");
+    storeAt(WB, M, targetPtr, 0, ConstantInt::get(i8, 0x48),
+            "morok.win.attach.patch.remote.movrcx0");
+    storeAt(WB, M, targetPtr, 1, ConstantInt::get(i8, 0xC7),
+            "morok.win.attach.patch.remote.movrcx1");
+    storeAt(WB, M, targetPtr, 2, ConstantInt::get(i8, 0xC1),
+            "morok.win.attach.patch.remote.movrcx2");
+    storeAt(WB, M, targetPtr, 3, ConstantInt::get(i8, 0x01),
+            "morok.win.attach.patch.remote.exitcode");
+    storeAt(WB, M, targetPtr, 4, ConstantInt::get(i8, 0x00),
+            "morok.win.attach.patch.remote.exitcode.pad0");
+    storeAt(WB, M, targetPtr, 5, ConstantInt::get(i8, 0x00),
+            "morok.win.attach.patch.remote.exitcode.pad1");
+    storeAt(WB, M, targetPtr, 6, ConstantInt::get(i8, 0x00),
+            "morok.win.attach.patch.remote.exitcode.pad2");
+    storeAt(WB, M, targetPtr, 7, ConstantInt::get(i8, 0x48),
+            "morok.win.attach.patch.remote.movrax0");
+    storeAt(WB, M, targetPtr, 8, ConstantInt::get(i8, 0xB8),
+            "morok.win.attach.patch.remote.movrax1");
+    storeAt(WB, M, targetPtr, 9, exitProcess,
+            "morok.win.attach.patch.remote.exitprocess");
+    storeAt(WB, M, targetPtr, 17, ConstantInt::get(i8, 0xFF),
+            "morok.win.attach.patch.remote.jmp0");
+    storeAt(WB, M, targetPtr, 18, ConstantInt::get(i8, 0xE0),
+            "morok.win.attach.patch.remote.jmp1");
+    Value *oldProtValue =
+        WB.CreateLoad(i32, oldProt, "morok.win.attach.patch.remote.oldprot");
+    cast<LoadInst>(oldProtValue)->setVolatile(true);
+    WB.CreateStore(target, baseSlot)->setVolatile(true);
+    WB.CreateStore(ConstantInt::get(ip, 19), sizeSlot)->setVolatile(true);
+    Value *restore = WB.CreateCall(
+        protectTy, protectPtr,
+        {WB.CreateIntToPtr(ConstantInt::getSigned(ip, -1), ptr), baseSlot,
+         sizeSlot, oldProtValue, oldProt},
+        "morok.win.attach.patch.remote.restore");
+    WB.CreateBr(retBB);
+
+    IRBuilder<> RB(retBB);
+    auto *result =
+        RB.CreatePHI(i32, 3, "morok.win.attach.patch.remote.result");
+    result->addIncoming(ConstantInt::getSigned(i32, -1), entry);
+    result->addIncoming(status, protectBB);
+    result->addIncoming(restore, writeBB);
+    RB.CreateRet(result);
+    return fn;
+}
+
+Function *windowsInvalidHandleProbeHelper(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.attach.invalid"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, {ip, ip}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.attach.invalid", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *ntClose = fn->getArg(0);
+    ntClose->setName("ntclose");
+    Argument *closeHandle = fn->getArg(1);
+    closeHandle->setName("closehandle");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *ntBB = BasicBlock::Create(ctx, "ntclose", fn);
+    auto *closeGateBB = BasicBlock::Create(ctx, "close.gate", fn);
+    auto *closeBB = BasicBlock::Create(ctx, "closehandle", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *mix = B.CreateAlloca(i64, nullptr, "morok.win.attach.mix");
+    B.CreateStore(ConstantInt::get(i64, 0), mix)->setVolatile(true);
+    B.CreateCondBr(B.CreateICmpNE(ntClose, ConstantInt::get(ip, 0),
+                                  "morok.win.attach.ntclose.ready"),
+                   ntBB, closeGateBB);
+
+    IRBuilder<> NB(ntBB);
+    auto *closeTy = FunctionType::get(i32, {ptr}, false);
+    Value *ntStatus = NB.CreateCall(
+        closeTy, NB.CreateIntToPtr(ntClose, ptr, "morok.win.attach.ntclose.ptr"),
+        {NB.CreateIntToPtr(ConstantInt::get(ip, 0xDEADDEADULL), ptr)},
+        "morok.win.attach.ntclose.invalid");
+    NB.CreateStore(NB.CreateZExt(ntStatus, i64), mix)->setVolatile(true);
+    NB.CreateBr(closeGateBB);
+
+    IRBuilder<> GB(closeGateBB);
+    GB.CreateCondBr(GB.CreateICmpNE(closeHandle, ConstantInt::get(ip, 0),
+                                    "morok.win.attach.closehandle.ready"),
+                    closeBB, retBB);
+
+    IRBuilder<> CB(closeBB);
+    Value *oldMix =
+        CB.CreateLoad(i64, mix, "morok.win.attach.invalid.old");
+    cast<LoadInst>(oldMix)->setVolatile(true);
+    Value *closeResult = CB.CreateCall(
+        closeTy,
+        CB.CreateIntToPtr(closeHandle, ptr, "morok.win.attach.closehandle.ptr"),
+        {CB.CreateIntToPtr(ConstantInt::get(ip, 0xDEADFEEDULL), ptr)},
+        "morok.win.attach.closehandle.invalid");
+    Value *nextMix = CB.CreateXor(
+        oldMix, CB.CreateShl(CB.CreateZExt(closeResult, i64),
+                             ConstantInt::get(i64, 32)),
+        "morok.win.attach.invalid.next");
+    CB.CreateStore(nextMix, mix)->setVolatile(true);
+    CB.CreateBr(retBB);
+
+    IRBuilder<> RB(retBB);
+    Value *out = RB.CreateLoad(i64, mix, "morok.win.attach.invalid.result");
+    cast<LoadInst>(out)->setVolatile(true);
+    RB.CreateRet(out);
+    return fn;
+}
+
+Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
+                                 ir::IRRandom &rng, const Triple &TT) {
+    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
+        intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.win.attach.probe"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.attach.probe", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    Function *pebReader = windowsPebReader(M);
+    Function *moduleByHash = windowsLdrModuleByHash(M);
+    Function *resolver = windowsPeExportResolver(M);
+    Function *patchRet = windowsPatchRetHelper(M);
+    Function *patchRemote = windowsPatchRemoteBreakinHelper(M);
+    Function *invalidProbe = windowsInvalidHandleProbeHelper(M);
+    if (!pebReader || !moduleByHash || !resolver || !patchRet ||
+        !patchRemote || !invalidProbe)
+        return nullptr;
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *resolveBB = BasicBlock::Create(ctx, "resolve", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    Value *peb = B.CreateCall(pebReader, {}, "morok.win.attach.peb");
+    foldState(B, State, peb, rng.next(), "morok.win.attach.peb.mix");
+    B.CreateCondBr(B.CreateICmpNE(peb, ConstantInt::get(ip, 0),
+                                  "morok.win.attach.peb.present"),
+                   resolveBB, retBB);
+
+    IRBuilder<> RB(resolveBB);
+    Value *ntdll = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("ntdll.dll"))},
+        "morok.win.attach.ntdll");
+    Value *kernel32 = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("kernel32.dll"))},
+        "morok.win.attach.kernel32");
+    Value *remoteBreakin = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("DbgUiRemoteBreakin"))},
+        "morok.win.attach.remote.breakin");
+    Value *dbgBreak = RB.CreateCall(
+        resolver, {ntdll, ConstantInt::get(i64, fnv1aName("DbgBreakPoint"))},
+        "morok.win.attach.dbg.breakpoint");
+    Value *ntProtect = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtProtectVirtualMemory"))},
+        "morok.win.attach.ntprotect");
+    Value *ntClose = RB.CreateCall(
+        resolver, {ntdll, ConstantInt::get(i64, fnv1aName("NtClose"))},
+        "morok.win.attach.ntclose");
+    Value *exitProcess = RB.CreateCall(
+        resolver, {kernel32, ConstantInt::get(i64, fnv1aName("ExitProcess"))},
+        "morok.win.attach.exitprocess");
+    Value *closeHandle = RB.CreateCall(
+        resolver, {kernel32, ConstantInt::get(i64, fnv1aName("CloseHandle"))},
+        "morok.win.attach.closehandle");
+    foldState(RB, State, remoteBreakin, rng.next(),
+              "morok.win.attach.remote.breakin.mix");
+    foldState(RB, State, dbgBreak, rng.next(),
+              "morok.win.attach.dbg.breakpoint.mix");
+    Value *remoteStatus = RB.CreateCall(
+        patchRemote, {remoteBreakin, exitProcess, ntProtect},
+        "morok.win.attach.patch.remote.status");
+    Value *breakStatus = RB.CreateCall(
+        patchRet, {dbgBreak, ntProtect}, "morok.win.attach.patch.ret.status");
+    Value *invalid = RB.CreateCall(
+        invalidProbe, {ntClose, closeHandle}, "morok.win.attach.invalid.mix");
+    foldState(RB, State, remoteStatus, rng.next(),
+              "morok.win.attach.patch.remote.status.mix");
+    foldState(RB, State, breakStatus, rng.next(),
+              "morok.win.attach.patch.ret.status.mix");
+    foldState(RB, State, invalid, rng.next(),
+              "morok.win.attach.invalid.mix.state");
+    Value *patchFailed = RB.CreateOr(
+        RB.CreateICmpSLT(remoteStatus, ConstantInt::get(i32, 0),
+                         "morok.win.attach.patch.remote.failed"),
+        RB.CreateICmpSLT(breakStatus, ConstantInt::get(i32, 0),
+                         "morok.win.attach.patch.ret.failed"),
+        "morok.win.attach.patch.failed");
+    foldFlag(RB, State, patchFailed, 0xE57B1490C6A32D8FULL,
+             "morok.win.attach.patch.failed");
+    RB.CreateBr(retBB);
+
+    IRBuilder<> RetB(retBB);
+    RetB.CreateRetVoid();
+    return fn;
+}
+
 } // namespace
 
 bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
@@ -9637,6 +9985,21 @@ bool windowsThreadHideModule(Module &M, ir::IRRandom &rng) {
     return true;
 }
 
+bool windowsAntiAttachModule(Module &M, ir::IRRandom &rng) {
+    const Triple tt(M.getTargetTriple());
+    GlobalVariable *state = windowsPeState(M, rng);
+    Function *probe = windowsAntiAttachProbe(M, state, rng, tt);
+    if (!probe)
+        return false;
+
+    Function *ctor = makeCtorShell(M, "morok.win.attach");
+    IRBuilder<> B(&ctor->getEntryBlock());
+    B.CreateCall(probe);
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, ctor, 0);
+    return true;
+}
+
 PreservedAnalyses AntiDebuggingPass::run(Module &M, ModuleAnalysisManager &) {
     ir::IRRandom rng(engine_);
     return antiDebuggingModule(M, rng) ? PreservedAnalyses::none()
@@ -9677,6 +10040,13 @@ PreservedAnalyses WindowsThreadHidePass::run(Module &M,
                                              ModuleAnalysisManager &) {
     ir::IRRandom rng(engine_);
     return windowsThreadHideModule(M, rng) ? PreservedAnalyses::none()
+                                           : PreservedAnalyses::all();
+}
+
+PreservedAnalyses WindowsAntiAttachPass::run(Module &M,
+                                             ModuleAnalysisManager &) {
+    ir::IRRandom rng(engine_);
+    return windowsAntiAttachModule(M, rng) ? PreservedAnalyses::none()
                                            : PreservedAnalyses::all();
 }
 

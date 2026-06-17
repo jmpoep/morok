@@ -13,6 +13,7 @@
 //   • WindowsPebHeapDebug — samples Windows PEB/heap debug fields directly.
 //   • WindowsDebugObject — queries Windows debug port/object/flags by NT API.
 //   • WindowsThreadHide — applies ThreadHideFromDebugger to current threads.
+//   • WindowsAntiAttach — patches remote-breakin/debug-break stubs.
 //   • TimingOracle   — samples independent clocks around short spans.
 //   • TrapOracle     — checks whether SIGTRAP/int3-style traps reach the app.
 //   • PageFaultTlbOracle — samples protected-page fault delivery and latency.
@@ -80,6 +81,13 @@ bool windowsDebugObjectModule(llvm::Module &M, morok::ir::IRRandom &rng);
 /// thread, then queries the class back and folds failures into hidden state.
 /// Returns true if code was added.
 bool windowsThreadHideModule(llvm::Module &M, morok::ir::IRRandom &rng);
+
+/// Inject Windows x86_64 anti-attach patching.  The emitted startup probe
+/// resolves ntdll/kernel32 by PEB.Ldr and export hash, patches
+/// DbgUiRemoteBreakin to tail-jump ExitProcess, patches DbgBreakPoint to ret,
+/// and samples invalid-handle CloseHandle/NtClose behavior.  Returns true if
+/// code was added.
+bool windowsAntiAttachModule(llvm::Module &M, morok::ir::IRRandom &rng);
 
 /// Inject a runtime timing oracle.  The emitted helper samples independent
 /// clocks around short deterministic spans and folds distribution-level
@@ -183,6 +191,19 @@ class WindowsThreadHidePass
     : public llvm::PassInfoMixin<WindowsThreadHidePass> {
 public:
     explicit WindowsThreadHidePass(std::uint64_t seed = 0x71D1E11Du)
+        : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
+
+    llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
+    static bool isRequired() { return true; }
+
+private:
+    core::Xoshiro256pp engine_;
+};
+
+class WindowsAntiAttachPass
+    : public llvm::PassInfoMixin<WindowsAntiAttachPass> {
+public:
+    explicit WindowsAntiAttachPass(std::uint64_t seed = 0xA77A11CEu)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
