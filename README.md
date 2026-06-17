@@ -40,6 +40,9 @@ tests/{unit/core,unit/config,ir,e2e}/             test suites
 third_party/{doctest,tomlplusplus}/               vendored, pinned
 cmake/Morok{Warnings,LLVM,Test}.cmake             build policy modules
 docs/algorithms.md                                per-pass algorithm reference
+docs/hardness.md                                  hardness-backed primitive specs
+docs/{insurance,insurance-tasks}.md               protection catalog + backlog
+docs/roadmap.md                                   implementation roadmap
 ```
 
 ## Building
@@ -62,7 +65,8 @@ tests, config tests, the LLVM-linked per-pass IR tests, the `c -> clang
 ```sh
 ./run_tests.sh            # incremental build + everything
 ./run_tests.sh --clean    # wipe build/ and reconfigure first
-./run_tests.sh -L ir      # just one label (core/config/ir/e2e/programs/max)
+./run_tests.sh -R passes  # just one ctest name regex
+./run_tests.sh -L ir      # just one label (core/config/ir/e2e/programs/max/unit/aggregate)
 ```
 
 The pure layers (`morok::core`, `morok::config`) and their tests build even if
@@ -85,24 +89,47 @@ opt -load-pass-plugin … -passes=morok-constenc …
 ```
 
 Configuration can also come from a TOML file (`-morok-config=…`, `MOROK_CONFIG`),
-with `[global]`, `[passes.*]`, and ordered `[[policy]]` rules; see
-[`docs/algorithms.md`](docs/algorithms.md) and the config tests for the schema.
-Per-function `__attribute__((annotate("sub")))` / `annotate("nosub")` overrides
-are honoured.
+with `[global]`, `[passes.*]`, and ordered `[[policy]]` rules.  Presets form the
+base layer; file pass sections override only the fields they mention, and policy
+rules can then retune matching module/function regexes.
+
+```toml
+[global]
+preset = "high"
+seed = 0xDEADBEEF1337
+
+[passes.string_encryption]
+enabled = true
+probability = 100
+skip_content = ["Usage:"]
+
+[passes.chaos_state_machine]
+generator = "tfunction"
+
+[[policy]]
+function = "^main$"
+passes.bcf.enabled = false
+passes.substitution.enabled = false
+```
+
+The accepted pass-section names are the snake_case TOML names in
+[`src/config/TomlLoader.cpp`](src/config/TomlLoader.cpp); the standalone
+`-passes=morok-*` names are listed below.  Per-function
+`__attribute__((annotate("sub")))` / `annotate("nosub")` overrides are honoured.
 
 The scheduler has hard instruction/block/module budgets and skips growth passes
 once a function or module is too large.  The `high` preset is bounded-aggressive:
 it enables small capped slices of VM lifting, hash self-decrypt, DFI,
 self-checks, MQ, microcode stress, and call-site wrapping while keeping
-adversarial clone/merge tuning as explicit opt-ins.  The `max` preset turns
-*everything* on — every pass enabled, every probability at 100, every budget at
-its proven ceiling (including mutual-guard, adversarial merge/outline and
-self-tuning, plain flattening, and the runtime anti-analysis trio) — and is the
-strongest configuration the whole sample corpus still compiles under.  String
-encryption also has
-direct byte caps so large global literals do not expand into unbounded
-constructor IR.  Standalone growth-heavy passes have fixed local caps for table,
-CFG-route, and call-site collection.
+adversarial clone/merge tuning as explicit opt-ins.  The `max` preset enables
+the full preset-managed stack — every configured probability at 100, every
+budget at its proven ceiling, plus mutual-guard, adversarial merge/outline and
+self-tuning, plain flattening, timing/trap oracles, and the runtime
+anti-analysis trio — and is the strongest configuration the whole sample corpus
+still compiles under.  String encryption has direct byte caps so large global
+literals do not expand into unbounded site/constructor decryptor IR.  Standalone
+growth-heavy passes have fixed local caps for table, CFG-route, and call-site
+collection.
 
 ## Testing strategy
 
@@ -165,13 +192,17 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 | Shamir threshold sharing | `morok-shamir` | selected integer literals reconstructed from GF(2^8) threshold shares |
 | MQ opaque gate | `morok-mq` | planted GF(2) quadratic systems guarding input-derived branch sites |
 | Constant encryption | `morok-constenc` | literals split into XOR shares |
-| String encryption | `morok-strenc` | literals stored GF(2⁸)-encrypted, decrypted in a ctor |
+| String encryption | `morok-strenc` | private byte-array strings encrypted at rest, materialized at use sites when safe, otherwise via per-string constructor decryptors |
 | Indirect branch | `morok-indbr` | conditional/switch edges → randomized `indirectbr` table |
 | Function wrapper | `morok-funcwrap` | call/invoke sites, including variadic, routed through forwarder proxies |
 | Function-call obfuscate | `morok-fco` | external calls/invokes resolved via `dlsym`, the symbol name decrypted inline per-site (never a readable string) |
 | Anti-debugging | `morok-antidbg` | `ptrace`-based debugger denial at startup |
 | Anti-hooking | `morok-antihook` | startup check for resident hooking frameworks |
 | Anti-class-dump | `morok-antiacd` | scrambles Objective-C metadata (no-op without it) |
+| Timing oracle | `morok-timing` | samples independent clocks around short spans and folds anomalies into hidden state |
+| Trap oracle | `morok-trap` | installs a trap handler and checks whether trap delivery reaches the process |
+| Decoy strings | `morok-decoystr` | distributes bogus diagnostic/logging call sites across the module |
+| VTable integrity | `morok-vtable` | guards recognized C++ virtual dispatches against expected vptrs and slot targets |
 
 Every pass is exercised by an IR-validity test, and the value/control-flow
 passes are additionally proven semantics-preserving by the end-to-end
