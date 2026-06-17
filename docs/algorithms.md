@@ -1114,7 +1114,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   exception path rather than guessing platform-specific exception-context
   offsets.
 - AntiClassDump / AntiDebugging / AntiHooking / TimingOracle / TrapOracle /
-  PageFaultTlbOracle / CacheTimingOracle: platform anti-analysis
+  PageFaultTlbOracle / CacheTimingOracle / MicroarchitecturalCanary: platform
+  anti-analysis
   (module passes). AntiDebugging combines startup checks with a mutable hidden
   state word, platform-specific recheck helpers, pthread watchdogs where
   available, and once-gated randomized calls inserted into user functions so
@@ -1313,6 +1314,15 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   slow or divergent sample distributions into `morok.cachetime.state`, and does
   not branch to an immediate response because the signal is low-confidence and
   platform-noisy.
+- MicroarchitecturalCanary is an opt-in constructor for speculative side-effect
+  checks.  Each sample runs a small counted branch that is repeatedly taken,
+  perturbs a private eviction buffer before the branch, and places a volatile
+  canary-line read at the predicted target.  On the final not-taken iteration,
+  a normal core may transiently touch the canary line before recovering; DBI,
+  single-step, or speculation-constrained environments often alter that
+  side-effect/timing envelope.  The measured canary read latency is folded with
+  primary/secondary clocks into `morok.microcanary.state`; like the other
+  low-confidence timing signals, it never gates an immediate kill path.
 - Nanomites lower selected conditional branches to a volatile predicate
   materialization followed by a synchronous `SIGTRAP` site.  The original
   condition no longer controls a direct branch; a `sigaction` `SA_SIGINFO`
@@ -1362,6 +1372,6 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   they can clone or generate dense IR.
 
 ## Scheduler order (to preserve semantics)
-Virtualization(user) → HashSelfDecrypt → AntiHook → AntiClassDump → AntiDebug → TimingOracle → TrapOracle → PageFaultTlbOracle → CacheTimingOracle → StringEnc → FCO(fn) → VTableIntegrity → per-fn{ Split, BCF, OptAmp, Sub,
+Virtualization(user) → HashSelfDecrypt → AntiHook → AntiClassDump → AntiDebug → TimingOracle → TrapOracle → PageFaultTlbOracle → CacheTimingOracle → MicroarchitecturalCanary → StringEnc → FCO(fn) → VTableIntegrity → per-fn{ Split, BCF, OptAmp, Sub,
 MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare, ConstEnc, IndirectBranch } → ProtectionHelperVM → SensitiveHelperHardening → Nanomites → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
 MisleadingMetadata → FeatureElimination (strip debug/names) → cleanup marker decls.

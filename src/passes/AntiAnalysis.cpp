@@ -7568,6 +7568,214 @@ Function *cacheTimingProbe(Module &M, GlobalVariable *State,
     return fn;
 }
 
+GlobalVariable *microCanaryState(Module &M, ir::IRRandom &rng) {
+    if (auto *existing = M.getGlobalVariable("morok.microcanary.state",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i64, rng.next()), "morok.microcanary.state");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *microCanaryLine(Module &M) {
+    if (auto *existing = M.getGlobalVariable("morok.microcanary.line",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    auto *ty = ArrayType::get(i8, 128);
+    auto *gv = new GlobalVariable(M, ty, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantAggregateZero::get(ty),
+                                  "morok.microcanary.line");
+    gv->setAlignment(Align(64));
+    return gv;
+}
+
+GlobalVariable *microCanaryEviction(Module &M) {
+    if (auto *existing = M.getGlobalVariable("morok.microcanary.evict",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    auto *ty = ArrayType::get(i8, 32768);
+    auto *gv = new GlobalVariable(M, ty, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantAggregateZero::get(ty),
+                                  "morok.microcanary.evict");
+    gv->setAlignment(Align(64));
+    return gv;
+}
+
+Value *microCanaryPtr(IRBuilderBase &B, Module &M, GlobalVariable *GV,
+                      std::uint64_t Offset, const Twine &Name) {
+    return gepI8(B, M, GV, constIp(M, Offset), Name);
+}
+
+LoadInst *loadMicroCanaryByte(IRBuilderBase &B, Module &M, Value *Ptr,
+                              const Twine &Name) {
+    auto *LI = B.CreateLoad(Type::getInt8Ty(M.getContext()), Ptr, Name);
+    LI->setVolatile(true);
+    LI->setAlignment(Align(1));
+    return LI;
+}
+
+void emitMicroCanaryEviction(IRBuilder<> &B, Module &M, GlobalVariable *Evict,
+                             std::uint64_t Salt) {
+    constexpr std::uint64_t kEvictBytes = 32768;
+    for (unsigned i = 0; i < 64; ++i) {
+        std::uint64_t off = (Salt + 521ULL * i + 4099ULL * (i % 7)) %
+                            kEvictBytes;
+        loadMicroCanaryByte(
+            B, M, microCanaryPtr(B, M, Evict, off, "morok.microcanary.evict.ptr"),
+            "morok.microcanary.evict.byte");
+    }
+}
+
+struct MicroCanarySample {
+    Value *primaryDelta = nullptr;
+    Value *secondaryDelta = nullptr;
+    Value *measuredByte = nullptr;
+};
+
+MicroCanarySample emitMicroCanarySample(IRBuilder<> &B, Module &M,
+                                        Function *Fn, GlobalVariable *Line,
+                                        GlobalVariable *Evict,
+                                        const Triple &TT, ir::IRRandom &rng,
+                                        unsigned Sample) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    BasicBlock *preheader = B.GetInsertBlock();
+    auto *loopBB = BasicBlock::Create(ctx, "morok.microcanary.train", Fn);
+    auto *touchBB = BasicBlock::Create(ctx, "morok.microcanary.predicted", Fn);
+    auto *doneBB = BasicBlock::Create(ctx, "morok.microcanary.measure", Fn);
+
+    const std::uint64_t lineOff = (Sample * 17u) & 63u;
+    Value *linePtr = microCanaryPtr(B, M, Line, lineOff,
+                                    "morok.microcanary.line.ptr");
+    B.CreateBr(loopBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *idx = LB.CreatePHI(i32, 2, "morok.microcanary.train.idx");
+    idx->addIncoming(ConstantInt::get(i32, 0), preheader);
+    emitMicroCanaryEviction(LB, M, Evict, rng.next() ^ Sample);
+    Value *train = LB.CreateICmpULT(idx, ConstantInt::get(i32, 24),
+                                    "morok.microcanary.train.taken");
+    LB.CreateCondBr(train, touchBB, doneBB);
+
+    IRBuilder<> TB(touchBB);
+    LoadInst *specByte =
+        loadMicroCanaryByte(TB, M, linePtr, "morok.microcanary.spec.byte");
+    (void)specByte;
+    Value *next =
+        TB.CreateAdd(idx, ConstantInt::get(i32, 1),
+                     "morok.microcanary.train.next");
+    TB.CreateBr(loopBB);
+    idx->addIncoming(next, touchBB);
+
+    IRBuilder<> DB(doneBB);
+    Value *primaryStart =
+        emitTimingPrimaryClock(DB, M, TT, "morok.microcanary.primary.start");
+    Value *secondaryStart =
+        emitTimingSecondaryClock(DB, M, TT,
+                                 "morok.microcanary.secondary.start");
+    LoadInst *measured =
+        loadMicroCanaryByte(DB, M, linePtr, "morok.microcanary.measure.byte");
+    Value *primaryEnd =
+        emitTimingPrimaryClock(DB, M, TT, "morok.microcanary.primary.end");
+    Value *secondaryEnd =
+        emitTimingSecondaryClock(DB, M, TT, "morok.microcanary.secondary.end");
+
+    MicroCanarySample out;
+    out.primaryDelta =
+        DB.CreateSub(primaryEnd, primaryStart,
+                     "morok.microcanary.primary.delta");
+    out.secondaryDelta =
+        DB.CreateSub(secondaryEnd, secondaryStart,
+                     "morok.microcanary.secondary.delta");
+    out.measuredByte = DB.CreateZExt(measured, Type::getInt64Ty(ctx),
+                                     "morok.microcanary.byte.wide");
+    B.SetInsertPoint(doneBB);
+    return out;
+}
+
+Function *microarchitecturalCanaryProbe(Module &M, GlobalVariable *State,
+                                        ir::IRRandom &rng, const Triple &TT) {
+    if (Function *existing = M.getFunction("morok.microcanary.oracle"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.microcanary.oracle", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    GlobalVariable *line = microCanaryLine(M);
+    GlobalVariable *evict = microCanaryEviction(M);
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    Value *badSamples = ConstantInt::get(i32, 0);
+    Value *divergentSamples = ConstantInt::get(i32, 0);
+    Value *mix = ConstantInt::get(i64, rng.next());
+    const bool hasCycleClock = isX86Target(TT);
+    const std::uint64_t primaryThreshold =
+        hasCycleClock ? 10000ULL : 5000000ULL;
+    constexpr std::uint64_t secondaryThreshold = 1000000ULL;
+
+    for (unsigned sample = 0; sample < 4; ++sample) {
+        MicroCanarySample s =
+            emitMicroCanarySample(B, M, fn, line, evict, TT, rng, sample);
+        Value *primarySlow =
+            B.CreateICmpUGT(s.primaryDelta,
+                            ConstantInt::get(i64, primaryThreshold),
+                            "morok.microcanary.primary.slow");
+        Value *secondarySlow =
+            B.CreateICmpUGT(s.secondaryDelta,
+                            ConstantInt::get(i64, secondaryThreshold),
+                            "morok.microcanary.secondary.slow");
+        Value *sampleSlow = B.CreateOr(primarySlow, secondarySlow,
+                                       "morok.microcanary.sample.slow");
+        Value *sampleDiverged =
+            B.CreateXor(primarySlow, secondarySlow,
+                        "morok.microcanary.sample.diverged");
+        badSamples =
+            B.CreateAdd(badSamples, B.CreateZExt(sampleSlow, i32),
+                        "morok.microcanary.bad.n");
+        divergentSamples =
+            B.CreateAdd(divergentSamples, B.CreateZExt(sampleDiverged, i32),
+                        "morok.microcanary.divergent.n");
+        mix = B.CreateXor(
+            B.CreateAdd(mix,
+                        B.CreateMul(s.primaryDelta,
+                                    ConstantInt::get(i64, rng.next() | 1ULL))),
+            B.CreateXor(
+                s.measuredByte,
+                B.CreateMul(s.secondaryDelta,
+                            ConstantInt::get(i64, rng.next() | 1ULL))),
+            "morok.microcanary.mix");
+    }
+
+    foldState(B, State, mix, 0xC9E1A47D328B506FULL,
+              "morok.microcanary.mix");
+    foldState(B, State, badSamples, 0x716D3C89E502A4BFULL,
+              "morok.microcanary.bad.samples");
+    foldState(B, State, divergentSamples, 0x4F2B95A71C0E6D38ULL,
+              "morok.microcanary.divergent.samples");
+    foldFlag(B, State,
+             B.CreateICmpUGE(badSamples, ConstantInt::get(i32, 2)),
+             0xA5B0E176D83429CFULL, "morok.microcanary.bad.distribution");
+    foldFlag(B, State,
+             B.CreateICmpUGE(divergentSamples, ConstantInt::get(i32, 2)),
+             0x2D78C4B50FA691E3ULL,
+             "morok.microcanary.divergent.distribution");
+    B.CreateRetVoid();
+    return fn;
+}
+
 } // namespace
 
 bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
@@ -7711,6 +7919,21 @@ bool cacheTimingOracleModule(Module &M, ir::IRRandom &rng) {
         return false;
 
     Function *ctor = makeCtorShell(M, "morok.cachetime");
+    IRBuilder<> B(&ctor->getEntryBlock());
+    B.CreateCall(oracle);
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, ctor, 0);
+    return true;
+}
+
+bool microarchitecturalCanaryModule(Module &M, ir::IRRandom &rng) {
+    const Triple tt(M.getTargetTriple());
+    GlobalVariable *state = microCanaryState(M, rng);
+    Function *oracle = microarchitecturalCanaryProbe(M, state, rng, tt);
+    if (!oracle)
+        return false;
+
+    Function *ctor = makeCtorShell(M, "morok.microcanary");
     IRBuilder<> B(&ctor->getEntryBlock());
     B.CreateCall(oracle);
     B.CreateRetVoid();
@@ -8018,6 +8241,13 @@ PreservedAnalyses CacheTimingOraclePass::run(Module &M,
     ir::IRRandom rng(engine_);
     return cacheTimingOracleModule(M, rng) ? PreservedAnalyses::none()
                                            : PreservedAnalyses::all();
+}
+
+PreservedAnalyses MicroarchitecturalCanaryPass::run(
+    Module &M, ModuleAnalysisManager &) {
+    ir::IRRandom rng(engine_);
+    return microarchitecturalCanaryModule(M, rng) ? PreservedAnalyses::none()
+                                                  : PreservedAnalyses::all();
 }
 
 } // namespace morok::passes

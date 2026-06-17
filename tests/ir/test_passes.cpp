@@ -10745,6 +10745,58 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("microarchitecturalCanaryModule emits x86 speculative canary") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(891);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::microarchitecturalCanaryModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.microcanary");
+    Function *Oracle = M->getFunction("morok.microcanary.oracle");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Oracle != nullptr);
+    CHECK(M->getGlobalVariable("morok.microcanary.state", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.microcanary.line", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.microcanary.evict", true) != nullptr);
+    CHECK(M->getFunction("clock_gettime") != nullptr);
+    CHECK(hasInlineAsmCall(*Oracle));
+    CHECK(countNamedInstructions(*Oracle, "morok.microcanary.train.idx") >=
+          1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.microcanary.spec.byte") >=
+          1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.microcanary.measure.byte") >=
+          1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("microarchitecturalCanaryModule emits Darwin mach canary") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "arm64-apple-macosx13.0.0"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(892);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::microarchitecturalCanaryModule(*M, rng));
+
+    Function *Oracle = M->getFunction("morok.microcanary.oracle");
+    REQUIRE(Oracle != nullptr);
+    CHECK(M->getFunction("mach_absolute_time") != nullptr);
+    CHECK(M->getFunction("clock_gettime") != nullptr);
+    CHECK_FALSE(hasInlineAsmCall(*Oracle));
+    CHECK(countNamedInstructions(*Oracle, "morok.microcanary.sample.slow") >=
+          1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.microcanary.evict.byte") >=
+          1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("nanomitesModule lowers conditional branches to trap-mediated "
           "indirectbr") {
     LLVMContext ctx;

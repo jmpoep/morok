@@ -371,6 +371,7 @@ struct PassConfig {
     ToggleConfig trap_oracles;
     ToggleConfig page_fault_oracles;
     ToggleConfig cache_timing_oracles;
+    ToggleConfig microarchitectural_canaries;
     ToggleConfig decoy_strings;
     ToggleConfig vtable_integrity;
 
