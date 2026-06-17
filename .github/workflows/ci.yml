@@ -1,8 +1,8 @@
 name: CI
 
-# Build + test the Morok LLVM-IR obfuscator against the official prebuilt LLVM
-# release toolchain on every platform, and publish per-platform release archives
-# for tags.
+# Build + test the Morok LLVM-IR obfuscator against upstream LLVM trunk (built
+# from source, aggressively cached) on every platform, and publish per-platform
+# release archives for tags.
 on:
   push:
     branches: [master]
@@ -20,26 +20,28 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Single source of truth for the pinned LLVM release version.
+  # Single source of truth for the pinned LLVM trunk commit.
   prep:
     runs-on: ubuntu-latest
     outputs:
-      llvm_version: ${{ steps.read.outputs.version }}
+      llvm_ref: ${{ steps.read.outputs.ref }}
     steps:
       - uses: actions/checkout@v4
       - id: read
         shell: bash
         run: |
           set -euo pipefail
-          source .github/llvm-version.env
-          echo "version=${LLVM_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Pinned LLVM release: ${LLVM_VERSION}"
+          source .github/llvm-trunk.env
+          echo "ref=${LLVM_REF}" >> "$GITHUB_OUTPUT"
+          echo "Pinned LLVM trunk: ${LLVM_REF}"
 
   build:
     needs: prep
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # The matrix runs all four platforms in parallel; within a job the LLVM build
+    # uses every core. Cold builds are long; cached runs are minutes.
+    timeout-minutes: 360
     permissions:
       contents: write # attach archives to the release on tags
     strategy:
@@ -53,11 +55,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Ninja (Linux)
+      - name: Install build prerequisites (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ninja-build
+          sudo apt-get install -y --no-install-recommends ninja-build clang lld
 
       - name: Install CMake + Ninja
         if: runner.os != 'Linux'
@@ -69,44 +71,73 @@ jobs:
         with:
           arch: x64
 
-      - name: Setup LLVM (prebuilt)
+      - name: Install sccache
+        uses: mozilla/sccache-action@v0.0.6
+
+      - name: Configure sccache (local disk)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The GitHub Actions cache *backend* for sccache is unreliable, so use a
+          # local-disk cache persisted by actions/cache instead. Stop any server
+          # the install action may have started bound to the GHA backend.
+          sccache --stop-server >/dev/null 2>&1 || true
+          dir="${RUNNER_TEMP//\\//}/sccache"
+          mkdir -p "$dir"
+          echo "SCCACHE_DIR=$dir" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
+          echo "SCCACHE_CACHE_SIZE=3G" >> "$GITHUB_ENV"
+
+      - name: Restore sccache cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ needs.prep.outputs.llvm_ref }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ runner.arch }}-${{ needs.prep.outputs.llvm_ref }}-
+            sccache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Setup LLVM trunk
         id: llvm
         uses: ./.github/actions/setup-llvm
         with:
-          llvm-version: ${{ needs.prep.outputs.llvm_version }}
+          llvm-ref: ${{ needs.prep.outputs.llvm_ref }}
 
       - name: Configure Morok
         shell: bash
         env:
-          LLVM_PREFIX: ${{ steps.llvm.outputs.install-prefix }}
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
         run: |
           set -euo pipefail
-          # The prebuilt LLVM static libs are built against the toolchain's own
-          # libc++; on Linux we must compile + link Morok with that same libc++
-          # (the runner's default libstdc++ headers are not even found by the
-          # relocated clang). The toolchain libc++ is self-contained there, so no
-          # system-libc++ ABI conflict arises (unlike macOS).
-          args=(
-            -S . -B build -G Ninja
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo
-            -DCMAKE_C_COMPILER="${{ steps.llvm.outputs.clang }}"
-            -DCMAKE_CXX_COMPILER="${{ steps.llvm.outputs.clangxx }}"
-            -DLLVM_DIR="${{ steps.llvm.outputs.llvm-dir }}"
-          )
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            ld="-stdlib=libc++ -L${LLVM_PREFIX}/lib -Wl,-rpath,${LLVM_PREFIX}/lib"
-            args+=(
-              -DCMAKE_CXX_FLAGS=-stdlib=libc++
-              -DCMAKE_EXE_LINKER_FLAGS="$ld"
-              -DCMAKE_SHARED_LINKER_FLAGS="$ld"
-              -DCMAKE_MODULE_LINKER_FLAGS="$ld"
-            )
-          fi
-          cmake "${args[@]}"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER="${{ steps.llvm.outputs.clang }}" \
+            -DCMAKE_CXX_COMPILER="${{ steps.llvm.outputs.clangxx }}" \
+            -DLLVM_DIR="${{ steps.llvm.outputs.llvm-dir }}" \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
       - name: Build Morok
         shell: bash
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
         run: cmake --build build --parallel
+
+      # Explicit save after all compilation so the object cache is uploaded even
+      # if the tests below fail.
+      - name: Save sccache cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ needs.prep.outputs.llvm_ref }}-${{ github.run_id }}
+
+      - name: sccache stats
+        if: always()
+        shell: bash
+        run: sccache --show-stats || true
 
       - name: Run tests
         shell: bash
@@ -127,8 +158,7 @@ jobs:
 
           if [ "$RUNNER_OS" = "Windows" ]; then
             # No loadable plugin on Windows (see src/pipeline/CMakeLists.txt):
-            # ship the static obfuscator libraries + public headers so Morok can
-            # be embedded into a host LLVM tool.
+            # ship the static obfuscator libraries + public headers.
             mkdir -p "dist/$stage/lib" "dist/$stage/include"
             found=0
             while IFS= read -r lib; do

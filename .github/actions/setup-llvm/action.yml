@@ -1,131 +1,164 @@
-name: "Setup LLVM (prebuilt release)"
+name: "Setup LLVM trunk (source build)"
 description: >
-  Download, verify (sha256), extract and expose an official prebuilt LLVM
-  release toolchain — clang, opt, the CMake package, headers and static libs —
-  for the current platform. The downloaded archive is cached by version so
-  repeat runs skip the (already fast) download entirely.
+  Restore, or build-from-source + explicitly cache, an upstream LLVM trunk
+  toolchain (clang + opt + the cmake package + headers + static libs) pinned to a
+  commit. The install directory is cached keyed by the commit SHA and saved by an
+  explicit cache step immediately after the build, so a successful (expensive)
+  LLVM build is preserved even if later job steps fail. sccache (configured by the
+  caller) makes the rare cold/bumped rebuild incremental.
 
 inputs:
-  llvm-version:
-    description: "LLVM release version, i.e. the llvmorg-<version> tag (e.g. 22.1.8)."
+  llvm-ref:
+    description: "Upstream llvm/llvm-project commit SHA to build."
     required: true
   cache-version:
-    description: "Bump to invalidate every cached LLVM archive."
+    description: "Bump to invalidate every LLVM install cache (recipe changes)."
     required: false
-    default: "v1"
+    default: "v2"
 
 outputs:
   install-prefix:
-    description: "Absolute path to the extracted LLVM toolchain."
+    description: "Absolute path to the LLVM install prefix."
     value: ${{ steps.vars.outputs.prefix }}
   llvm-dir:
     description: "Path to lib/cmake/llvm (for -DLLVM_DIR)."
     value: ${{ steps.vars.outputs.llvm_dir }}
   clang:
-    description: "Path to the clang driver."
+    description: "Path to the built clang driver."
     value: ${{ steps.vars.outputs.clang }}
   clangxx:
-    description: "Path to the clang++ driver."
+    description: "Path to the built clang++ driver."
     value: ${{ steps.vars.outputs.clangxx }}
   cache-hit:
-    description: "Whether the LLVM archive was restored from cache."
-    value: ${{ steps.cache.outputs.cache-hit }}
+    description: "Whether the LLVM install was restored from cache."
+    value: ${{ steps.restore.outputs.cache-hit }}
 
 runs:
   using: composite
   steps:
-    - name: Resolve asset + paths
+    - name: Resolve paths
       id: vars
       shell: bash
       run: |
         set -euo pipefail
-        ver="${{ inputs.llvm-version }}"
-        prefix="${RUNNER_TEMP//\\//}/llvm"
-        tarball="${RUNNER_TEMP//\\//}/llvm-${ver}.tar.xz"
-        case "${RUNNER_OS}-${RUNNER_ARCH}" in
-          Linux-X64)   asset="LLVM-${ver}-Linux-X64.tar.xz" ;;
-          Linux-ARM64) asset="LLVM-${ver}-Linux-ARM64.tar.xz" ;;
-          macOS-ARM64) asset="LLVM-${ver}-macOS-ARM64.tar.xz" ;;
-          Windows-X64) asset="clang+llvm-${ver}-x86_64-pc-windows-msvc.tar.xz" ;;
-          *) echo "::error::no prebuilt LLVM mapping for ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
-        esac
-        {
-          echo "prefix=$prefix"
-          echo "tarball=$tarball"
-          echo "asset=$asset"
-          echo "llvm_dir=$prefix/lib/cmake/llvm"
-        } >> "$GITHUB_OUTPUT"
+        prefix="${RUNNER_TEMP//\\//}/llvm-install"
+        echo "prefix=$prefix"                  >> "$GITHUB_OUTPUT"
+        echo "llvm_dir=$prefix/lib/cmake/llvm"  >> "$GITHUB_OUTPUT"
         if [ "$RUNNER_OS" = "Windows" ]; then
-          echo "clang=$prefix/bin/clang.exe"    >> "$GITHUB_OUTPUT"
-          echo "clangxx=$prefix/bin/clang++.exe" >> "$GITHUB_OUTPUT"
+          echo "clang=$prefix/bin/clang.exe"     >> "$GITHUB_OUTPUT"
+          echo "clangxx=$prefix/bin/clang++.exe"  >> "$GITHUB_OUTPUT"
         else
-          echo "clang=$prefix/bin/clang"    >> "$GITHUB_OUTPUT"
-          echo "clangxx=$prefix/bin/clang++" >> "$GITHUB_OUTPUT"
+          echo "clang=$prefix/bin/clang"          >> "$GITHUB_OUTPUT"
+          echo "clangxx=$prefix/bin/clang++"      >> "$GITHUB_OUTPUT"
         fi
 
-    - name: Cache LLVM archive
-      id: cache
-      uses: actions/cache@v4
+    - name: Restore LLVM install cache
+      id: restore
+      uses: actions/cache/restore@v4
       with:
-        path: ${{ steps.vars.outputs.tarball }}
-        key: llvm-prebuilt-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-version }}-${{ inputs.llvm-version }}
+        path: ${{ steps.vars.outputs.prefix }}
+        key: llvm-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-version }}-${{ inputs.llvm-ref }}
 
-    - name: Download + verify LLVM (cache miss)
-      if: steps.cache.outputs.cache-hit != 'true'
+    - name: Build + install LLVM trunk (cache miss)
+      if: steps.restore.outputs.cache-hit != 'true'
       shell: bash
       env:
-        GH_TOKEN: ${{ github.token }}
-        VER: ${{ inputs.llvm-version }}
-        ASSET: ${{ steps.vars.outputs.asset }}
-        TARBALL: ${{ steps.vars.outputs.tarball }}
-      run: |
-        set -euo pipefail
-        # Authoritative sha256 straight from the release asset metadata.
-        digest="$(gh api "repos/llvm/llvm-project/releases/tags/llvmorg-${VER}" \
-          --jq ".assets[] | select(.name==\"${ASSET}\") | .digest" || true)"
-        digest="${digest#sha256:}"
-        if [ -z "$digest" ]; then
-          echo "::error::could not resolve sha256 digest for ${ASSET} (llvmorg-${VER})"; exit 1
-        fi
-        url="https://github.com/llvm/llvm-project/releases/download/llvmorg-${VER}/${ASSET}"
-        echo "Downloading ${url}"
-        curl -fSL --retry 5 --retry-delay 5 -o "$TARBALL" "$url"
-        echo "Verifying sha256 ${digest}"
-        if command -v sha256sum >/dev/null 2>&1; then
-          echo "${digest}  ${TARBALL}" | sha256sum -c -
-        else
-          echo "${digest}  ${TARBALL}" | shasum -a 256 -c -
-        fi
-
-    - name: Extract LLVM
-      shell: bash
-      env:
+        LLVM_REF: ${{ inputs.llvm-ref }}
         PREFIX: ${{ steps.vars.outputs.prefix }}
-        TARBALL: ${{ steps.vars.outputs.tarball }}
+        CMAKE_C_COMPILER_LAUNCHER: sccache
+        CMAKE_CXX_COMPILER_LAUNCHER: sccache
       run: |
         set -euo pipefail
-        rm -rf "$PREFIX"
-        mkdir -p "$PREFIX"
-        # Every release archive nests everything under a single top directory.
+        SRC="${RUNNER_TEMP//\\//}/llvm-project"
+        BUILD="${RUNNER_TEMP//\\//}/llvm-build"
+
+        echo "::group::Fetch llvm-project @ ${LLVM_REF}"
+        rm -rf "$SRC" "$BUILD"
+        mkdir -p "$SRC"
+        git -C "$SRC" init -q
+        git -C "$SRC" remote add origin https://github.com/llvm/llvm-project.git
+        git -C "$SRC" -c protocol.version=2 fetch --depth 1 --no-tags origin "$LLVM_REF"
+        git -C "$SRC" checkout -q --detach FETCH_HEAD
+        echo "::endgroup::"
+
+        ncpu="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+
+        # Single args array (seeded non-empty) so expansion is safe under set -u
+        # even on the macOS runners' bash 3.2.
+        ARGS=(
+          -G Ninja
+          -S "$SRC/llvm" -B "$BUILD"
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_INSTALL_PREFIX="$PREFIX"
+          -DLLVM_ENABLE_PROJECTS=clang
+          -DLLVM_TARGETS_TO_BUILD="X86;AArch64"
+          -DLLVM_ENABLE_ASSERTIONS=OFF
+          -DLLVM_INCLUDE_TESTS=OFF
+          -DLLVM_INCLUDE_EXAMPLES=OFF
+          -DLLVM_INCLUDE_BENCHMARKS=OFF
+          -DLLVM_INCLUDE_DOCS=OFF
+          -DLLVM_ENABLE_TERMINFO=OFF
+          -DLLVM_ENABLE_LIBXML2=OFF
+          -DLLVM_ENABLE_LIBEDIT=OFF
+          -DLLVM_ENABLE_ZLIB=OFF
+          -DLLVM_ENABLE_ZSTD=OFF
+          -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON
+          -DLLVM_OPTIMIZED_TABLEGEN=ON
+          -DLLVM_PARALLEL_LINK_JOBS=2
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+        )
         if [ "$RUNNER_OS" = "Windows" ]; then
-          # git-bash's GNU tar treats the "D:" drive as a remote host and has no
-          # bundled xz; the Windows system bsdtar handles drive paths and .xz.
-          if [ -x /c/Windows/System32/tar.exe ]; then
-            /c/Windows/System32/tar.exe -xf "$TARBALL" -C "$PREFIX" --strip-components=1
-          else
-            tar --force-local -xf "$TARBALL" -C "$PREFIX" --strip-components=1
-          fi
+          # MSVC env set up by the caller; Release has no debug info, keeping
+          # sccache able to cache (it cannot cache /Zi PDB writes).
+          ARGS+=(
+            -DCMAKE_C_COMPILER=cl
+            -DCMAKE_CXX_COMPILER=cl
+            -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=
+          )
         else
-          tar -xf "$TARBALL" -C "$PREFIX" --strip-components=1
+          # Build LLVM with the host clang (matches the host C++ stdlib, which the
+          # freshly-built clang then also uses to build Morok); pick a fast linker.
+          if command -v clang >/dev/null 2>&1; then
+            ARGS+=( -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ )
+          fi
+          if command -v ld.lld >/dev/null 2>&1; then
+            ARGS+=( -DLLVM_USE_LINKER=lld )
+          fi
         fi
-        if [ ! -f "$PREFIX/lib/cmake/llvm/LLVMConfig.cmake" ]; then
-          echo "::error::extracted toolchain is missing the CMake package"; ls -la "$PREFIX"; exit 1
-        fi
+
+        echo "::group::Configure LLVM"
+        cmake "${ARGS[@]}"
+        echo "::endgroup::"
+
+        echo "::group::Build + install LLVM (slow, cached right after this)"
+        cmake --build "$BUILD" --target install --parallel "$ncpu"
+        echo "::endgroup::"
+
+        # Reclaim disk before the cache save (Windows runners are tight).
+        rm -rf "$BUILD" "$SRC"
+        sccache --show-stats || true
+
+    # Explicit save immediately after the build so a successful LLVM build is
+    # uploaded even if a later job step (Morok build / tests) fails.
+    - name: Save LLVM install cache
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ steps.vars.outputs.prefix }}
+        key: llvm-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-version }}-${{ inputs.llvm-ref }}
 
     - name: Export toolchain to environment
       shell: bash
       run: |
         set -euo pipefail
-        echo "${{ steps.vars.outputs.prefix }}/bin" >> "$GITHUB_PATH"
+        prefix="${{ steps.vars.outputs.prefix }}"
+        if [ ! -e "${{ steps.vars.outputs.clang }}" ]; then
+          echo "::error::LLVM install missing clang at ${{ steps.vars.outputs.clang }}"
+          ls -la "$prefix/bin" || true
+          exit 1
+        fi
+        echo "$prefix/bin" >> "$GITHUB_PATH"
         echo "LLVM_DIR=${{ steps.vars.outputs.llvm_dir }}" >> "$GITHUB_ENV"
         "${{ steps.vars.outputs.clang }}" --version
