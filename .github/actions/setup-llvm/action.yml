@@ -14,7 +14,7 @@ inputs:
   cache-version:
     description: "Bump to invalidate every LLVM install cache (recipe changes)."
     required: false
-    default: "v3"
+    default: "v4"
 
 outputs:
   install-prefix:
@@ -93,6 +93,11 @@ runs:
           -DLLVM_ENABLE_PROJECTS=clang
           -DLLVM_TARGETS_TO_BUILD="X86;AArch64"
           -DLLVM_ENABLE_ASSERTIONS=OFF
+          # Pin ABI-breaking checks OFF (the default WITH_ASSERTS produced an
+          # install whose headers and libs disagreed on the ilist_iterator type,
+          # breaking the IR-test link); FORCE_OFF bakes a consistent value that
+          # also matches the toolchain Morok is developed against.
+          -DLLVM_ABI_BREAKING_CHECKS=FORCE_OFF
           -DLLVM_INCLUDE_TESTS=OFF
           -DLLVM_INCLUDE_EXAMPLES=OFF
           -DLLVM_INCLUDE_BENCHMARKS=OFF
