@@ -29,6 +29,7 @@
 #include <string_view>
 #include <tuple>
 #include <vector>
+#include <memory> // std::unique_ptr / make_unique (libstdc++ needs it explicitly)
 #include <cmath>
 
 // =============================================================================

@@ -42,11 +42,11 @@ compile_one() {
   case "$src" in
     *.cpp)
       cc=("$CLANGXX")
-      std=(-std=c++23)
+      std=(-std=c++23 -D_GNU_SOURCE)
       ;;
     *)
       cc=("$CLANG")
-      std=(-std=c11)
+      std=(-std=c11 -D_GNU_SOURCE)
       ;;
   esac
 

@@ -54,8 +54,8 @@ for base in "${PROGRAMS[@]}"; do
   src="$DIR/$base"
   [ -f "$src" ] || { echo "skip (absent) $base"; continue; }
   total=$((total + 1))
-  cc=("$CLANG"); std=(-std=c11)
-  case "$src" in *.cpp) cc=("$CLANGXX"); std=(-std=c++23);; esac
+  cc=("$CLANG"); std=(-std=c11 -D_GNU_SOURCE)
+  case "$src" in *.cpp) cc=("$CLANGXX"); std=(-std=c++23 -D_GNU_SOURCE);; esac
 
   if ! "${cc[@]}" "${SYSROOT[@]}" -O2 "${std[@]}" "$src" -o "$TMP/clean" >/dev/null 2>&1; then
     echo "FAIL clean-compile $base" >&2; fails=$((fails + 1)); continue; fi

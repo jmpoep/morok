@@ -50,6 +50,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strcasecmp (glibc declares it here, not <string.h>) */
 #include <stdint.h>
 #include <stdbool.h>
 #include <ctype.h>
