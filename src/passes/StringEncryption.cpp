@@ -27,6 +27,7 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/AtomicOrdering.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
@@ -320,6 +321,36 @@ Value *emitStackString(Instruction *InsertBefore, const Cipher &C,
         "morok.str.stack.ptr");
 }
 
+// Collect the functions that (transitively, through constant exprs) reference
+// GV.  Sets Escapes if the address is baked into static data (another global's
+// initializer) or any non-instruction, non-constant user — contexts where no
+// function-entry hook can guarantee the string is decrypted before it is read.
+void collectUsingFunctions(Value *V, SmallPtrSetImpl<Function *> &Funcs,
+                           bool &Escapes) {
+    for (User *U : V->users()) {
+        if (auto *I = dyn_cast<Instruction>(U)) {
+            if (Function *F = I->getFunction())
+                Funcs.insert(F);
+        } else if (isa<GlobalVariable>(U)) {
+            Escapes = true;
+        } else if (isa<Constant>(U)) {
+            collectUsingFunctions(U, Funcs, Escapes);
+        } else {
+            Escapes = true;
+        }
+    }
+}
+
+// A private i8 once-state guard (0 = untouched, 1 = decrypting, 2 = done).
+GlobalVariable *createGuard(Module &M) {
+    auto *I8 = Type::getInt8Ty(M.getContext());
+    auto *GV = new GlobalVariable(M, I8, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(I8, 0), "morok.strg");
+    GV->setAlignment(Align(1));
+    return GV;
+}
+
 bool materializeStackUses(GlobalVariable *GV, const Cipher &C,
                           GlobalVariable *Seed, ArrayType *ArrTy,
                           std::uint64_t Len) {
@@ -450,35 +481,61 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
             continue;
         }
 
-        // Decrypt in place via this string's own constructor.  Short
-        // strings unroll (maximally tangled); long ones loop so module code
-        // size stays bounded.
-        target->setConstant(
-            false); // mutated in place by this string's decryptor
+        // Lazily decrypt in place the first time a using function runs, NOT
+        // eagerly in a global constructor.  Eager init-time decryption leaves
+        // plaintext sitting in writable .data for a "run the ctors, dump memory"
+        // attack; a lazy first-use decryptor leaves only ciphertext until the
+        // code path that needs the string actually executes.  A thread-safe
+        // once-guard (cmpxchg 0->1, publish 2 with release; late threads spin on
+        // an acquire load) makes it correct under concurrency — a plain flag
+        // would let a second thread observe a half-decrypted (or, for XOR,
+        // double-decrypted) buffer.
+        target->setConstant(false); // mutated in place by its decryptor
         auto *decFn =
             Function::Create(FunctionType::get(voidTy, false),
                              GlobalValue::InternalLinkage, "morok.strdec", &M);
         decFn->addFnAttr(Attribute::NoInline);
         decFn->addFnAttr(Attribute::OptimizeNone);
+
+        GlobalVariable *guard = createGuard(M);
+        auto *entryBB = BasicBlock::Create(ctx, "entry", decFn);
+        auto *waitBB = BasicBlock::Create(ctx, "morok.str.wait", decFn);
+        auto *decBB = BasicBlock::Create(ctx, "morok.str.dec", decFn);
+        auto *doneBB = BasicBlock::Create(ctx, "morok.str.done", decFn);
+
+        {
+            IRBuilder<> B(entryBB);
+            auto *won = B.CreateAtomicCmpXchg(
+                guard, ConstantInt::get(i8, 0), ConstantInt::get(i8, 1),
+                MaybeAlign(1), AtomicOrdering::AcquireRelease,
+                AtomicOrdering::Monotonic);
+            B.CreateCondBr(B.CreateExtractValue(won, 1, "morok.str.won"), decBB,
+                           waitBB);
+        }
+        {
+            IRBuilder<> B(waitBB);
+            auto *st = B.CreateLoad(i8, guard, "morok.str.state");
+            st->setAtomic(AtomicOrdering::Acquire);
+            st->setAlignment(Align(1));
+            B.CreateCondBr(
+                B.CreateICmpEQ(st, ConstantInt::get(i8, 2), "morok.str.ready"),
+                doneBB, waitBB);
+        }
+
+        IRBuilder<> B(decBB);
         if (storedLen <= kUnrollThreshold) {
-            IRBuilder<> B(BasicBlock::Create(ctx, "entry", decFn));
             emitDecryptUnrolled(B, c, seed, target, target, arrTy, storedLen);
-            B.CreateRetVoid();
         } else {
-            auto *entry = BasicBlock::Create(ctx, "entry", decFn);
-            auto *loop = BasicBlock::Create(ctx, "loop", decFn);
-            auto *exit = BasicBlock::Create(ctx, "exit", decFn);
-            IRBuilder<> B(entry);
-            LoadInst *seedLoad =
-                B.CreateLoad(i64, seed, /*isVolatile=*/true);
+            auto *loop = BasicBlock::Create(ctx, "morok.str.loop", decFn);
+            auto *loopExit =
+                BasicBlock::Create(ctx, "morok.str.loopexit", decFn);
+            LoadInst *seedLoad = B.CreateLoad(i64, seed, /*isVolatile=*/true);
             emitStaticAnalysisBarrier(B, M);
-            Value *seedMix =
-                B.CreateAdd(seedLoad,
-                            emitVolatileStableZero(B, c.key ^ c.mul,
-                                                   "morok.str.loop.mix"),
-                            "morok.str.loop.k.mix");
-            Value *rtKey =
-                B.CreateXor(seedMix, ConstantInt::get(i64, c.key));
+            Value *seedMix = B.CreateAdd(
+                seedLoad,
+                emitVolatileStableZero(B, c.key ^ c.mul, "morok.str.loop.mix"),
+                "morok.str.loop.k.mix");
+            Value *rtKey = B.CreateXor(seedMix, ConstantInt::get(i64, c.key));
             Value *byteZero = B.CreateTrunc(
                 emitVolatileStableZero(B, c.key + c.mul,
                                        "morok.str.loop.byte.mix"),
@@ -487,9 +544,8 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
 
             B.SetInsertPoint(loop);
             PHINode *iv = B.CreatePHI(i64, 2);
-            iv->addIncoming(ConstantInt::get(i64, 0), entry);
-            Value *ks =
-                ir::emitKeystreamDynamic(B, c.recipe, rtKey, iv, c.mul);
+            iv->addIncoming(ConstantInt::get(i64, 0), decBB);
+            Value *ks = ir::emitKeystreamDynamic(B, c.recipe, rtKey, iv, c.mul);
             Value *ptr = B.CreateInBoundsGEP(arrTy, target,
                                              {ConstantInt::get(i64, 0), iv});
             Value *cipher = B.CreateLoad(i8, ptr);
@@ -501,14 +557,36 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
             iv->addIncoming(next, loop);
             B.CreateCondBr(
                 B.CreateICmpULT(next, ConstantInt::get(i64, storedLen)), loop,
-                exit);
-
-            B.SetInsertPoint(exit);
-            B.CreateRetVoid();
+                loopExit);
+            B.SetInsertPoint(loopExit);
         }
-        // Vary the constructor priority so the decryptors do not appear as one
-        // contiguous block running back-to-back.
-        appendToGlobalCtors(M, decFn, static_cast<int>(rng.range(40000)) + 1);
+        // Publish the decrypted bytes (release) so a spinning thread that reads
+        // state==2 with an acquire load sees the fully decrypted buffer.
+        auto *publish = B.CreateStore(ConstantInt::get(i8, 2), guard);
+        publish->setAtomic(AtomicOrdering::Release);
+        publish->setAlignment(Align(1));
+        B.CreateBr(doneBB);
+        IRBuilder<>(doneBB).CreateRetVoid();
+
+        // Trigger the decryptor lazily at the entry of every function that
+        // references the string.  If the address is baked into static data
+        // (no function-entry hook can run first), fall back to an init-time
+        // constructor for that one string.
+        SmallPtrSet<Function *, 8> users;
+        bool escapes = false;
+        collectUsingFunctions(target, users, escapes);
+        users.erase(decFn);
+        if (escapes || users.empty()) {
+            appendToGlobalCtors(M, decFn,
+                                static_cast<int>(rng.range(40000)) + 1);
+        } else {
+            for (Function *UF : users) {
+                if (UF->isDeclaration())
+                    continue;
+                IRBuilder<> EB(&*UF->getEntryBlock().getFirstInsertionPt());
+                EB.CreateCall(decFn->getFunctionType(), decFn, {});
+            }
+        }
         changed = true;
     }
     return changed;

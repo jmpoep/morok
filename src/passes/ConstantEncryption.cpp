@@ -17,6 +17,9 @@
 
 #include "morok/core/XorShare.hpp"
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -167,6 +170,117 @@ Value *reconstruct(Module &M, Instruction &user, Constant *c,
     return acc;
 }
 
+// A SwitchInst's case values are LITERAL by construction — constant encryption
+// cannot touch them, so a license gate lowered to a `switch` (an
+// `if (h==C1) ... if (h==C2) ...` chain SimplifyCFG folds into one) leaks every
+// magic Ci as a cleartext `cmp reg, #imm` an attacker reads and patches.  This
+// lowers such a switch into a linear chain of *encrypted* equality comparisons,
+// so the magic case values become volatile share loads instead of immediates.
+// Only switches carrying a wide-magic case are lowered — dense dispatch/jump-
+// table switches (small case values) are left intact so hot dispatch is unharmed.
+bool deSwitchWideMagics(Function &F, Module &M, unsigned shareCount,
+                        ir::IRRandom &rng) {
+    SmallVector<SwitchInst *, 8> Switches;
+    for (BasicBlock &BB : F) {
+        auto *SI = dyn_cast<SwitchInst>(BB.getTerminator());
+        if (!SI || SI->getNumCases() == 0)
+            continue;
+        bool Magic = false;
+        for (auto C : SI->cases())
+            if (isWideMagic(C.getCaseValue())) {
+                Magic = true;
+                break;
+            }
+        if (Magic)
+            Switches.push_back(SI);
+    }
+    if (Switches.empty())
+        return false;
+
+    LLVMContext &Ctx = F.getContext();
+    for (SwitchInst *SI : Switches) {
+        BasicBlock *OrigBB = SI->getParent();
+        Value *Cond = SI->getCondition();
+        BasicBlock *DefaultBB = SI->getDefaultDest();
+
+        struct CaseRec {
+            ConstantInt *val;
+            BasicBlock *dest;
+        };
+        SmallVector<CaseRec, 16> Cases;
+        for (auto C : SI->cases())
+            Cases.push_back({C.getCaseValue(), C.getCaseSuccessor()});
+
+        // The comparison for case i lives in ChainBB[i]; ChainBB[0] is OrigBB and
+        // each subsequent comparison gets a fresh block.  A false result on the
+        // last comparison falls through to the original default.
+        SmallVector<BasicBlock *, 16> ChainBB;
+        ChainBB.push_back(OrigBB);
+        for (unsigned i = 1; i < Cases.size(); ++i)
+            ChainBB.push_back(BasicBlock::Create(Ctx, "morok.deswitch", &F));
+
+        // Snapshot each successor PHI's incoming value from OrigBB before the CFG
+        // changes; the switch contributes exactly one OrigBB entry per PHI even
+        // when several cases share a destination.
+        DenseMap<PHINode *, Value *> PhiFromOrig;
+        auto snapshot = [&](BasicBlock *Succ) {
+            for (PHINode &Phi : Succ->phis()) {
+                if (PhiFromOrig.count(&Phi))
+                    continue;
+                int Idx = Phi.getBasicBlockIndex(OrigBB);
+                if (Idx >= 0)
+                    PhiFromOrig[&Phi] =
+                        Phi.getIncomingValue(static_cast<unsigned>(Idx));
+            }
+        };
+        for (const CaseRec &C : Cases)
+            snapshot(C.dest);
+        snapshot(DefaultBB);
+
+        // Drop the switch terminator; OrigBB keeps its other instructions.
+        SI->eraseFromParent();
+
+        for (unsigned i = 0; i < Cases.size(); ++i) {
+            IRBuilder<NoFolder> B(ChainBB[i]);
+            auto *Eq = cast<ICmpInst>(B.CreateICmpEQ(Cond, Cases[i].val,
+                                                     "morok.deswitch.eq"));
+            BasicBlock *FalseDest =
+                (i + 1 < Cases.size()) ? ChainBB[i + 1] : DefaultBB;
+            B.CreateCondBr(Eq, Cases[i].dest, FalseDest);
+            // Replace the literal case value with its encrypted reconstruction.
+            Value *Enc = reconstruct(M, *Eq, Cases[i].val, shareCount, rng);
+            Eq->setOperand(1, Enc);
+        }
+
+        // Rewire successor PHIs: the OrigBB edge becomes one edge per new chain
+        // predecessor.  Add the new incomings first, then drop the OrigBB entry.
+        for (unsigned i = 0; i < Cases.size(); ++i)
+            for (PHINode &Phi : Cases[i].dest->phis()) {
+                auto It = PhiFromOrig.find(&Phi);
+                if (It != PhiFromOrig.end())
+                    Phi.addIncoming(It->second, ChainBB[i]);
+            }
+        for (PHINode &Phi : DefaultBB->phis()) {
+            auto It = PhiFromOrig.find(&Phi);
+            if (It != PhiFromOrig.end())
+                Phi.addIncoming(It->second, ChainBB.back());
+        }
+
+        SmallPtrSet<BasicBlock *, 16> Succs;
+        for (const CaseRec &C : Cases)
+            Succs.insert(C.dest);
+        Succs.insert(DefaultBB);
+        for (BasicBlock *S : Succs)
+            for (PHINode &Phi : S->phis()) {
+                int Idx = Phi.getBasicBlockIndex(OrigBB);
+                if (Idx >= 0)
+                    Phi.removeIncomingValue(static_cast<unsigned>(Idx),
+                                            /*DeletePHIIfEmpty=*/false);
+            }
+    }
+    return true;
+}
+
 } // namespace
 
 bool constantEncryptFunction(Function &F, const ConstEncParams &params,
@@ -303,6 +417,15 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
         }
     }
     return changed;
+}
+
+bool deSwitchGateConstantsFunction(Function &F, const ConstEncParams &params,
+                                   ir::IRRandom &rng) {
+    if (F.isDeclaration())
+        return false;
+    const unsigned shareCount = std::clamp<unsigned>(
+        params.share_count, core::kMinShares, core::kMaxShares);
+    return deSwitchWideMagics(F, *F.getParent(), shareCount, rng);
 }
 
 PreservedAnalyses ConstantEncryptionPass::run(Function &F,

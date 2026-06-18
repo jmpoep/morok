@@ -28,6 +28,13 @@ struct VirtualizationParams {
     std::uint32_t max_registers = 96;      ///< bytecode virtual-register cap
     bool include_protection_helpers = false; ///< lift allowlisted checkers too
     bool protection_helpers_only = false;    ///< restrict selection to checkers
+    /// Permit lifting user functions that contain DIRECT calls to defined
+    /// internal functions (simple scalar signatures only — never imports,
+    /// indirect calls, varargs, or by-value aggregates).  This lets the VM claim
+    /// trust-boundary functions (e.g. a license verdict computer) that were
+    /// previously rejected outright for containing any call, while staying clear
+    /// of the ABI/indirect-dispatch surface that is risky to virtualize.
+    bool allow_internal_user_calls = false;
 };
 
 /// Lift a single eligible function into a private threaded bytecode VM helper.

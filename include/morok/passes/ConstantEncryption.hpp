@@ -44,6 +44,15 @@ struct ConstEncParams {
 bool constantEncryptFunction(llvm::Function &F, const ConstEncParams &params,
                              morok::ir::IRRandom &rng);
 
+/// Lower any `switch` carrying a wide-magic case value into a chain of encrypted
+/// equality comparisons, so gate constants buried in switch cases (immutable
+/// literals that `constantEncryptFunction` cannot touch) are hidden too.  Must
+/// run EARLY — before the CFG passes that consume switches into dispatch forms —
+/// so the encrypted comparisons it leaves behind survive every later transform.
+bool deSwitchGateConstantsFunction(llvm::Function &F,
+                                   const ConstEncParams &params,
+                                   morok::ir::IRRandom &rng);
+
 /// New-PM wrapper for standalone use (`-passes=morok-constenc`).
 class ConstantEncryptionPass
     : public llvm::PassInfoMixin<ConstantEncryptionPass> {

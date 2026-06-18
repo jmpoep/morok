@@ -245,7 +245,7 @@ bool loopLikelyHot(Function &F) {
         return false;
     if (!hasNaturalLoop(F))
         return false;
-    return F.getName() == "main" || hasRuntimeUsers(F);
+    return hasRuntimeUsers(F);
 }
 
 std::uint64_t widthMask(unsigned Width) {
@@ -481,7 +481,7 @@ bool isLowerableIntrinsic(const CallBase &CB) {
 // (imports) are also gated out so a naked import call never appears inside a
 // handler.  Pure intrinsics are handled elsewhere.
 bool liftableCall(const CallBase &CB, bool AllowProtectionCalls,
-                  bool AllowInlineAsm) {
+                  bool AllowInlineAsm, bool AllowDirectInternalCalls = false) {
     const auto *CI = dyn_cast<CallInst>(&CB);
     if (!CI || CI->isMustTailCall() || CI->hasOperandBundles())
         return false;
@@ -503,12 +503,20 @@ bool liftableCall(const CallBase &CB, bool AllowProtectionCalls,
             return false;
     if (CI->isInlineAsm())
         return AllowInlineAsm;
+    const Function *Callee = CB.getCalledFunction();
+    const bool DirectDefined = Callee && !Callee->isDeclaration() &&
+                               !Callee->isIntrinsic() && !Callee->isVarArg();
+    // A direct call to a defined internal function is safe to lift for user code
+    // too: the handler just calls the callee with marshalled register args —
+    // no import ABI, no indirect dispatch.
+    if (AllowDirectInternalCalls && DirectDefined)
+        return true;
     if (!AllowProtectionCalls)
         return false;
-    if (const Function *Callee = CB.getCalledFunction())
-        return !Callee->isDeclaration() && !Callee->isIntrinsic() &&
-               !Callee->isVarArg();
+    if (Callee)
+        return DirectDefined;
     // Indirect call: the callee operand is materialized as a register at lift.
+    // Only protection helpers take this (riskier) path.
     return true;
 }
 
@@ -556,7 +564,8 @@ bool sizedNonScalable(const DataLayout &DL, Type *T) {
 }
 
 bool liftableInstruction(const Instruction &I, const BasicBlock &Entry,
-                         const DataLayout &DL, bool AllowProtectionCalls) {
+                         const DataLayout &DL, bool AllowProtectionCalls,
+                         bool AllowDirectInternalCalls = false) {
     if (isa<PHINode>(I))
         return isScalarVmTy(I.getType()); // demoted to a stack slot of this type
 
@@ -607,7 +616,8 @@ bool liftableInstruction(const Instruction &I, const BasicBlock &Entry,
     if (const auto *CB = dyn_cast<CallBase>(&I))
         return isSkippableIntrinsic(*CB) || isLowerableIntrinsic(*CB) ||
                liftableCall(*CB, AllowProtectionCalls,
-                            /*AllowInlineAsm=*/AllowProtectionCalls);
+                            /*AllowInlineAsm=*/AllowProtectionCalls,
+                            AllowDirectInternalCalls);
     return false;
 }
 
@@ -628,6 +638,8 @@ bool isEligible(Function &F, const VirtualizationParams &Params) {
     const BasicBlock &Entry = F.getEntryBlock();
     const bool AllowProtectionCalls =
         Params.include_protection_helpers && generatedProtectionFunction(F);
+    const bool AllowDirectInternalCalls =
+        Params.allow_internal_user_calls && !generatedFunction(F);
     std::uint32_t Instructions = 0;
     // Coarse pre-estimate of the post-demotion register arena (every value used
     // across blocks or by a PHI becomes a stack slot).  Reject if it cannot fit
@@ -639,7 +651,8 @@ bool isEligible(Function &F, const VirtualizationParams &Params) {
         for (const Instruction &I : BB) {
             if (I.isTerminator())
                 continue;
-            if (!liftableInstruction(I, Entry, DL, AllowProtectionCalls))
+            if (!liftableInstruction(I, Entry, DL, AllowProtectionCalls,
+                                     AllowDirectInternalCalls))
                 return false;
             if (++Instructions > kMaxLiftInstructions)
                 return false;
@@ -1162,7 +1175,9 @@ bool Lifter::liftIntrinsic(IntrinsicInst &II) {
 bool Lifter::liftCall(CallInst &CI) {
     const bool AllowProtectionCalls =
         Params_.include_protection_helpers && generatedProtectionFunction(F_);
-    if (!AllowProtectionCalls)
+    const bool AllowDirectInternalCalls =
+        Params_.allow_internal_user_calls && !generatedFunction(F_);
+    if (!AllowProtectionCalls && !AllowDirectInternalCalls)
         return false;
     if (P_.calls.size() >= 200) // bound: one dispatch handler id per call site
         return false;
@@ -1170,10 +1185,20 @@ bool Lifter::liftCall(CallInst &CI) {
     CS.fn_ty = CI.getFunctionType();
     CS.cc = CI.getCallingConv();
     if (CI.isInlineAsm()) {
+        if (!AllowProtectionCalls) // inline asm is a protection-only lift target
+            return false;
         CS.direct = CI.getCalledOperand();
     } else if (Function *Callee = CI.getCalledFunction()) {
+        // User-call lifting accepts only DIRECT calls to defined internal
+        // functions; imports/varargs/intrinsics stay native.
+        if (!AllowProtectionCalls &&
+            (Callee->isDeclaration() || Callee->isIntrinsic() ||
+             Callee->isVarArg()))
+            return false;
         CS.direct = Callee;
     } else {
+        if (!AllowProtectionCalls) // indirect dispatch is protection-only
+            return false;
         auto Reg = materialize(CI.getCalledOperand());
         if (!Reg)
             return false;

@@ -362,6 +362,18 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
             config_.passes.virtualization.max_instructions.value_or(64);
         p.max_registers =
             config_.passes.virtualization.max_registers.value_or(96);
+        // NOTE: VirtualizationParams::allow_internal_user_calls lets the VM lift
+        // functions that contain direct calls to defined internal helpers (the
+        // machinery is implemented and correct for straight-line call graphs —
+        // see the /tmp/vc.c proof).  It is intentionally left OFF here: enabling
+        // it broadly also lifts recursive / mutually-recursive functions and
+        // main, and routing recursion through the bytecode interpreter traps at
+        // runtime (programs_maxpreset_run: call_nested / call_tail_recursive /
+        // 04_bst exit 133).  Safe enablement needs call-graph SCC analysis to
+        // exclude every recursion cycle plus Linux CI validation, so the flag
+        // stays gated until that lands.  The decision boundary is already covered
+        // by self-checksum + return poisoning, de-switch + constenc, and
+        // nanomites, so this is defense-in-depth, not a load-bearing gap.
         changed |= passes::virtualizeModule(M, p, rng);
     }
 
@@ -456,6 +468,22 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
             const config::PassConfig eff =
                 config::resolve(config_, moduleName, F.getName(), demangle);
             const bool Sensitive = isUserSensitiveFunction(F);
+
+            // De-switch wide-magic gates FIRST, before any CFG pass consumes a
+            // switch into a dispatch/jump-table form.  A license tier table
+            // (`switch (hash) { case 0xMAGIC: ... }`) otherwise leaks every case
+            // value as a cleartext compare the backend materializes; lowering it
+            // here to encrypted comparison chains leaves volatile-load constants
+            // that survive split/flatten/dispatcherless/indirectbranch.  Only
+            // wide-magic switches are touched, so dense dispatch stays intact and
+            // the integrity passes are not inflated out of budget.
+            if (integrityFunctionOk(F) &&
+                ir::shouldObfuscate(F, "constenc",
+                                    eff.const_enc.enabled.value_or(false))) {
+                passes::ConstEncParams p;
+                p.share_count = eff.const_enc.share_count.value_or(2);
+                changed |= passes::deSwitchGateConstantsFunction(F, p, rng);
+            }
 
             // Structural passes first: split creates more dispatch targets,
             // then bogus control flow widens the CFG, before the value-level
