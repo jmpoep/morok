@@ -21,6 +21,7 @@
 #include "morok/passes/AntiAnalysis.hpp"
 #include "morok/passes/ArithmeticTables.hpp"
 #include "morok/passes/BogusControlFlow.hpp"
+#include "morok/passes/CallerKeyedDispatch.hpp"
 #include "morok/passes/ChaosStateMachine.hpp"
 #include "morok/passes/CoherentDecoys.hpp"
 #include "morok/passes/ConstantEncryption.hpp"
@@ -218,6 +219,10 @@ PassPluginLibraryInfo getPluginInfo() {
                         }
                         if (name == "morok-fco") {
                             MPM.addPass(passes::FunctionCallObfuscatePass());
+                            return true;
+                        }
+                        if (name == "morok-ckd") {
+                            MPM.addPass(passes::CallerKeyedDispatchPass());
                             return true;
                         }
                         if (name == "morok-afm") {

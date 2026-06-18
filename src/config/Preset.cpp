@@ -236,6 +236,11 @@ PassConfig makeLow() {
     c.microcode_stress.decoy_blocks = 0;
     c.microcode_stress.alias_stores = 0;
 
+    c.caller_keyed_dispatch.enabled = false;
+    c.caller_keyed_dispatch.probability = 0;
+    c.caller_keyed_dispatch.max_calls = 0;
+    c.caller_keyed_dispatch.region_bytes = 0;
+
     c.vec.enabled = false;
     c.csm.enabled = false;
     c.csm.generator = CsmGenerator::Logistic;
@@ -444,6 +449,11 @@ PassConfig makeMid() {
     c.microcode_stress.table_entries = 0;
     c.microcode_stress.decoy_blocks = 0;
     c.microcode_stress.alias_stores = 0;
+
+    c.caller_keyed_dispatch.enabled = false;
+    c.caller_keyed_dispatch.probability = 0;
+    c.caller_keyed_dispatch.max_calls = 0;
+    c.caller_keyed_dispatch.region_bytes = 0;
 
     c.vec.enabled = true;
     c.vec.probability = 40;
@@ -659,6 +669,11 @@ PassConfig makeHigh() {
     c.microcode_stress.table_entries = 16;
     c.microcode_stress.decoy_blocks = 4;
     c.microcode_stress.alias_stores = 1;
+
+    c.caller_keyed_dispatch.enabled = true;
+    c.caller_keyed_dispatch.probability = 100;
+    c.caller_keyed_dispatch.max_calls = 4096;
+    c.caller_keyed_dispatch.region_bytes = 16;
 
     c.vec.enabled = true;
     c.vec.probability = 75;
@@ -886,6 +901,11 @@ PassConfig makeMax() {
     c.microcode_stress.table_entries = 32;
     c.microcode_stress.decoy_blocks = 8;
     c.microcode_stress.alias_stores = 2;
+
+    c.caller_keyed_dispatch.enabled = true;
+    c.caller_keyed_dispatch.probability = 100;
+    c.caller_keyed_dispatch.max_calls = 4096;
+    c.caller_keyed_dispatch.region_bytes = 16;
 
     c.vec.enabled = true;
     c.vec.probability = 100;

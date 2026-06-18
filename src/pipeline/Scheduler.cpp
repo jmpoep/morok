@@ -16,6 +16,7 @@
 #include "morok/passes/AntiAnalysis.hpp"
 #include "morok/passes/ArithmeticTables.hpp"
 #include "morok/passes/BogusControlFlow.hpp"
+#include "morok/passes/CallerKeyedDispatch.hpp"
 #include "morok/passes/ChaosStateMachine.hpp"
 #include "morok/passes/CoherentDecoys.hpp"
 #include "morok/passes/ConstantEncryption.hpp"
@@ -942,6 +943,23 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         p.max_outlines =
             config_.passes.adversarial_merge.max_outlines.value_or(8);
         changed |= passes::adversarialFunctionMergingModule(M, p, rng);
+    }
+
+    // Collapse surviving direct user calls through one shared native dispatch
+    // hub.  Keep this after merge/tuning and before FunctionWrapper; otherwise
+    // wrappers would consume user edges first and leave only generated
+    // `morok.wrap` callees for this pass to skip.
+    if (InitialModuleGrowthOk &&
+        config_.passes.caller_keyed_dispatch.enabled.value_or(false) &&
+        moduleGrowthOk(measureModule(M))) {
+        passes::CallerKeyedDispatchParams p;
+        p.probability =
+            config_.passes.caller_keyed_dispatch.probability.value_or(100);
+        p.max_calls =
+            config_.passes.caller_keyed_dispatch.max_calls.value_or(4096);
+        p.region_bytes =
+            config_.passes.caller_keyed_dispatch.region_bytes.value_or(16);
+        changed |= passes::callerKeyedDispatchModule(M, p, rng);
     }
 
     // Module-level call-site wrapping runs after the per-function transforms so

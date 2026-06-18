@@ -32,6 +32,7 @@ add_library(morok_passes STATIC
   MisleadingMetadata.cpp
   MqGate.cpp
   ChaosStateMachine.cpp
+  CallerKeyedDispatch.cpp
   OptimizerAmplification.cpp
   PerBuildPolymorphism.cpp
   ArithmeticTables.cpp

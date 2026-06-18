@@ -16,6 +16,7 @@
 #include "morok/passes/AntiAnalysis.hpp"
 #include "morok/passes/ArithmeticTables.hpp"
 #include "morok/passes/BogusControlFlow.hpp"
+#include "morok/passes/CallerKeyedDispatch.hpp"
 #include "morok/passes/ChaosStateMachine.hpp"
 #include "morok/passes/CoherentDecoys.hpp"
 #include "morok/passes/ConstantEncryption.hpp"
@@ -235,6 +236,15 @@ std::size_t countCallsTo(Function &F, StringRef name) {
             if (Function *Callee = CB->getCalledFunction())
                 if (Callee->getName() == name)
                     ++n;
+    return n;
+}
+
+std::size_t countCallsThroughOperand(Function &F, const Value *Target) {
+    std::size_t n = 0;
+    for (Instruction &I : instructions(F))
+        if (auto *CB = dyn_cast<CallBase>(&I))
+            if (CB->getCalledOperand()->stripPointerCasts() == Target)
+                ++n;
     return n;
 }
 
@@ -8652,6 +8662,81 @@ TEST_CASE("functionWrapModule caps generated forwarders") {
         *M, {/*probability=*/100, /*times=*/1, /*max_wrappers=*/1000}, rng));
 
     CHECK(countFunctions(*M, "morok.wrap") == 256u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("callerKeyedDispatchModule routes direct calls through one hub") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "arm64-apple-macosx14.0.0"
+define internal i32 @inc(i32 %x) {
+entry:
+  %r = add i32 %x, 1
+  ret i32 %r
+}
+
+define internal i32 @mix(i32 %x) {
+entry:
+  %r = xor i32 %x, 85
+  ret i32 %r
+}
+
+define i32 @caller(i32 %x) {
+entry:
+  %a = call i32 @inc(i32 %x)
+  %b = call i32 @mix(i32 %a)
+  ret i32 %b
+}
+)ir");
+    Function *Caller = M->getFunction("caller");
+    REQUIRE(Caller);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(952);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::CallerKeyedDispatchParams params;
+    params.probability = 100;
+    params.max_calls = 16;
+    params.region_bytes = 8;
+
+    CHECK(morok::passes::callerKeyedDispatchModule(*M, params, rng));
+
+    Function *Dispatch = M->getFunction("morok.ckd.dispatch");
+    Function *Init = M->getFunction("morok.ckd.init");
+    REQUIRE(Dispatch != nullptr);
+    REQUIRE(Init != nullptr);
+    CHECK(hasInlineAsmCall(*Dispatch));
+    CHECK(countCallsTo(*Caller, "inc") == 0u);
+    CHECK(countCallsTo(*Caller, "mix") == 0u);
+    CHECK(countCallsThroughOperand(*Caller, Dispatch) == 2u);
+    CHECK(countGlobals(*M, "morok.ckd.enc") == 2u);
+    CHECK(M->getGlobalVariable("llvm.global_ctors") != nullptr);
+    CHECK(countCallsTo(*Init, "morok.ckd.dispatch") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("callerKeyedDispatchModule is a no-op on unsupported targets") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "wasm32-unknown-unknown"
+define internal i32 @inc(i32 %x) {
+entry:
+  %r = add i32 %x, 1
+  ret i32 %r
+}
+define i32 @caller(i32 %x) {
+entry:
+  %r = call i32 @inc(i32 %x)
+  ret i32 %r
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(953);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::CallerKeyedDispatchParams params;
+    params.probability = 100;
+
+    CHECK_FALSE(morok::passes::callerKeyedDispatchModule(*M, params, rng));
+    CHECK(M->getFunction("morok.ckd.dispatch") == nullptr);
+    CHECK(countUserCallsTo(*M, "inc") == 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

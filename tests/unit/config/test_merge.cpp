@@ -193,6 +193,10 @@ TEST_CASE("merge handles every pass family") {
     src.microcode_stress.table_entries = 48u;
     src.microcode_stress.decoy_blocks = 9u;
     src.microcode_stress.alias_stores = 3u;
+    src.caller_keyed_dispatch.enabled = true;
+    src.caller_keyed_dispatch.probability = 100u;
+    src.caller_keyed_dispatch.max_calls = 1024u;
+    src.caller_keyed_dispatch.region_bytes = 24u;
     src.nanomites.enabled = true;
     src.nanomites.probability = 79u;
     src.nanomites.max_sites = 5u;
@@ -352,6 +356,10 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.microcode_stress.table_entries == 48u);
     CHECK(dst.microcode_stress.decoy_blocks == 9u);
     CHECK(dst.microcode_stress.alias_stores == 3u);
+    CHECK(dst.caller_keyed_dispatch.enabled == true);
+    CHECK(dst.caller_keyed_dispatch.probability == 100u);
+    CHECK(dst.caller_keyed_dispatch.max_calls == 1024u);
+    CHECK(dst.caller_keyed_dispatch.region_bytes == 24u);
     CHECK(dst.nanomites.enabled == true);
     CHECK(dst.nanomites.probability == 79u);
     CHECK(dst.nanomites.max_sites == 5u);

@@ -269,6 +269,13 @@ struct MicrocodeStressConfig {
     Opt<std::uint32_t> alias_stores;
 };
 
+struct CallerKeyedDispatchConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> probability;
+    Opt<std::uint32_t> max_calls;
+    Opt<std::uint32_t> region_bytes;
+};
+
 struct NanomiteConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
@@ -356,6 +363,7 @@ struct PassConfig {
     TraceKeyConfig trace_keying;
     DispatcherlessConfig dispatcherless;
     MicrocodeStressConfig microcode_stress;
+    CallerKeyedDispatchConfig caller_keyed_dispatch;
     NanomiteConfig nanomites;
     StrEncConfig str_enc;
     ConstEncConfig const_enc;

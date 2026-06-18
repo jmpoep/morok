@@ -256,6 +256,15 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.microcode_stress.decoy_blocks);
     mergeOpt(dst.microcode_stress.alias_stores,
              src.microcode_stress.alias_stores);
+    // Caller-keyed indirect call dispatch
+    mergeOpt(dst.caller_keyed_dispatch.enabled,
+             src.caller_keyed_dispatch.enabled);
+    mergeOpt(dst.caller_keyed_dispatch.probability,
+             src.caller_keyed_dispatch.probability);
+    mergeOpt(dst.caller_keyed_dispatch.max_calls,
+             src.caller_keyed_dispatch.max_calls);
+    mergeOpt(dst.caller_keyed_dispatch.region_bytes,
+             src.caller_keyed_dispatch.region_bytes);
     // Trap-mediated branch nanomites
     mergeOpt(dst.nanomites.enabled, src.nanomites.enabled);
     mergeOpt(dst.nanomites.probability, src.nanomites.probability);

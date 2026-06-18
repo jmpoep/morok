@@ -253,6 +253,11 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     table_entries = 48
     decoy_blocks = 9
     alias_stores = 3
+    [passes.caller_keyed_dispatch]
+    enabled = true
+    probability = 100
+    max_calls = 2048
+    region_bytes = 24
     [passes.nanomites]
     enabled = true
     probability = 82
@@ -434,6 +439,10 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.microcode_stress.table_entries == 48u);
     CHECK(r.config.passes.microcode_stress.decoy_blocks == 9u);
     CHECK(r.config.passes.microcode_stress.alias_stores == 3u);
+    CHECK(r.config.passes.caller_keyed_dispatch.enabled == true);
+    CHECK(r.config.passes.caller_keyed_dispatch.probability == 100u);
+    CHECK(r.config.passes.caller_keyed_dispatch.max_calls == 2048u);
+    CHECK(r.config.passes.caller_keyed_dispatch.region_bytes == 24u);
     CHECK(r.config.passes.nanomites.enabled == true);
     CHECK(r.config.passes.nanomites.probability == 82u);
     CHECK(r.config.passes.nanomites.max_sites == 6u);
