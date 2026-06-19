@@ -28,6 +28,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
+#include "llvm/Support/AtomicOrdering.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/ModRef.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -521,6 +522,7 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
         auto *Crypto =
             XB.CreateLoad(I64, HeartbeatCrypto, "morok.sc.watchdog.crypto");
         Crypto->setVolatile(true);
+        Crypto->setAtomic(AtomicOrdering::Monotonic);
         Crypto->setAlignment(Align(8));
         Diff = XB.CreateXor(Diff, Crypto, "morok.sc.crypto.diff");
     }

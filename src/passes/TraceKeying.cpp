@@ -31,6 +31,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
+#include "llvm/Support/AtomicOrdering.h"
 #include "llvm/Support/ModRef.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
@@ -523,6 +524,7 @@ DelayedSample delayedSample(IRBuilder<NoFolder> &B, GlobalVariable *Latent,
             auto *CryptoLoad =
                 B.CreateLoad(I64, Crypto, "morok.trace.watchdog.crypto");
             CryptoLoad->setVolatile(true);
+            CryptoLoad->setAtomic(AtomicOrdering::Monotonic);
             CryptoLoad->setAlignment(Align(8));
             LoadedKey = B.CreateXor(LoadedKey, CryptoLoad,
                                     "morok.trace.crypto.latent");

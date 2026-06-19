@@ -77,6 +77,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/AtomicOrdering.h"
 #include "llvm/Support/ModRef.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
@@ -194,6 +195,56 @@ std::size_t countVolatileAccesses(Function &F) {
                 ++n;
     }
     return n;
+}
+
+bool isMonotonicAtomicLoadFrom(const LoadInst *LI, StringRef globalPrefix) {
+    return LI->isVolatile() && LI->isAtomic() &&
+           LI->getOrdering() == AtomicOrdering::Monotonic &&
+           LI->getAlign() == Align(8) &&
+           LI->getPointerOperand()->getName().starts_with(globalPrefix);
+}
+
+bool isMonotonicAtomicStoreTo(const StoreInst *SI, StringRef globalPrefix) {
+    return SI->isVolatile() && SI->isAtomic() &&
+           SI->getOrdering() == AtomicOrdering::Monotonic &&
+           SI->getAlign() == Align(8) &&
+           SI->getPointerOperand()->getName().starts_with(globalPrefix);
+}
+
+std::size_t countMonotonicAtomicLoadsFrom(Function &F,
+                                          StringRef globalPrefix) {
+    std::size_t n = 0;
+    for (Instruction &I : instructions(F))
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+            if (isMonotonicAtomicLoadFrom(LI, globalPrefix))
+                ++n;
+    return n;
+}
+
+std::size_t countMonotonicAtomicStoresTo(Function &F,
+                                         StringRef globalPrefix) {
+    std::size_t n = 0;
+    for (Instruction &I : instructions(F))
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+            if (isMonotonicAtomicStoreTo(SI, globalPrefix))
+                ++n;
+    return n;
+}
+
+bool hasNamedIcmpWithConstant(Function &F, StringRef name,
+                              std::uint64_t value) {
+    for (Instruction &I : instructions(F)) {
+        if (!I.getName().starts_with(name))
+            continue;
+        auto *Cmp = dyn_cast<ICmpInst>(&I);
+        if (!Cmp)
+            continue;
+        for (Value *Op : Cmp->operands())
+            if (auto *CI = dyn_cast<ConstantInt>(Op))
+                if (CI->getZExtValue() == value)
+                    return true;
+    }
+    return false;
 }
 
 std::size_t countOpcode(Module &M, unsigned opcode) {
@@ -8019,7 +8070,7 @@ entry:
     bool hasVolatileExpectedLoad = false;
     bool hasVolatileCodeSizeLoad = false;
     bool hasVolatileCodeByteLoad = false;
-    bool hasVolatileWatchdogCryptoLoad = false;
+    bool hasAtomicWatchdogCryptoLoad = false;
     bool hasDiffValue = false;
     bool hasCryptoDiff = false;
     for (Instruction &I : instructions(*Diff)) {
@@ -8044,10 +8095,8 @@ entry:
             hasVolatileCodeByteLoad |=
                 LI->isVolatile() &&
                 LI->getName().starts_with("morok.sc.code.byte");
-            hasVolatileWatchdogCryptoLoad |=
-                LI->isVolatile() &&
-                LI->getPointerOperand()->getName().starts_with(
-                    "morok.watchdog.crypto");
+            hasAtomicWatchdogCryptoLoad |=
+                isMonotonicAtomicLoadFrom(LI, "morok.watchdog.crypto");
         }
     }
 
@@ -8058,7 +8107,7 @@ entry:
     CHECK(hasVolatileExpectedLoad);
     CHECK(hasVolatileCodeSizeLoad);
     CHECK(hasVolatileCodeByteLoad);
-    CHECK(hasVolatileWatchdogCryptoLoad);
+    CHECK(hasAtomicWatchdogCryptoLoad);
     CHECK(hasDiffValue);
     CHECK(hasCryptoDiff);
     CHECK_FALSE(hasTrap);
@@ -9385,9 +9434,7 @@ no:
                 ++valueTerms;
             if (auto *LI = dyn_cast<LoadInst>(&I)) {
                 volatileLoads += LI->isVolatile() ? 1u : 0u;
-                if (LI->isVolatile() &&
-                    LI->getPointerOperand()->getName().starts_with(
-                        "morok.watchdog.crypto"))
+                if (isMonotonicAtomicLoadFrom(LI, "morok.watchdog.crypto"))
                     ++watchdogCryptoLoads;
             }
             if (auto *SI = dyn_cast<StoreInst>(&I)) {
@@ -12608,7 +12655,22 @@ entry:
     CHECK(countNamedInstructions(*HeartbeatWatch,
                                  "morok.watchdog.heartbeat.cadence") >= 1u);
     CHECK(countNamedInstructions(*HeartbeatWatch,
+                                 "morok.watchdog.heartbeat.sleep.complete") >=
+          1u);
+    CHECK(countNamedInstructions(*HeartbeatWatch,
                                  "morok.watchdog.heartbeat.missing") >= 1u);
+    CHECK(hasNamedIcmpWithConstant(*HeartbeatWatch,
+                                   "morok.watchdog.heartbeat.missing", 4u));
+    CHECK(countMonotonicAtomicLoadsFrom(*ProbeWatch,
+                                        "morok.watchdog.heartbeat") >= 1u);
+    CHECK(countMonotonicAtomicStoresTo(*ProbeWatch,
+                                       "morok.watchdog.heartbeat") >= 1u);
+    CHECK(countMonotonicAtomicLoadsFrom(*HeartbeatWatch,
+                                        "morok.watchdog.heartbeat") >= 2u);
+    CHECK(countMonotonicAtomicLoadsFrom(*HeartbeatWatch,
+                                        "morok.watchdog.crypto") >= 1u);
+    CHECK(countMonotonicAtomicStoresTo(*HeartbeatWatch,
+                                       "morok.watchdog.crypto") >= 1u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
                                  "morok.antidbg.dr.fork") >= 1u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),

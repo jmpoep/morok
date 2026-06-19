@@ -26,6 +26,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Alignment.h"
+#include "llvm/Support/AtomicOrdering.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
@@ -42,6 +43,8 @@ namespace morok::passes {
 namespace {
 
 constexpr std::uint32_t kWatchdogMaxIterations = 4;
+constexpr std::uint32_t kWatchdogCryptoStaleThreshold =
+    kWatchdogMaxIterations;
 
 SmallPtrSet<BasicBlock *, 32> naturalLoopBlocks(Function &F) {
     DominatorTree DT(F);
@@ -164,6 +167,7 @@ GlobalVariable *antiDebugWatchdogHeartbeat(Module &M, ir::IRRandom &rng) {
         M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
         ConstantInt::get(i64, rng.next() | 1ULL), "morok.watchdog.heartbeat");
     gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(8));
     return gv;
 }
 
@@ -2294,11 +2298,15 @@ Function *probeWatchThread(Module &M, Function *Probe, GlobalVariable *Heartbeat
     BB.CreateCall(Probe->getFunctionType(), Probe, {tag});
     auto *oldBeat = BB.CreateLoad(i64, Heartbeat, "morok.watchdog.heartbeat.old");
     oldBeat->setVolatile(true);
+    oldBeat->setAtomic(AtomicOrdering::Monotonic);
+    oldBeat->setAlignment(Align(8));
     Value *beat = BB.CreateXor(
         BB.CreateAdd(BB.CreateMul(oldBeat, ConstantInt::get(i64, beatMul)), tag),
         ConstantInt::get(i64, beatSalt), "morok.watchdog.heartbeat.beat");
     auto *beatStore = BB.CreateStore(beat, Heartbeat);
     beatStore->setVolatile(true);
+    beatStore->setAtomic(AtomicOrdering::Monotonic);
+    beatStore->setAlignment(Align(8));
     Value *next = BB.CreateAdd(iter, ConstantInt::get(i32, 1));
     BB.CreateBr(loopBB);
     iter->addIncoming(next, bodyBB);
@@ -2331,6 +2339,11 @@ Function *heartbeatWatchThread(Module &M, GlobalVariable *State,
         static_cast<std::uint32_t>((rng.next() | 1ULL) & 0xffffu);
 
     IRBuilder<> EB(entry);
+    auto *initialBeat =
+        EB.CreateLoad(i64, Heartbeat, "morok.watchdog.heartbeat.initial");
+    initialBeat->setVolatile(true);
+    initialBeat->setAtomic(AtomicOrdering::Monotonic);
+    initialBeat->setAlignment(Align(8));
     EB.CreateBr(loopBB);
 
     IRBuilder<> LB(loopBB);
@@ -2338,7 +2351,7 @@ Function *heartbeatWatchThread(Module &M, GlobalVariable *State,
     auto *last = LB.CreatePHI(i64, 2, "morok.watchdog.heartbeat.last");
     auto *staleCount = LB.CreatePHI(i32, 2, "morok.watchdog.heartbeat.stale");
     iter->addIncoming(ConstantInt::get(i32, 0), entry);
-    last->addIncoming(ConstantInt::get(i64, 0), entry);
+    last->addIncoming(initialBeat, entry);
     staleCount->addIncoming(ConstantInt::get(i32, 0), entry);
     LB.CreateCondBr(
         LB.CreateICmpULT(iter, ConstantInt::get(i32, kWatchdogMaxIterations)),
@@ -2352,18 +2365,29 @@ Function *heartbeatWatchThread(Module &M, GlobalVariable *State,
                                   ConstantInt::get(i32, cadenceAdd)),
                      ConstantInt::get(i32, 3)),
         ConstantInt::get(i32, 2), "morok.watchdog.heartbeat.cadence");
-    BB.CreateCall(sleepFn, {cadence});
+    Value *sleepLeft =
+        BB.CreateCall(sleepFn, {cadence},
+                      "morok.watchdog.heartbeat.sleep.left");
+    Value *sleepComplete = BB.CreateICmpEQ(
+        sleepLeft, ConstantInt::get(i32, 0),
+        "morok.watchdog.heartbeat.sleep.complete");
     auto *cur = BB.CreateLoad(i64, Heartbeat, "morok.watchdog.heartbeat.cur");
     cur->setVolatile(true);
+    cur->setAtomic(AtomicOrdering::Monotonic);
+    cur->setAlignment(Align(8));
     Value *armed =
         BB.CreateICmpNE(last, ConstantInt::get(i64, 0), "morok.watchdog.armed");
-    Value *stale = BB.CreateAnd(armed, BB.CreateICmpEQ(cur, last),
+    Value *sampleStable = BB.CreateAnd(
+        sleepComplete, BB.CreateICmpEQ(cur, last),
+        "morok.watchdog.heartbeat.sample.stable");
+    Value *stale = BB.CreateAnd(armed, sampleStable,
                                 "morok.watchdog.heartbeat.same");
     Value *staleNext = BB.CreateSelect(
         stale, BB.CreateAdd(staleCount, ConstantInt::get(i32, 1)),
         ConstantInt::get(i32, 0), "morok.watchdog.heartbeat.stale.next");
-    Value *missing = BB.CreateICmpUGE(staleNext, ConstantInt::get(i32, 2),
-                                      "morok.watchdog.heartbeat.missing");
+    Value *missing = BB.CreateICmpUGE(
+        staleNext, ConstantInt::get(i32, kWatchdogCryptoStaleThreshold),
+        "morok.watchdog.heartbeat.missing");
     foldState(BB, State, cur, 0x35A8F179C46D20B3ULL,
               "morok.watchdog.heartbeat.sample");
     foldFlag(BB, State, missing, 0xC7D2841AF09B53E6ULL,
@@ -2371,6 +2395,7 @@ Function *heartbeatWatchThread(Module &M, GlobalVariable *State,
     auto *cryptoOld =
         BB.CreateLoad(i64, Crypto, "morok.watchdog.crypto.old");
     cryptoOld->setVolatile(true);
+    cryptoOld->setAtomic(AtomicOrdering::Monotonic);
     cryptoOld->setAlignment(Align(8));
     Value *cryptoDrift = BB.CreateXor(
         BB.CreateMul(cur, ConstantInt::get(i64, rng.next() | 1ULL)),
@@ -2382,6 +2407,7 @@ Function *heartbeatWatchThread(Module &M, GlobalVariable *State,
         cryptoOld, "morok.watchdog.crypto.next");
     auto *cryptoStore = BB.CreateStore(cryptoNext, Crypto);
     cryptoStore->setVolatile(true);
+    cryptoStore->setAtomic(AtomicOrdering::Monotonic);
     cryptoStore->setAlignment(Align(8));
     Value *next = BB.CreateAdd(iter, ConstantInt::get(i32, 1));
     BB.CreateBr(loopBB);
