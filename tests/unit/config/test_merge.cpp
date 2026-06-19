@@ -134,6 +134,7 @@ TEST_CASE("merge handles every pass family") {
     src.hash_self_decrypt.enabled = true;
     src.hash_self_decrypt.probability = 91u;
     src.hash_self_decrypt.max_payloads = 3u;
+    src.hash_self_decrypt.max_payload_bytes = 8192u;
     src.hash_self_decrypt.context_keying = false;
     src.self_checksum.enabled = true;
     src.self_checksum.probability = 82u;
@@ -297,6 +298,7 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.hash_self_decrypt.enabled == true);
     CHECK(dst.hash_self_decrypt.probability == 91u);
     CHECK(dst.hash_self_decrypt.max_payloads == 3u);
+    CHECK(dst.hash_self_decrypt.max_payload_bytes == 8192u);
     CHECK(dst.hash_self_decrypt.context_keying == false);
     CHECK(dst.self_checksum.enabled == true);
     CHECK(dst.self_checksum.probability == 82u);

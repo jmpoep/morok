@@ -162,6 +162,8 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.hash_self_decrypt.probability);
     mergeOpt(dst.hash_self_decrypt.max_payloads,
              src.hash_self_decrypt.max_payloads);
+    mergeOpt(dst.hash_self_decrypt.max_payload_bytes,
+             src.hash_self_decrypt.max_payload_bytes);
     mergeOpt(dst.hash_self_decrypt.context_keying,
              src.hash_self_decrypt.context_keying);
     // Self-checksum-fused constants

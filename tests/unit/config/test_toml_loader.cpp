@@ -203,6 +203,7 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     enabled = true
     probability = 92
     max_payloads = 3
+    max_payload_bytes = 4096
     context_keying = true
     [passes.self_checksum_constants]
     enabled = true
@@ -401,6 +402,7 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.hash_self_decrypt.enabled == true);
     CHECK(r.config.passes.hash_self_decrypt.probability == 92u);
     CHECK(r.config.passes.hash_self_decrypt.max_payloads == 3u);
+    CHECK(r.config.passes.hash_self_decrypt.max_payload_bytes == 4096u);
     CHECK(r.config.passes.hash_self_decrypt.context_keying == true);
     CHECK(r.config.passes.self_checksum.enabled == true);
     CHECK(r.config.passes.self_checksum.probability == 83u);

@@ -98,6 +98,7 @@ max_registers = 128
 [passes.hash_gated_self_decrypt]
 probability = 100
 max_payloads = 16
+max_payload_bytes = 65536
 context_keying = true
 
 [passes.self_checksum_constants]

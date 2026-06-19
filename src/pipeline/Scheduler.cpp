@@ -406,6 +406,9 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
             config_.passes.hash_self_decrypt.probability.value_or(100);
         p.max_payloads =
             config_.passes.hash_self_decrypt.max_payloads.value_or(2);
+        p.max_payload_bytes =
+            config_.passes.hash_self_decrypt.max_payload_bytes.value_or(
+                p.max_payload_bytes);
         p.context_keying =
             config_.passes.hash_self_decrypt.context_keying.value_or(true);
         changed |= passes::hashGatedSelfDecryptModule(M, p, rng);

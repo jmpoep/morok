@@ -151,6 +151,20 @@ std::size_t countNamedAllocas(BasicBlock &BB, StringRef prefix) {
     return n;
 }
 
+std::uint64_t maxStaticAllocaArrayBytes(Function &F, StringRef prefix) {
+    std::uint64_t maxBytes = 0;
+    for (Instruction &I : instructions(F)) {
+        auto *AI = dyn_cast<AllocaInst>(&I);
+        if (!AI || !AI->getName().starts_with(prefix))
+            continue;
+        auto *AT = dyn_cast<ArrayType>(AI->getAllocatedType());
+        if (!AT || !AT->getElementType()->isIntegerTy(8))
+            continue;
+        maxBytes = std::max(maxBytes, AT->getNumElements());
+    }
+    return maxBytes;
+}
+
 std::size_t countNamedInstructions(Function &F, StringRef prefix) {
     std::size_t n = 0;
     for (Instruction &I : instructions(F))
@@ -7836,6 +7850,65 @@ entry:
     CHECK(gateFallsIntoDecrypt);
     CHECK(decryptBranchesToDecide);
     CHECK(hasPostDecryptGateDecision);
+    CHECK(maxStaticAllocaArrayBytes(*Ensure, "morok.sdb.move.scratch") <=
+          64u * 1024u);
+    CHECK(maxStaticAllocaArrayBytes(*Seal, "morok.sdb.move.scratch") <=
+          64u * 1024u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("hashGatedSelfDecryptModule skips oversized bytecode payloads") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+@morok.vm.bytecode.big = private constant [17 x i8] c"0123456789abcdefg"
+
+define void @morok.vm.big.exec() {
+entry:
+  ret void
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(173);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::hashGatedSelfDecryptModule(
+        *M, {/*probability=*/100, /*max_payloads=*/1,
+             /*max_payload_bytes=*/16, /*context_keying=*/true},
+        rng));
+
+    GlobalVariable *Bytecode =
+        M->getGlobalVariable("morok.vm.bytecode.big", true);
+    REQUIRE(Bytecode);
+    CHECK(Bytecode->isConstant());
+    CHECK(M->getFunction("morok.sdb.ensure.big") == nullptr);
+    CHECK(M->getFunction("morok.sdb.seal.big") == nullptr);
+    CHECK(countGlobals(*M, "morok.sdb.ready") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("hashGatedSelfDecryptModule caps generated scratch alloca size") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+@morok.vm.bytecode.edge = private constant [16 x i8] c"0123456789abcdef"
+
+define void @morok.vm.edge.exec() {
+entry:
+  ret void
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(174);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::hashGatedSelfDecryptModule(
+        *M, {/*probability=*/100, /*max_payloads=*/1,
+             /*max_payload_bytes=*/16, /*context_keying=*/true},
+        rng));
+
+    Function *Ensure = M->getFunction("morok.sdb.ensure.edge");
+    REQUIRE(Ensure);
+    Function *Seal = M->getFunction("morok.sdb.seal.edge");
+    REQUIRE(Seal);
+    CHECK(maxStaticAllocaArrayBytes(*Ensure, "morok.sdb.move.scratch") == 16u);
+    CHECK(maxStaticAllocaArrayBytes(*Seal, "morok.sdb.move.scratch") == 16u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

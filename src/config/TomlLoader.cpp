@@ -211,6 +211,7 @@ void parseHashSelfDecrypt(const toml::table &t, HashSelfDecryptConfig &c) {
     c.enabled = readBool(t["enabled"]);
     c.probability = readU32(t["probability"]);
     c.max_payloads = readU32(t["max_payloads"]);
+    c.max_payload_bytes = readU32(t["max_payload_bytes"]);
     c.context_keying = readBool(t["context_keying"]);
 }
 

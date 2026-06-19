@@ -21,3 +21,4 @@ max_registers = 200
 enabled = true
 probability = 100
 max_payloads = 16
+max_payload_bytes = 65536

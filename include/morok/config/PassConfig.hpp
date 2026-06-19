@@ -172,6 +172,7 @@ struct HashSelfDecryptConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
     Opt<std::uint32_t> max_payloads;
+    Opt<std::uint32_t> max_payload_bytes;
     Opt<bool> context_keying;
 };
 

@@ -162,6 +162,7 @@ PassConfig makeLow() {
     c.hash_self_decrypt.enabled = false;
     c.hash_self_decrypt.probability = 0;
     c.hash_self_decrypt.max_payloads = 0;
+    c.hash_self_decrypt.max_payload_bytes = 0;
     c.hash_self_decrypt.context_keying = false;
 
     c.self_checksum.enabled = false;
@@ -374,6 +375,7 @@ PassConfig makeMid() {
     c.hash_self_decrypt.enabled = false;
     c.hash_self_decrypt.probability = 0;
     c.hash_self_decrypt.max_payloads = 0;
+    c.hash_self_decrypt.max_payload_bytes = 0;
     c.hash_self_decrypt.context_keying = false;
 
     c.self_checksum.enabled = false;
@@ -592,6 +594,7 @@ PassConfig makeHigh() {
     c.hash_self_decrypt.enabled = true;
     c.hash_self_decrypt.probability = 100;
     c.hash_self_decrypt.max_payloads = 1;
+    c.hash_self_decrypt.max_payload_bytes = 64 * 1024;
     c.hash_self_decrypt.context_keying = true;
 
     c.self_checksum.enabled = true;
@@ -832,6 +835,7 @@ PassConfig makeMax() {
     c.hash_self_decrypt.enabled = true;
     c.hash_self_decrypt.probability = 100;
     c.hash_self_decrypt.max_payloads = 16;
+    c.hash_self_decrypt.max_payload_bytes = 64 * 1024;
     c.hash_self_decrypt.context_keying = true;
 
     c.self_checksum.enabled = true;

@@ -683,7 +683,7 @@ shares where needed.
 | `vtable_integrity` | `enabled` |
 | `decoy_strings` | `enabled` |
 | `virtualization` | `enabled`, `probability`, `max_functions`, `max_instructions`, `max_registers` |
-| `hash_gated_self_decrypt` | `enabled`, `probability`, `max_payloads`, `context_keying` |
+| `hash_gated_self_decrypt` | `enabled`, `probability`, `max_payloads`, `max_payload_bytes`, `context_keying` |
 | `self_checksum_constants` | `enabled`, `probability`, `max_constants`, `region_bytes` |
 | `data_flow_integrity` | `enabled`, `probability`, `max_tables`, `region_bytes` |
 | `mutual_guard_graph` | `enabled`, `probability`, `nodes`, `region_bytes`, `max_returns` |

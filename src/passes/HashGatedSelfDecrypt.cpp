@@ -193,8 +193,12 @@ std::vector<std::uint8_t> readBytes(GlobalVariable &GV) {
     return Bytes;
 }
 
-std::vector<Payload> collectPayloads(Module &M) {
+std::vector<Payload> collectPayloads(Module &M,
+                                     std::uint32_t MaxPayloadBytes) {
     std::vector<Payload> Payloads;
+    if (MaxPayloadBytes == 0)
+        return Payloads;
+
     for (GlobalVariable &GV : M.globals()) {
         if (!GV.getName().starts_with(kBytecodePrefix))
             continue;
@@ -203,6 +207,8 @@ std::vector<Payload> collectPayloads(Module &M) {
         auto *ArrTy = dyn_cast<ArrayType>(GV.getValueType());
         if (!ArrTy || !ArrTy->getElementType()->isIntegerTy(8) ||
             ArrTy->getNumElements() == 0)
+            continue;
+        if (ArrTy->getNumElements() > MaxPayloadBytes)
             continue;
         std::string Suffix =
             GV.getName().drop_front(kBytecodePrefix.size()).str();
@@ -1024,10 +1030,12 @@ bool wrapPayload(Module &M, Payload &P,
 bool hashGatedSelfDecryptModule(Module &M,
                                 const HashGatedSelfDecryptParams &Params,
                                 ir::IRRandom &Rng) {
-    if (Params.probability == 0 || Params.max_payloads == 0)
+    if (Params.probability == 0 || Params.max_payloads == 0 ||
+        Params.max_payload_bytes == 0)
         return false;
 
-    std::vector<Payload> Payloads = collectPayloads(M);
+    std::vector<Payload> Payloads =
+        collectPayloads(M, Params.max_payload_bytes);
     if (Payloads.empty())
         return false;
     shufflePayloads(Payloads, Rng);

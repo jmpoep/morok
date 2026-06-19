@@ -82,6 +82,7 @@ TEST_CASE("low preset matches the documented table") {
     CHECK(c.uniform_lower.enabled == false);
     CHECK(c.virtualization.enabled == false);
     CHECK(c.hash_self_decrypt.enabled == false);
+    CHECK(c.hash_self_decrypt.max_payload_bytes == 0u);
     CHECK(c.self_checksum.enabled == false);
     CHECK(c.data_flow_integrity.enabled == false);
     CHECK(c.mutual_guard.enabled == false);
@@ -166,6 +167,7 @@ TEST_CASE("mid preset matches the documented table") {
     CHECK(c.uniform_lower.max_branches == 2u);
     CHECK(c.virtualization.enabled == false);
     CHECK(c.hash_self_decrypt.enabled == false);
+    CHECK(c.hash_self_decrypt.max_payload_bytes == 0u);
     CHECK(c.self_checksum.enabled == false);
     CHECK(c.data_flow_integrity.enabled == false);
     CHECK(c.mutual_guard.enabled == false);
@@ -277,6 +279,7 @@ TEST_CASE("high preset matches the documented table") {
     CHECK(c.hash_self_decrypt.enabled == true);
     CHECK(c.hash_self_decrypt.probability == 100u);
     CHECK(c.hash_self_decrypt.max_payloads == 1u);
+    CHECK(c.hash_self_decrypt.max_payload_bytes == 65536u);
     CHECK(c.hash_self_decrypt.context_keying == true);
     CHECK(c.self_checksum.enabled == true);
     CHECK(c.self_checksum.probability == 20u);
@@ -384,6 +387,7 @@ TEST_CASE("max preset enables every pass at full intensity") {
     CHECK(c.uniform_lower.enabled == true);
     CHECK(c.virtualization.enabled == true);
     CHECK(c.hash_self_decrypt.enabled == true);
+    CHECK(c.hash_self_decrypt.max_payload_bytes == 65536u);
     CHECK(c.self_checksum.enabled == true);
     CHECK(c.data_flow_integrity.enabled == true);
     CHECK(c.mutual_guard.enabled == true);
