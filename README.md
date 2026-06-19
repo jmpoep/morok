@@ -1,35 +1,66 @@
 # Morok
 
-Morok is a modular C++23 LLVM New-PM IR obfuscator. It loads as a pass plugin
-inside `clang` or `opt`, rewrites LLVM IR, and emits a behaviourally identical
-program with fewer static landmarks, more hostile control/data flow, and layered
-runtime self-protection.
+Morok is a modular C++23 LLVM New-PM IR obfuscator. It loads as a pass
+plugin inside `clang` or `opt`, rewrites LLVM IR, and emits a behaviorally
+equivalent program with fewer stable static landmarks, more hostile control and
+data flow, and optional runtime self-protection.
 
-The project is deliberately test-first. Pure arithmetic and encoding primitives
-live below LLVM and are exercised by exhaustive/property unit tests. The LLVM
-passes are tested as IR emitters and then as a whole pipeline by compiling and
-running real C/C++ programs clean vs obfuscated.
+The project is deliberately test-first. Pure arithmetic and encoding
+primitives live below LLVM and are exercised by exhaustive/property unit tests.
+The LLVM passes are tested as IR emitters and then as a whole pipeline by
+compiling and running real C/C++ programs clean vs obfuscated.
+
+Morok is intended for binaries you own or are explicitly authorized to protect
+and test. It raises static and dynamic analysis cost; it is not a trust
+boundary, a license system by itself, or a substitute for platform signing,
+attestation, sandboxing, or server-side policy.
+
+## Contents
+
+- [Scope](#scope)
+- [Repository Layout](#repository-layout)
+- [Build Requirements](#build-requirements)
+- [Build](#build)
+- [Authoritative Test Gate](#authoritative-test-gate)
+- [Quick Use](#quick-use)
+- [Cross Builds and Post-Link Sealing](#cross-builds-and-post-link-sealing)
+- [Configuration Model](#configuration-model)
+- [Presets](#presets)
+- [Annotations](#annotations)
+- [Scheduler Order](#scheduler-order)
+- [Pass Inventory](#pass-inventory)
+- [TOML Option Reference](#toml-option-reference)
+- [Platform Notes](#platform-notes)
+- [Static-Recovery Resistance Notes](#static-recovery-resistance-notes)
+- [Development Workflow](#development-workflow)
+- [Troubleshooting](#troubleshooting)
+- [Related Documents and Examples](#related-documents-and-examples)
+- [License](#license)
 
 ## Scope
 
-Morok can do things an LLVM pass can produce:
+Morok can do things an LLVM IR pass can produce:
 
-- Rewrite integer, floating, pointer, stack, PHI, branch, call, string, constant,
-  vtable, and VM bytecode IR.
+- Rewrite integer, floating, pointer, stack, PHI, branch, call, string,
+  constant, vtable, and VM bytecode IR.
 - Emit constructors, helper functions, helper threads, inline assembly,
   signal/exception handlers, direct syscalls, and platform-specific runtime
   probes into the target binary.
-- Generate per-build and per-callsite diversity from a deterministic seed.
-- Emit retained post-link manifests for later patchers where final native bytes
-  are needed.
+- Generate deterministic per-build and per-callsite diversity from a seed.
+- Emit retained post-link manifests for later patching where final native
+  bytes are needed.
+- Keep growth bounded with function, module, callsite, table, payload, clone,
+  route, and visit caps.
 
 Morok cannot do things that require external infrastructure:
 
-- It cannot sign Mach-O or PE files, provision entitlements, enable HVCI/PPL, or
-  turn on compiler/linker features such as CFG/XFG/CET/PAC/BTI/RELRO.
+- It cannot sign Mach-O or PE files, provision entitlements, enable HVCI/PPL,
+  or turn on compiler/linker features such as CFG/XFG/CET/PAC/BTI/RELRO.
 - It cannot provide TPM/SGX/TrustZone/SEV/Secure-Enclave remote roots of trust.
-- It cannot make a hostile kernel or hypervisor trustworthy. It raises cost and
-  creates tamper-sensitive dependencies inside userland code.
+- It cannot make a hostile kernel, debugger, hypervisor, or administrator
+  trustworthy.
+- It cannot make all platforms equally complete. Some high-intensity runtime
+  paths are currently Apple-first and are gated in the test suite elsewhere.
 
 The implementable protection backlog is tracked in
 [`docs/insurance-tasks.md`](docs/insurance-tasks.md). Algorithm and pass details
@@ -53,7 +84,7 @@ morok::ir         LLVM helper layer: annotations, symbol cloaking, IR random
 
 morok::passes     New-PM pass implementations plus testable free functions.
 
-libMorok          Loadable New-PM pass plugin and whole-pipeline scheduler.
+morok_plugin      Loadable New-PM pass plugin, emitted as libMorok.
 ```
 
 Tracked top-level paths:
@@ -62,29 +93,42 @@ Tracked top-level paths:
 include/morok/{core,config,ir,passes,pipeline}/   public headers
 src/{core,config,ir,passes,pipeline}/             implementations
 tests/{unit,ir,e2e}/                              unit, IR, and e2e gates
-programs/                                         local stress corpus, when present
 third_party/{doctest,tomlplusplus}/               vendored header-only deps
 cmake/Morok{LLVM,Test,Warnings}.cmake             build policy modules
 docs/algorithms.md                                pass and scheduler reference
 docs/hardness.md                                  primitive hardness notes
 docs/insurance-tasks.md                           implementable protection checklist
+docs/roadmap.md                                   design backlog and reality notes
 cross_build.sh                                    Linux/macOS cross-build helper
 run_tests.sh                                      authoritative local test entrypoint
+```
+
+Optional local paths may exist in a developer tree:
+
+```text
+programs/                                         stress corpus for compile/run sweeps
+crackmes/                                        example protected programs
+issues/                                          local issue triage material
+build*/                                          generated build trees
 ```
 
 ## Build Requirements
 
 - CMake 3.28 or newer.
 - Ninja.
-- A C++23 compiler.
+- A C11 and C++23 capable toolchain.
 - LLVM 18 or newer with the New-PM plugin API Morok targets.
 
 This tree currently validates a forked/custom LLVM plugin API:
-`<llvm/Plugins/PassPlugin.h>` with `LLVM_PLUGIN_API_VERSION == 2`. The CMake
+`<llvm/Plugins/PassPlugin.h>` with `LLVM_PLUGIN_API_VERSION == 2`. Upstream LLVM
+normally exposes `<llvm/Passes/PassPlugin.h>` with API version 1. The CMake
 probe in [`cmake/MorokLLVM.cmake`](cmake/MorokLLVM.cmake) fails loudly if the
 host LLVM cannot load the plugin ABI that Morok was compiled against.
 
-Build:
+The test/build helper defaults to a local LLVM install under `/Users/int/local`.
+Override with `CC`, `CXX`, and `LLVM_DIR` when using another matching LLVM.
+
+## Build
 
 ```sh
 cmake -S . -B build -G Ninja \
@@ -103,6 +147,18 @@ MOROK_WERROR=OFF           treat warnings as errors when ON
 MOROK_SANITIZE=OFF         ASan/UBSan for pure layers/tests when ON
 ```
 
+Plugin output names:
+
+```text
+macOS:   build/src/pipeline/libMorok.dylib
+Linux:   build/src/pipeline/libMorok.so
+Windows: build/src/pipeline/libMorok.dll
+```
+
+On Unix, the plugin is a loadable module that resolves LLVM symbols from the
+loading `clang`/`opt` process. On Windows, the plugin statically links the LLVM
+component libraries it uses and explicitly exports `llvmGetPassPluginInfo`.
+
 ## Authoritative Test Gate
 
 Use the top-level script unless you are intentionally narrowing the loop:
@@ -120,21 +176,32 @@ The full gate covers:
 |---|---|---|
 | `core` | exhaustive/property doctest suites | arithmetic, field, cipher, PRNG, sharing, and identity primitives are correct independently of LLVM |
 | `config` | doctest suites | presets, merge precedence, policy resolution, TOML parsing, and error paths |
-| `ir` / `passes` | LLVM-linked IR tests | every pass emits verifier-clean IR and actually fires on representative shapes |
+| `ir` / `passes` | LLVM-linked IR tests | every pass emits verifier-clean IR and fires on representative shapes |
 | whole pipeline | clean-vs-obfuscated differentials | compiled binaries preserve output across presets/configs/seeds |
-| `programs/` corpus | compile and runtime sweeps | real C/C++ programs compile at high/max intensity; curated deterministic programs also run byte-for-byte equal |
+| `programs/` corpus | compile and runtime sweeps, when present | real C/C++ programs compile at high/max intensity; curated deterministic programs also run byte-for-byte equal |
 
-On Apple hosts the e2e suite exercises the full high/max presets and VM-specific
-runtime gate. On non-Apple hosts, e2e uses the portable max configuration where
-backend/runtime porting is still incomplete; the IR tests still exercise the
-platform-specific emitters in-process.
+Platform behavior in the e2e suite:
+
+| Host | E2E behavior |
+|---|---|
+| Apple | Exercises built-in `high`/`max`, `tests/e2e/max.toml`, VM-specific differential tests, and adversarial post-link patch tests when Python is available. |
+| Non-Apple | Uses `tests/e2e/portable.toml` for high-intensity e2e paths where virtualization, trap-oracle recovery, and some anti-analysis runtime probes are not yet fully ported. |
+| Windows | Skips behavioral plugin-dlopen e2e tests; coverage comes from core/config/IR tests and targeted object-level checks. |
 
 ## Quick Use
+
+Set the plugin path once:
+
+```sh
+PLUGIN=build/src/pipeline/libMorok.dylib  # macOS
+# PLUGIN=build/src/pipeline/libMorok.so   # Linux
+# PLUGIN=build/src/pipeline/libMorok.dll  # Windows
+```
 
 Whole pipeline from `clang`:
 
 ```sh
-clang -O2 -fpass-plugin=build/src/pipeline/libMorok.dylib \
+clang -O2 -fpass-plugin="$PLUGIN" \
   -mllvm -morok \
   -mllvm -morok-preset=high \
   -mllvm -morok-seed=1234 \
@@ -144,51 +211,144 @@ clang -O2 -fpass-plugin=build/src/pipeline/libMorok.dylib \
 Whole pipeline from `opt`:
 
 ```sh
-opt -load-pass-plugin build/src/pipeline/libMorok.dylib \
+opt -load-pass-plugin "$PLUGIN" \
   -passes=morok prog.ll -o out.bc
 ```
 
 One standalone pass:
 
 ```sh
-opt -load-pass-plugin build/src/pipeline/libMorok.dylib \
+opt -load-pass-plugin "$PLUGIN" \
   -passes=morok-strenc prog.ll -o out.bc
 ```
 
 Configuration can be supplied by flag or environment:
 
 ```sh
-clang -O2 -fpass-plugin=build/src/pipeline/libMorok.dylib \
+clang -O2 -fpass-plugin="$PLUGIN" \
   -mllvm -morok \
   -mllvm -morok-config=morok.toml \
   -mllvm -morok-seed=0xC0FFEE \
   prog.c -o prog
 
-MOROK_CONFIG=morok.toml clang -O2 -fpass-plugin=... -mllvm -morok prog.c -o prog
+MOROK_CONFIG=morok.toml \
+MOROK_SEED=0xC0FFEE \
+clang -O2 -fpass-plugin="$PLUGIN" -mllvm -morok prog.c -o prog
 ```
 
-Cross-build helper:
+Environment switches recognized by the plugin:
+
+```text
+MOROK_ENABLE=1     opt into clang auto-injection without -mllvm -morok
+MOROK_CONFIG=path  config file fallback when -morok-config is absent
+MOROK_PRESET=high  preset fallback when no config file is loaded
+MOROK_SEED=1234    seed fallback when -morok-seed is absent or zero
+```
+
+When `-morok-config` or `MOROK_CONFIG` loads successfully, that file supplies
+the preset base through `[global].preset`; `-morok-preset` is only used when no
+config file is loaded. `-morok-seed` and `MOROK_SEED` override the config seed
+for reproducible builds.
+
+For `clang -fpass-plugin`, Morok also registers extension-point callbacks:
+
+- vectorizer-start: early optimizer amplification when enabled.
+- pipeline-early-simplification: VM candidate preservation for `-mllvm -morok`.
+- optimizer-last: the main Morok scheduler.
+
+## Cross Builds and Post-Link Sealing
+
+The helper in [`cross_build.sh`](cross_build.sh) builds a source file through
+Morok for Linux and/or macOS:
 
 ```sh
 ./cross_build.sh --source programs/cf_license_crackme.c --out-dir build/cross
 ./cross_build.sh --linux-only --source boo.c --out-dir build/cross
 ./cross_build.sh --macos-arches "arm64 x86_64" --preset max
+./cross_build.sh --config morok.toml --seed 832040
 ```
 
-For static Linux outputs, `cross_build.sh` derives a temporary config that
-disables `function_call_obfuscate`: a fully static binary has no dynamic loader,
-so a `dlsym(RTLD_DEFAULT, ...)` fallback cannot resolve imports at runtime and
-adds no useful hiding surface.
+Common options:
+
+| Option | Meaning |
+|---|---|
+| `--source PATH` | Source file to build. A positional source path is also accepted. |
+| `--out-dir DIR` | Output directory. |
+| `--preset NAME` | Preset to use when `--config` is not supplied. |
+| `--config PATH` | TOML config file to use instead of a preset-only build. |
+| `--seed N` | Deterministic Morok seed. |
+| `--clang PATH`, `--clangxx PATH` | C/C++ compiler drivers matching the plugin LLVM ABI. |
+| `--plugin PATH` | Morok plugin path. |
+| `--linux-target TRIPLE` | Linux target triple. |
+| `--linux-cc PATH` | GCC-compatible Linux cross toolchain driver for crt/libgcc lookup. |
+| `--macos-arches LIST` | Space-separated macOS arches or target triples. |
+| `--macos-min VERSION` | macOS deployment target. |
+| `--linux-only`, `--macos-only` | Build only one platform family. |
+| `--no-linux`, `--no-macos` | Skip one platform family. |
+| `--no-strip` | Leave produced binaries unstripped. |
+| `-h`, `--help` | Show the script help. |
+
+Recognized environment overrides include `BUILD_DIR`, `OUT_DIR`, `CLANG`,
+`CLANGXX`, `PLUGIN`, `PRESET`, `SEED`, `OPT_LEVEL`, `LINUX_TARGET`,
+`LINUX_CC`, `LINUX_STATIC`, `LINUX_SYSROOT`, `LINUX_STRIP`, `MACOS_ARCHES`,
+`MACOS_MIN`, `MACOS_SDK`, `SEAL_BINARIES`, `SEAL_WINDOW`, `SEAL_TOOL`, and
+`PYTHON`.
+
+Important defaults:
+
+```text
+source:       programs/cf_license_crackme.c
+out dir:      build/cross
+preset:       max, unless --config is provided
+seed:         832040
+optimization: -O3
+clang:        clang-23
+plugin:       build/src/pipeline/libMorok.dylib
+Linux target: x86_64-linux-musl
+macOS min:    13.0
+strip:        enabled
+sealing:      enabled
+```
+
+For static Linux outputs, `cross_build.sh` derives a temporary TOML config that
+forces `[passes.function_call_obfuscate].enabled = false`. A fully static binary
+has no dynamic loader, so dynamic import lookup has no useful hiding surface and
+can crash if left enabled.
+
+Post-link sealing is mandatory for shippable binaries that rely on
+`self_checksum_constants` or `mutual_guard_graph` native-code windows. The IR
+passes reserve retained manifests, but final code byte ranges are only known
+after linking and stripping. `cross_build.sh` seals automatically after strip
+and fails closed if no manifests are present. Manual sealing is:
+
+```sh
+python3 tests/e2e/adversarial_binary.py seal path/to/binary --window 262144
+```
+
+On macOS, an in-place seal invalidates the ad hoc signature, so the helper
+re-signs the binary after patching.
 
 ## Configuration Model
 
 Config layering is intentionally simple:
 
-1. `[global].preset` loads `low`, `mid`, `high`, or `max`.
+1. `[global].preset` loads `low`, `mid`, `high`, `max`, or `none`.
 2. `[passes.*]` sections override only fields they mention.
 3. Ordered `[[policy]]` rules can apply another preset and/or pass overrides to
    matching module/function regexes.
-4. `-mllvm -morok-seed=N` overrides the config seed for deterministic builds.
+4. `-mllvm -morok-seed=N` or `MOROK_SEED=N` overrides the config seed for
+   deterministic builds.
+
+Top-level global keys:
+
+```toml
+[global]
+preset = "high"
+seed = 0xDEADBEEF1337
+verbose = false
+trace = false
+demangle_names = true
+```
 
 Example:
 
@@ -218,38 +378,56 @@ passes.substitution.enabled = false
 function = "license|verify|decrypt"
 passes.mba.enabled = true
 passes.external_opaque_predicates.enabled = true
+passes.virtualization.enabled = true
 ```
+
+Policies are evaluated in file order by
+[`src/config/Resolver.cpp`](src/config/Resolver.cpp). Regexes match the module
+source filename and/or function name. If `demangle_names = true`, policy
+function matching uses demangled names where possible.
+
+## Presets
+
+| Preset | Intent |
+|---|---|
+| `none` | No preset base. Only explicitly enabled pass sections or policies apply. |
+| `low` | Light scalar/control rewriting, string encryption, constant sharing, split blocks, and retained decoy strings. |
+| `mid` | Broader scalar/control obfuscation with more density and vector/table features than `low`. |
+| `high` | Bounded aggressive mode: capped VM/self-decrypt/integrity/table/MQ/microstress/function-wrapper slices while keeping expensive graph-wide searches controlled. |
+| `max` | Full preset-managed stack: high probabilities, maximal tested budgets, anti-debug/anti-hook/timing/trap bundle, FCO, VM, self-decrypt, integrity, routing, wrappers, Windows pass toggles, and decoys. |
+
+The scheduler enforces instruction, block, function, module, byte, table,
+route, callsite, clone, payload, and visit caps. If a function or module grows
+beyond the relevant budget, later growth passes are skipped rather than
+allowing unbounded IR expansion.
+
+## Annotations
 
 Source annotations are copied from Clang's `llvm.global.annotations` into Morok
 metadata before scheduling:
 
 ```c
-__attribute__((annotate("sub")))    static int force_sub(int x) { return x + 1; }
-__attribute__((annotate("nosub")))  static int skip_sub(int x)  { return x + 1; }
+__attribute__((annotate("sub")))       static int force_sub(int x) { return x + 1; }
+__attribute__((annotate("nosub")))     static int skip_sub(int x)  { return x + 1; }
 __attribute__((annotate("sensitive"))) static int hot_secret(int x) { return x * 7; }
 ```
 
-Per-function annotation keys are the scheduler tags, such as `sub`, `mba`,
-`split`, `bcf`, `optamp`, `threshold`, `aliasop`, `extop`, `decoy`, `nistate`,
-`entfla`, `csm`, `fla`, `stateop`, `ifsm`, `phitangle`, `typepun`,
-`stackcoalesce`, `stackdelta`, `ptrlaunder`, `dfi`, `tablearith`, `uniform`,
-`vobf`, `pathexplode`, `mq`, `tracekey`, `dispatchless`, `microstress`,
-`selfcheck`, `mutualguard`, `shamir`, `constenc`, and `indibran`. Prefix any key
-with `no` to force it off for that function.
+Per-function annotation keys are the scheduler tags:
 
-### Presets
+```text
+aliasop, bcf, csm, constenc, decoy, dfi, dispatchless, entfla, extop,
+fla, ifsm, indibran, mba, microstress, mq, mutualguard, nistate, optamp,
+pathexplode, phitangle, ptrlaunder, selfcheck, shamir, split,
+stackcoalesce, stackdelta, stateop, sub, tablearith, threshold, tracekey,
+typepun, uniform, vobf
+```
 
-| Preset | Intent |
-|---|---|
-| `low` | Light scalar/control rewriting, string encryption, constant sharing, split blocks, and retained decoy strings. |
-| `mid` | Broader scalar/control obfuscation with more density and vector/table features than `low`. |
-| `high` | Bounded aggressive mode: small capped VM/self-decrypt/integrity/table/MQ/microstress/function-wrapper slices while keeping expensive graph-wide searches opt-in. |
-| `max` | Full preset-managed stack: high probabilities, maximal tested budgets, anti-debug/anti-hook/timing/trap bundle, FCO, VM, self-decrypt, integrity, routing, wrappers, and decoys. |
+Prefix any key with `no` to force that pass off for a function, for example
+`nomba`, `nobcf`, or `noconstenc`.
 
-The scheduler enforces instruction, block, function, module, byte, table, route,
-callsite, clone, and payload caps. If a function or module grows beyond the
-budget, later growth passes are skipped rather than allowing exponential IR
-growth.
+`sensitive` is special: when BCF, MBA, or external opaque predicates are unset
+or enabled, the scheduler raises their density on that function. Explicit
+negative annotations still win.
 
 ## Scheduler Order
 
@@ -266,12 +444,53 @@ VM(user code)
 -> function-call obfuscation
 -> vtable integrity
 -> per-function structural, scalar, CFG, data-flow, integrity, and literal passes
+-> leaf-helper seal binding
 -> VM/hardening for generated protection helpers
 -> nanomites
--> adversarial self-tuning / merge / function wrappers
+-> adversarial self-tuning / merge
+-> caller-keyed dispatch
+-> function wrappers
 -> per-build polymorphism
 -> misleading metadata
 -> generated-symbol privacy cleanup
+```
+
+Within the per-function loop, Morok runs structural and value-level transforms
+before routing/integrity/literal hiding:
+
+```text
+de-switch wide gate constants
+-> split
+-> BCF
+-> optimizer amplification
+-> substitution
+-> MBA
+-> sub-threshold persistence
+-> alias/external opaque predicates
+-> coherent decoys
+-> exactly one flattening family member: NiState / EntFla / CSM / Flatten
+-> state opaque predicates
+-> interprocedural FSM
+-> PHI tangling
+-> type punning
+-> stack coalescing
+-> stack delta games
+-> pointer laundering
+-> DFI
+-> table arithmetic
+-> uniform primitive lowering
+-> vector obfuscation
+-> path explosion
+-> MQ gates
+-> trace keying
+-> dispatcherless routing
+-> microcode stress
+-> self-checksum constants
+-> mutual guard graph
+-> Shamir sharing
+-> constant encryption
+-> condition-only constant encryption rescue
+-> indirect branch
 ```
 
 The precise maintained order is documented in
@@ -279,8 +498,9 @@ The precise maintained order is documented in
 
 ## Pass Inventory
 
-Each pass can be run standalone with `-passes=morok-*` or through the scheduler
-with a TOML section. Some final hygiene transforms, such as misleading metadata
+Each pass can be run standalone with `-passes=morok-*` where registered, or
+through the scheduler with a TOML section. Some final hygiene transforms, such
+as misleading metadata, leaf-helper seal binding, protection-helper hardening,
 and private-linkage cleanup for generated `morok.*` helpers, are scheduler-only.
 
 ### Structural, Control-Flow, and Decompiler Stress
@@ -288,7 +508,7 @@ and private-linkage cleanup for generated `morok.*` helpers, are scheduler-only.
 | Capability | `-passes` name | TOML section | Summary |
 |---|---|---|---|
 | Split basic blocks | `morok-split` | `split_blocks` | Splits blocks into more dispatch targets. |
-| Bogus control flow | `morok-bcf` | `bcf` | Opaque-true guarded junk/decoy edges with optional entropy/junk-asm pressure. |
+| Bogus control flow | `morok-bcf` | `bcf` | Adds opaque-true guarded junk/decoy edges with optional entropy and inline-asm pressure. |
 | Flattening | `morok-flatten` | `flattening` | Classic switch-dispatcher control-flow flattening. |
 | Data-entangled flattening | `morok-entfla` | `data_entangled_flattening` | Stores successor state through live-data and previous-state tokens. |
 | Non-invertible state | `morok-nistate` | `non_invertible_state` | Uses keyed lossy hashes for encoded dispatcher states. |
@@ -333,7 +553,8 @@ and private-linkage cleanup for generated `morok.*` helpers, are scheduler-only.
 | Capability | `-passes` name | TOML section | Summary |
 |---|---|---|---|
 | String encryption | `morok-strenc` | `string_encryption` | Encrypts eligible private byte-array globals with a unique per-string cipher. Safe C-string callsites are materialized into per-use stack buffers; unsupported uses get per-string constructor decryptors. |
-| Function-call obfuscation | `morok-fco` | `function_call_obfuscate` | Hides external calls behind per-site import indirection. Linux/macOS 64-bit paths use manual export-by-hash resolvers and avoid plaintext `dlsym`; unsupported targets use per-site cloaked `dlsym`. |
+| Function-call obfuscation | `morok-fco` | `function_call_obfuscate` | Hides external calls behind per-site import indirection. Linux/macOS 64-bit paths use manual export-by-hash resolvers where supported; unsupported targets use per-site cloaked dynamic lookup. |
+| Caller-keyed dispatch | `morok-ckd` | `caller_keyed_dispatch` | Collapses surviving direct user calls through a shared dispatch hub keyed by caller context and integrity bytes. |
 | Function wrapper | `morok-funcwrap` | `function_wrapper` | Wraps calls after per-function transforms so callers see proxy edges. |
 | VTable integrity | `morok-vtable` | `vtable_integrity` | Guards Itanium C++ virtual dispatches by expected vptr, slot, target, and cookie hash. |
 | Decoy strings | `morok-decoystr` | `decoy_strings` | Distributes retained plaintext honeypot diagnostics and fake logging infrastructure. |
@@ -346,7 +567,7 @@ user strings are encrypted, length-padded where safe, and materialized lazily.
 
 | Capability | `-passes` name | TOML section | Summary |
 |---|---|---|---|
-| Virtualization | `morok-vm` | `virtualization` | Lifts eligible integer/pointer computation kernels to encrypted threaded bytecode VMs, including multi-block, memory, cast, compare, division, and selected intrinsic idioms. |
+| Virtualization | `morok-vm` | `virtualization` | Lifts eligible integer/pointer computation kernels to encrypted threaded bytecode VMs, including multi-block, memory, cast, compare, division, selected intrinsics, and direct internal helper calls when safe. |
 | Hash-gated self-decrypt | `morok-selfdecrypt` | `hash_gated_self_decrypt` | Lazily decrypts VM bytecode from runtime hashes/context and re-encrypts on helper exit. |
 | Self-checksum constants | `morok-selfcheck` | `self_checksum_constants` | Fuses constants with runtime checksum diffs so tamper corrupts data instead of branching. |
 | Mutual guard graph | `morok-mutualguard` | `mutual_guard_graph` | Emits overlapping checksum nodes whose aggregate diff poisons scalar returns. |
@@ -365,7 +586,7 @@ logic is not left as a simple native plaintext island.
 | Anti-hooking | `morok-antihook` | `anti_hooking` | Clean-copy executable byte diff, prologue hook scan, function-window MACs, GOT/PLT or Mach-O fixup validation, W^X enforcement, address-space census, guarded pages, anti-dump, call-stack origin checks, method divergence, anti-VM/DBI heuristics, negative-space verification, and corroboration scoring. |
 | Anti-class-dump | `morok-antiacd` | `anti_class_dump` | Scrambles Objective-C metadata when present. |
 | Timing oracle | `morok-timing` | `timing_oracles` | Samples short spans with independent clocks and folds slow/divergent distributions into private state. |
-| Trap oracle | `morok-trap` | `trap_oracles` | Installs temporary trap handlers and checks `int3`/`icebp`/TF or portable `SIGTRAP` delivery. |
+| Trap oracle | `morok-trap` | `trap_oracles` | Installs temporary trap handlers and checks trap delivery. |
 | Page-fault/TLB oracle | `morok-pftlb` | `page_fault_oracles` | Maps protected code islands, validates fault provenance, and folds missing/extra/slow faults into state. |
 | Cache-timing oracle | `morok-cachetime` | `cache_timing_oracles` | Pseudo-random pointer chase over code bytes with clock distribution checks. |
 | Microarchitectural canary | `morok-microcanary` | `microarchitectural_canaries` | Samples branch-prediction/speculation side effects as low-confidence timing evidence. |
@@ -382,24 +603,136 @@ foundation helpers instead of hardcoding duplicate offsets or import paths.
 | PEB/heap debug checks | `morok-winpeb` | `windows_peb_heap_debug` | Reads `BeingDebugged`, `NtGlobalFlag`, `ProcessHeap`, `Flags`, and `ForceFlags` directly. |
 | Debug-object battery | `morok-windbgobj` | `windows_debug_object` | Resolves NT APIs by hashed export and probes debug port/object/flags plus debug-object type count. |
 | Thread hide | `morok-winthide` | `windows_thread_hide` | Walks threads, applies `ThreadHideFromDebugger`, queries it back, and folds failures. |
-| Anti-attach | `morok-winattach` | `windows_anti_attach` | Patches `DbgUiRemoteBreakin` and `DbgBreakPoint`, probes invalid-handle behavior, and avoids plaintext NT/API names. |
+| Anti-attach | `morok-winattach` | `windows_anti_attach` | Patches debugger attach helpers, probes invalid-handle behavior, and avoids plaintext API names. |
 | Kernel-debugger census | `morok-winkdbg` | `windows_kernel_debugger` | Reads `SharedUserData`, queries kernel-debugger state, samples module/parent/window-class signals. |
-| Direct/indirect syscalls | `morok-winsys` | `windows_syscalls` | Resolves SSNs with Hell's/Halo's/Tartarus-style stub scanning and compares direct vs recycled-gadget syscalls. |
+| Direct/indirect syscalls | `morok-winsys` | `windows_syscalls` | Resolves syscall numbers from runtime stubs and compares direct vs recycled-gadget syscall paths. |
 | KnownDlls unhook | `morok-winunhook` | `windows_unhook` | Maps pristine `ntdll.dll`/`kernel32.dll` text from KnownDlls and locally refreshes hooked `.text`. |
 | VEH audit | `morok-winveh` | `windows_veh_audit` | Locates/decode-candidates the internal VEH list and removes foreign handlers outside loader-known modules. |
-| Process mitigations | `morok-winmitigate` | `windows_process_mitigations` | Hash-resolves `SetProcessMitigationPolicy` and opts into ACG (`ProhibitDynamicCode`) and CIG (`MicrosoftSignedOnly`) after Morok's startup text repair. |
+| Process mitigations | `morok-winmitigate` | `windows_process_mitigations` | Hash-resolves `SetProcessMitigationPolicy` and opts into ACG/CIG after Morok's startup text repair. |
+
+## TOML Option Reference
+
+Every per-pass field is optional. Unset fields fall through to the preset,
+policy, or pass default. Percentages use `0..100` unless noted.
+
+### Global and Policy
+
+| Scope | Keys |
+|---|---|
+| `[global]` | `preset`, `seed`, `verbose`, `trace`, `demangle_names` |
+| `[[policy]]` | `module`, `function`, `preset`, nested `passes.<section>.<key>` overrides |
+
+### Structural and Control-Flow Sections
+
+| Section | Keys |
+|---|---|
+| `bcf` | `enabled`, `probability`, `iterations`, `complexity`, `entropy_chain`, `junk_asm`, `junk_asm_min`, `junk_asm_max` |
+| `split_blocks` | `enabled`, `splits`, `stack_confusion` |
+| `flattening` | `enabled` |
+| `data_entangled_flattening` | `enabled`, `max_terms` |
+| `non_invertible_state` | `enabled`, `max_terms`, `rounds` |
+| `state_opaque_predicates` | `enabled`, `probability`, `max_blocks`, `max_terms` |
+| `interprocedural_fsm` | `enabled`, `probability`, `max_sites`, `max_terms` |
+| `chaos_state_machine` | `enabled`, `generator`, `tf_const`, `nested_dispatch`, `warmup` |
+| `dispatcherless_routing` | `enabled`, `probability`, `max_routes`, `max_terms` |
+| `indirect_branch` | `enabled` |
+| `microcode_stress` | `enabled`, `probability`, `max_sites`, `table_entries`, `decoy_blocks`, `alias_stores` |
+| `path_explosion` | `enabled`, `probability`, `max_blocks`, `max_iterations` |
+| `coherent_decoys` | `enabled`, `probability`, `max_blocks`, `depth` |
+| `alias_opaque_predicates` | `enabled`, `probability`, `iterations`, `max_blocks` |
+| `external_opaque_predicates` | `enabled`, `probability`, `max_blocks`, `decoy_stores` |
+| `mq_gate` | `enabled`, `probability`, `vars`, `eqs`, `density`, `max_gates`, `fold_diff` |
+| `nanomites` | `enabled`, `probability`, `max_sites` |
+
+`chaos_state_machine.generator` accepts `logistic` or `tfunction`.
+
+### Scalar, Data, Stack, and Literal Sections
+
+| Section | Keys |
+|---|---|
+| `substitution` | `enabled`, `probability`, `iterations` |
+| `mba` | `enabled`, `probability`, `layers`, `heuristic` |
+| `optimizer_amplification` | `enabled`, `probability`, `max_forms` |
+| `sub_threshold_persistence` | `enabled`, `probability`, `max_terms` |
+| `constant_encryption` | `enabled`, `iterations`, `share_count`, `feistel`, `substitute_xor`, `substitute_xor_prob`, `globalize`, `globalize_prob`, `skip_value`, `force_value` |
+| `shamir_share` | `enabled`, `probability`, `threshold`, `shares`, `max_secrets` |
+| `table_arithmetic` | `enabled`, `probability`, `max_tables` |
+| `uniform_primitive_lowering` | `enabled`, `op_probability`, `branch_probability`, `max_tables`, `max_branches` |
+| `vector_obfuscation` | `enabled`, `probability`, `width`, `shuffle`, `lift_comparisons` |
+| `stack_coalescing` | `enabled`, `probability`, `opaque_offsets` |
+| `stack_delta_games` | `enabled`, `probability`, `max_blocks`, `min_bytes`, `max_extra_bytes`, `touches` |
+| `pointer_laundering` | `enabled`, `pointer_probability`, `integer_probability` |
+| `type_punning` | `enabled`, `probability`, `include_floating`, `max_targets` |
+| `phi_tangling` | `enabled`, `probability`, `layers`, `max_phis` |
+
+`constant_encryption.globalize` and `globalize_prob` are parsed for forward
+compatibility. Current constant encryption always emits private volatile global
+shares where needed.
+
+`vector_obfuscation.width` accepts the pass-supported SIMD width values
+`128`, `256`, and `512`.
+
+### Strings, Calls, VM, Integrity, and Runtime Sections
+
+| Section | Keys |
+|---|---|
+| `string_encryption` | `enabled`, `probability`, `skip_content`, `force_content` |
+| `function_call_obfuscate` | `enabled` |
+| `caller_keyed_dispatch` | `enabled`, `probability`, `max_calls`, `region_bytes` |
+| `function_wrapper` | `enabled`, `probability`, `times` |
+| `vtable_integrity` | `enabled` |
+| `decoy_strings` | `enabled` |
+| `virtualization` | `enabled`, `probability`, `max_functions`, `max_instructions`, `max_registers` |
+| `hash_gated_self_decrypt` | `enabled`, `probability`, `max_payloads`, `context_keying` |
+| `self_checksum_constants` | `enabled`, `probability`, `max_constants`, `region_bytes` |
+| `data_flow_integrity` | `enabled`, `probability`, `max_tables`, `region_bytes` |
+| `mutual_guard_graph` | `enabled`, `probability`, `nodes`, `region_bytes`, `max_returns` |
+| `execution_trace_keying` | `enabled`, `probability`, `max_blocks` |
+| `adversarial_function_merging` | `enabled`, `probability`, `max_groups`, `max_functions`, `outline_probability`, `max_outlines` |
+| `adversarial_self_tuning` | `enabled`, `max_candidates`, `max_candidate_passes`, `score_floor`, `emit_marker` |
+| `per_build_polymorphism` | `enabled`, `function_order`, `block_order`, `anchor_probability`, `max_anchors` |
+
+`skip_content`, `force_content`, `skip_value`, and `force_value` are string
+arrays.
+
+### Anti-Analysis and Platform Toggle Sections
+
+These sections currently accept only `enabled`:
+
+```text
+anti_debugging
+anti_hooking
+anti_class_dump
+windows_pe_foundation
+windows_peb_heap_debug
+windows_debug_object
+windows_thread_hide
+windows_anti_attach
+windows_kernel_debugger
+windows_syscalls
+windows_unhook
+windows_veh_audit
+windows_process_mitigations
+timing_oracles
+trap_oracles
+page_fault_oracles
+cache_timing_oracles
+microarchitectural_canaries
+```
 
 ## Platform Notes
 
-- Linux x86_64: Morok uses inline `syscall` for sensitive anti-debug/anti-hook
-  operations where syscall numbers/layouts are known. Static Linux cross-builds
-  disable FCO automatically unless you provide an explicit config that says
+- macOS arm64/x86_64: primary full-pipeline e2e target. The Apple test path
+  exercises the full `high`/`max` presets, VM-specific tests, and adversarial
+  post-link patch tests when Python is available.
+- Linux x86_64: supported for core/config/IR and portable e2e gates. Static
+  cross-builds disable FCO automatically unless an explicit config chooses
   otherwise.
-- macOS x86_64/arm64: anti-debugging uses Darwin syscalls or Mach APIs as
-  appropriate; FCO's 64-bit macOS path parses Mach-O exports by hash and avoids
-  plaintext `dlsym` for supported symbols.
+- Linux arm64 and other non-Apple hosts: use the portable e2e configuration for
+  high-intensity runtime tests until the VM/trap/anti-analysis runtime paths are
+  fully ported.
 - Windows x86_64: Windows-specific passes emit PE/PEB/TEB/export/syscall/VEH
-  helpers into Windows-targeted IR. Behavioural e2e plugin loading is skipped on
+  helpers into Windows-targeted IR. Behavioral e2e plugin loading is skipped on
   Windows hosts; coverage comes from core/config/IR tests and targeted object
   smokes.
 - Unsupported triples keep conservative fallbacks or no-op for passes that need
@@ -414,12 +747,16 @@ The current string/import strategy is designed against simple static decoders:
   constructor per string.
 - Each string has independent key material, keystream variant, ADD/XOR combine,
   and odd multiplier, all perturbed through volatile runtime state.
-- Linux/macOS FCO does not need to emit symbol names for supported 64-bit
-  targets; it carries hashes and resolves exports manually.
+- Linux/macOS FCO avoids plaintext symbol strings for supported 64-bit manual
+  resolver paths and otherwise falls back conservatively.
 - Per-callsite cached function pointers are encoded with volatile seed/key
   material and exist as raw pointers only immediately before the indirect call.
+- Caller-keyed dispatch, function wrappers, adversarial merge/outline, and
+  per-build polymorphism reduce stable caller/callee shape across builds.
 - Decoy strings are retained and plaintext by design, so `strings` should find
   bait while real user strings remain hidden.
+- Generated `morok.*` helpers are demoted to private linkage at the end of the
+  scheduler so descriptive helper names do not reach the object symbol table.
 
 ## Development Workflow
 
@@ -431,7 +768,15 @@ cmake --build build --target morok_ir_tests morok_config_tests morok_plugin
 ./build/tests/unit/config/morok_config_tests
 ```
 
-Before merging or pushing a completed feature, run:
+For core/config edits:
+
+```sh
+cmake --build build --target morok_core_tests morok_config_tests
+./build/tests/unit/core/morok_core_tests
+./build/tests/unit/config/morok_config_tests
+```
+
+Before merging or pushing a completed code feature, run:
 
 ```sh
 ./run_tests.sh
@@ -439,8 +784,40 @@ git diff --check
 ```
 
 When touching platform runtime emitters, add a targeted object/binary smoke that
-proves the relevant names are absent from `strings` and that the emitted object
-contains the expected constructor/helper shape.
+proves the relevant strings/symbols are absent where expected and that the
+emitted object contains the expected constructor/helper shape.
+
+When touching post-link integrity, verify both halves:
+
+```sh
+./run_tests.sh -L adversarial
+python3 tests/e2e/adversarial_binary.py seal path/to/binary --window 262144
+```
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| CMake cannot find `llvm/Plugins/PassPlugin.h` | Host LLVM is upstream or wrong fork/API | Point `LLVM_DIR` at the matching custom LLVM install. |
+| Plugin load reports API/version mismatch | `clang`/`opt` and Morok were built against different LLVM plugin ABIs | Rebuild Morok with the same LLVM used by the host driver. |
+| `-mllvm -morok` is unknown on Windows | Windows plugin cl::opts are not parsed by host clang the same way | Use `MOROK_ENABLE=1` plus `MOROK_CONFIG`, `MOROK_PRESET`, and `MOROK_SEED`. |
+| Static Linux binary crashes around import indirection | FCO was left enabled in a static link | Use `cross_build.sh` or force `[passes.function_call_obfuscate].enabled = false`. |
+| Self-checksum does not detect a native patch | Post-link manifests were not sealed | Seal after final link/strip and fail closed if manifest count is zero. |
+| E2E max fails off Apple | Some max-level runtime/backend paths are still Apple-first | Use `tests/e2e/portable.toml` and consult the comments in that file. |
+| A huge input stops getting later transforms | Scheduler growth budgets are firing | Narrow with policy/annotations or increase the specific pass budget after adding tests. |
+
+## Related Documents and Examples
+
+- [`docs/algorithms.md`](docs/algorithms.md): algorithm and scheduler reference.
+- [`docs/hardness.md`](docs/hardness.md): hardness-backed primitive specs.
+- [`docs/insurance.md`](docs/insurance.md): broader binary self-protection catalog.
+- [`docs/insurance-tasks.md`](docs/insurance-tasks.md): implementable task list.
+- [`docs/roadmap.md`](docs/roadmap.md): design backlog and known limits.
+- [`tests/e2e/*.toml`](tests/e2e): tested pipeline configurations.
+- [`crackmes/siloterminal/README.md`](crackmes/siloterminal/README.md):
+  freestanding/static crackme example.
+- [`crackmes/zorya/AUTHORS_NOTE.md`](crackmes/zorya/AUTHORS_NOTE.md):
+  sealed verifier example and security model.
 
 ## License
 
