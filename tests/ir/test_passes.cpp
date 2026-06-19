@@ -12089,11 +12089,18 @@ entry:
     CHECK(M->getFunction("sysctl") == nullptr);
     CHECK(M->getFunction("csops") == nullptr);
     CHECK(M->getFunction("getenv") != nullptr);
-    // M2 const→thunk: svc bytes live in a const, JIT-published into a global
-    // thunk at runtime; the checks call through it (no inline svc landmark).
-    CHECK(M->getGlobalVariable("morok.svc.thunk", true) != nullptr);
+    // M2 direct syscall fallback: no imported MAP_JIT/icache helper can
+    // interpose or patch a mutable syscall thunk before checks execute.
+    CHECK(M->getGlobalVariable("morok.svc.thunk", true) == nullptr);
     CHECK(M->getFunction("morok.svc.fallback") != nullptr);
-    CHECK(M->getGlobalVariable("morok.svc.code", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.svc.code", true) == nullptr);
+    CHECK(M->getFunction("mmap") == nullptr);
+    CHECK(M->getFunction("pthread_jit_write_protect_np") == nullptr);
+    CHECK(M->getFunction("sys_icache_invalidate") == nullptr);
+    CHECK(countCallsTo(*M->getFunction("morok.antidbg"),
+                       "morok.svc.fallback") >= 1u);
+    CHECK(countCallsTo(*M->getFunction("morok.antidbg.probe"),
+                       "morok.svc.fallback") >= 1u);
     // M3: the loaded-image census enumerates dyld images to flag foreign dylibs.
     CHECK(M->getFunction("_dyld_get_image_name") != nullptr);
     CHECK(M->getFunction("_dyld_image_count") != nullptr);
