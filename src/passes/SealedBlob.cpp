@@ -36,7 +36,9 @@ constexpr StringLiteral kSection = ".morok.sealed";
 constexpr StringLiteral kSelectedPrefix = "morok.sealed.";
 constexpr StringLiteral kCipherPrefix = "morok.sealed.cipher.";
 constexpr StringLiteral kOpenPrefix = "morok.sealed.open.";
+constexpr StringLiteral kTagSinkPrefix = "morok.sealed.tag.sink.";
 constexpr std::uint64_t kDefaultMaxBlobBytes = 64 * 1024;
+constexpr std::uint64_t kRuntimeTagDomain = 0x6d726b3574397362ULL;
 
 struct RewriteSite {
     Instruction *inst = nullptr;
@@ -50,6 +52,8 @@ struct BlobPlan {
     std::uint64_t salt0 = 0;
     std::uint64_t salt1 = 0;
     std::uint32_t id = 0;
+    std::uint32_t magic_bytes = 0;
+    GlobalVariable *magic_sink = nullptr;
     SmallVector<RewriteSite, 8> sites;
 };
 
@@ -103,6 +107,25 @@ Value *emitKeystreamByte(IRBuilderBase &B, const BlobPlan &Plan, Value *Key,
                     "morok.sealed.ks.input");
     X = mix64(B, X, Plan.salt0 ^ Plan.salt1, "morok.sealed.ks.mix");
     return B.CreateTrunc(X, B.getInt8Ty(), "morok.sealed.ks.byte");
+}
+
+Value *emitRuntimeTagByte(IRBuilderBase &B, const BlobPlan &Plan, Value *Seed,
+                          Value *Index) {
+    auto *I64 = B.getInt64Ty();
+    Value *IdxA = B.CreateMul(
+        Index,
+        ConstantInt::get(I64, (Plan.salt1 ^ 0xA24BAED4963EE407ULL) | 1ULL),
+        "morok.sealed.tag.idx.a");
+    Value *IdxB =
+        B.CreateAdd(B.CreateShl(Index, ConstantInt::get(I64, 11),
+                                "morok.sealed.tag.idx.shl"),
+                    ConstantInt::get(I64, Plan.salt0 ^ kRuntimeTagDomain),
+                    "morok.sealed.tag.idx.b");
+    Value *X = B.CreateXor(Seed, IdxA, "morok.sealed.tag.seed");
+    X = B.CreateXor(X, IdxB, "morok.sealed.tag.input");
+    X = mix64(B, X, Plan.salt0 + Plan.salt1 + kRuntimeTagDomain,
+              "morok.sealed.tag.kdf");
+    return B.CreateTrunc(X, B.getInt8Ty(), "morok.sealed.tag.byte");
 }
 
 bool selected(const GlobalVariable &GV) {
@@ -254,6 +277,17 @@ void addAccessorAttrs(Function &F) {
     F.addFnAttr(Attribute::NoInline);
 }
 
+GlobalVariable *createTagSink(Module &M, const BlobPlan &Plan) {
+    auto *I64 = Type::getInt64Ty(M.getContext());
+    auto *GV = new GlobalVariable(
+        M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(I64, 0),
+        (Twine(kTagSinkPrefix) + Twine(Plan.id)).str());
+    GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    GV->setAlignment(Align(8));
+    return GV;
+}
+
 Value *emitStableAddressZero(IRBuilderBase &B, Function *Fn) {
     auto *I64 = B.getInt64Ty();
     auto *Slot = B.CreateAlloca(I64, nullptr, "morok.sealed.addr.slot");
@@ -312,6 +346,27 @@ Function *defineAccessor(Module &M, const BlobPlan &Plan,
 
     Value *Key = EB.CreateXor(ConstantInt::get(I64, Plan.key), Dynamic,
                               "morok.sealed.key");
+    Value *TagSeed = nullptr;
+    if (Plan.magic_sink && Plan.magic_bytes > 0) {
+        GlobalVariable *Seal =
+            runtime_seal::findChannel(M, runtime_seal::kAntiDebugChannel);
+        if (Seal) {
+            auto *Root = EB.CreateLoad(I64, Seal, "morok.sealed.tag.root");
+            Root->setVolatile(true);
+            Root->setAlignment(Align(8));
+            Value *SeedInput = EB.CreateXor(
+                Root,
+                ConstantInt::get(
+                    I64, kRuntimeTagDomain ^
+                             (static_cast<std::uint64_t>(Plan.id) << 32) ^
+                             Plan.salt1),
+                "morok.sealed.tag.root.mix");
+            TagSeed = mix64(EB, SeedInput, Plan.salt0 ^ kRuntimeTagDomain,
+                            "morok.sealed.tag.seed.kdf");
+        } else {
+            TagSeed = ConstantInt::get(I64, 0);
+        }
+    }
     Value *CipherBase = EB.CreateInBoundsGEP(
         Plan.gv->getValueType(), Plan.gv,
         {ConstantInt::get(I64, 0), ConstantInt::get(I64, 0)},
@@ -321,6 +376,11 @@ Function *defineAccessor(Module &M, const BlobPlan &Plan,
     IRBuilder<> LB(Loop);
     auto *Idx = LB.CreatePHI(I64, 2, "morok.sealed.i");
     Idx->addIncoming(ConstantInt::get(I64, 0), Entry);
+    PHINode *TagDiff = nullptr;
+    if (TagSeed) {
+        TagDiff = LB.CreatePHI(I64, 2, "morok.sealed.tag.diff");
+        TagDiff->addIncoming(ConstantInt::get(I64, 0), Entry);
+    }
     Value *CipherPtr = LB.CreateInBoundsGEP(LB.getInt8Ty(), CipherBase, Idx,
                                             "morok.sealed.cipher.ptr");
     auto *Cipher =
@@ -329,6 +389,19 @@ Function *defineAccessor(Module &M, const BlobPlan &Plan,
     Cipher->setAlignment(Align(1));
     Value *Plain = LB.CreateXor(Cipher, emitKeystreamByte(LB, Plan, Key, Idx),
                                 "morok.sealed.plain.byte");
+    Value *NextTagDiff = nullptr;
+    if (TagDiff) {
+        Value *Expected = emitRuntimeTagByte(LB, Plan, TagSeed, Idx);
+        Value *ByteDiff = LB.CreateZExt(
+            LB.CreateXor(Plain, Expected, "morok.sealed.tag.byte.diff"), I64,
+            "morok.sealed.tag.byte.diff64");
+        Value *InWindow =
+            LB.CreateICmpULT(Idx, ConstantInt::get(I64, Plan.magic_bytes),
+                             "morok.sealed.tag.window");
+        Value *Accum = LB.CreateOr(TagDiff, ByteDiff, "morok.sealed.tag.accum");
+        NextTagDiff =
+            LB.CreateSelect(InWindow, Accum, TagDiff, "morok.sealed.tag.next");
+    }
     Value *DstPtr = LB.CreateInBoundsGEP(LB.getInt8Ty(), Fn->getArg(0), Idx,
                                          "morok.sealed.dst.ptr");
     auto *Store = LB.CreateStore(Plain, DstPtr);
@@ -336,12 +409,22 @@ Function *defineAccessor(Module &M, const BlobPlan &Plan,
     Value *NextI =
         LB.CreateAdd(Idx, ConstantInt::get(I64, 1), "morok.sealed.next");
     Idx->addIncoming(NextI, Loop);
+    if (TagDiff)
+        TagDiff->addIncoming(NextTagDiff, Loop);
     LB.CreateCondBr(LB.CreateICmpULT(NextI,
                                      ConstantInt::get(I64, Plan.plain.size()),
                                      "morok.sealed.more"),
                     Loop, Done);
 
     IRBuilder<> DB(Done);
+    if (Plan.magic_sink && NextTagDiff) {
+        Value *SinkWord = runtime_seal::emitKdf64(
+            DB, NextTagDiff, Plan.salt0 ^ Plan.salt1 ^ kRuntimeTagDomain,
+            "morok.sealed.tag.poison");
+        auto *SinkStore = DB.CreateStore(SinkWord, Plan.magic_sink);
+        SinkStore->setVolatile(true);
+        SinkStore->setAlignment(Align(8));
+    }
     DB.CreateRetVoid();
     return Fn;
 }
@@ -415,8 +498,19 @@ bool sealedBlobModule(Module &M, const SealedBlobParams &Params,
     if (Plans.empty())
         return false;
 
+    const bool UseRuntimeTags =
+        Params.runtime_keyed_magic && Params.magic_bytes > 0;
+    if (UseRuntimeTags)
+        runtime_seal::getChannel(M, runtime_seal::kAntiDebugChannel, Rng);
+
     bool Changed = false;
-    for (const BlobPlan &Plan : Plans) {
+    for (BlobPlan &Plan : Plans) {
+        if (UseRuntimeTags) {
+            Plan.magic_bytes = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(Plan.plain.size(), Params.magic_bytes));
+            if (Plan.magic_bytes > 0)
+                Plan.magic_sink = createTagSink(M, Plan);
+        }
         encryptStorage(Plan);
         Function *Open = defineAccessor(M, Plan, Params);
         rewriteSite(Plan, Open, Params.zeroize_after_use);

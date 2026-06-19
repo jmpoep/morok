@@ -142,6 +142,8 @@ TEST_CASE("merge handles every pass family") {
     src.sealed_blob.key_sources = {"runtime_seal", "external_proof"};
     src.sealed_blob.delivery = "eager";
     src.sealed_blob.zeroize_after_use = false;
+    src.sealed_blob.runtime_keyed_magic = true;
+    src.sealed_blob.magic_bytes = 13u;
     src.fault_paged_payload.enabled = true;
     src.fault_paged_payload.probability = 92u;
     src.fault_paged_payload.max_payloads = 4u;
@@ -327,6 +329,8 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.sealed_blob.key_sources[1] == "external_proof");
     CHECK(dst.sealed_blob.delivery == "eager");
     CHECK(dst.sealed_blob.zeroize_after_use == false);
+    CHECK(dst.sealed_blob.runtime_keyed_magic == true);
+    CHECK(dst.sealed_blob.magic_bytes == 13u);
     CHECK(dst.fault_paged_payload.enabled == true);
     CHECK(dst.fault_paged_payload.probability == 92u);
     CHECK(dst.fault_paged_payload.max_payloads == 4u);

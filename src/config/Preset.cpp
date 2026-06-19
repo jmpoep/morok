@@ -190,6 +190,8 @@ PassConfig makeLow() {
     c.sealed_blob.max_blob_bytes = 0;
     c.sealed_blob.delivery = "eager";
     c.sealed_blob.zeroize_after_use = true;
+    c.sealed_blob.runtime_keyed_magic = false;
+    c.sealed_blob.magic_bytes = 0;
 
     c.self_checksum.enabled = false;
     c.self_checksum.probability = 0;
@@ -430,6 +432,8 @@ PassConfig makeMid() {
     c.sealed_blob.max_blob_bytes = 0;
     c.sealed_blob.delivery = "eager";
     c.sealed_blob.zeroize_after_use = true;
+    c.sealed_blob.runtime_keyed_magic = false;
+    c.sealed_blob.magic_bytes = 0;
 
     c.self_checksum.enabled = false;
     c.self_checksum.probability = 0;
@@ -678,6 +682,8 @@ PassConfig makeHigh() {
                                  "code_region"};
     c.sealed_blob.delivery = "eager";
     c.sealed_blob.zeroize_after_use = true;
+    c.sealed_blob.runtime_keyed_magic = true;
+    c.sealed_blob.magic_bytes = 8;
 
     c.self_checksum.enabled = true;
     c.self_checksum.probability = 20;
@@ -947,6 +953,8 @@ PassConfig makeMax() {
                                  "code_region"};
     c.sealed_blob.delivery = "eager";
     c.sealed_blob.zeroize_after_use = true;
+    c.sealed_blob.runtime_keyed_magic = true;
+    c.sealed_blob.magic_bytes = 16;
 
     c.self_checksum.enabled = true;
     c.self_checksum.probability = 100;

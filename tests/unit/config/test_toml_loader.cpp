@@ -271,6 +271,8 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     key_sources = ["runtime_seal", "external_proof", "code_region"]
     delivery = "eager"
     zeroize_after_use = false
+    runtime_keyed_magic = true
+    magic_bytes = 11
     [passes.self_checksum_constants]
     enabled = true
     probability = 83
@@ -498,6 +500,8 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.sealed_blob.key_sources[2] == "code_region");
     CHECK(r.config.passes.sealed_blob.delivery == "eager");
     CHECK(r.config.passes.sealed_blob.zeroize_after_use == false);
+    CHECK(r.config.passes.sealed_blob.runtime_keyed_magic == true);
+    CHECK(r.config.passes.sealed_blob.magic_bytes == 11u);
     CHECK(r.config.passes.self_checksum.enabled == true);
     CHECK(r.config.passes.self_checksum.probability == 83u);
     CHECK(r.config.passes.self_checksum.max_constants == 6u);

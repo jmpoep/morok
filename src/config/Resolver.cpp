@@ -223,6 +223,9 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.sealed_blob.delivery, src.sealed_blob.delivery);
     mergeOpt(dst.sealed_blob.zeroize_after_use,
              src.sealed_blob.zeroize_after_use);
+    mergeOpt(dst.sealed_blob.runtime_keyed_magic,
+             src.sealed_blob.runtime_keyed_magic);
+    mergeOpt(dst.sealed_blob.magic_bytes, src.sealed_blob.magic_bytes);
     // Self-checksum-fused constants
     mergeOpt(dst.self_checksum.enabled, src.self_checksum.enabled);
     mergeOpt(dst.self_checksum.probability, src.self_checksum.probability);

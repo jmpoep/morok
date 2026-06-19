@@ -217,6 +217,8 @@ struct SealedBlobConfig {
     std::vector<std::string> key_sources;
     Opt<std::string> delivery;
     Opt<bool> zeroize_after_use;
+    Opt<bool> runtime_keyed_magic;
+    Opt<std::uint32_t> magic_bytes;
 };
 
 struct SelfChecksumConfig {

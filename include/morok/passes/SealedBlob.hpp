@@ -30,6 +30,8 @@ struct SealedBlobParams {
     std::vector<std::string> key_sources = {"runtime_seal", "external_proof"};
     std::string delivery = "eager";
     bool zeroize_after_use = true;
+    bool runtime_keyed_magic = false;
+    std::uint32_t magic_bytes = 8;
 };
 
 /// Encrypt explicitly selected byte-array globals and rewrite supported uses to

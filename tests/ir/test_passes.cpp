@@ -8820,9 +8820,12 @@ entry:
     params.max_blobs = 2;
     params.max_blob_bytes = 32;
     params.key_sources = {"runtime_seal", "external_proof", "code_region"};
+    params.runtime_keyed_magic = true;
+    params.magic_bytes = 4;
     CHECK(morok::passes::sealedBlobModule(*M, params, rng));
 
     CHECK_FALSE(hasReadableByteString(*M, "magic"));
+    CHECK(M->getGlobalVariable("morok.seal.root.anti_debug", true) != nullptr);
     GlobalVariable *Cipher =
         M->getGlobalVariable("morok.sealed.cipher.0", true);
     REQUIRE(Cipher != nullptr);
@@ -8835,6 +8838,17 @@ entry:
     CHECK(Open->hasFnAttribute(Attribute::NoInline));
     CHECK(countNamedInstructions(*Open, "morok.sealed.cipher.byte") >= 1u);
     CHECK(countNamedInstructions(*Open, "morok.sealed.addr.zero") >= 1u);
+    CHECK(countNamedInstructions(*Open, "morok.sealed.tag.window") >= 1u);
+    CHECK(countNamedInstructions(*Open, "morok.sealed.tag.poison") >= 1u);
+    GlobalVariable *TagSink =
+        M->getGlobalVariable("morok.sealed.tag.sink.0", true);
+    REQUIRE(TagSink != nullptr);
+    bool sawTagSinkStore = false;
+    for (Instruction &I : instructions(*Open))
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+            sawTagSinkStore |=
+                SI->isVolatile() && SI->getPointerOperand() == TagSink;
+    CHECK(sawTagSinkStore);
 
     Function *Reader = M->getFunction("read_secret");
     REQUIRE(Reader != nullptr);

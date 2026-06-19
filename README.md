@@ -322,8 +322,8 @@ byte ranges are only known after linking and stripping. `cross_build.sh` seals
 automatically after strip and fails closed if no manifests are present. It then
 runs `tools/morok-audit.py` over the final output directory to reject unsealed
 manifests, placeholder manifest state, private-key sidecars, embedded
-development paths, and plaintext high-value release markers before anything is
-shipped. Manual sealing is:
+development paths, plaintext high-value release markers, and plaintext
+magic/sentinel markers before anything is shipped. Manual sealing is:
 
 ```sh
 python3 tests/e2e/adversarial_binary.py seal path/to/binary --window 262144
@@ -579,7 +579,7 @@ and private-linkage cleanup for generated `morok.*` helpers, are scheduler-only.
 | Capability | `-passes` name | TOML section | Summary |
 |---|---|---|---|
 | String encryption | `morok-strenc` | `string_encryption` | Encrypts eligible private byte-array globals with a unique per-string cipher. Safe C-string callsites are materialized into per-use stack buffers; unsupported uses get per-string constructor decryptors. |
-| Sealed blobs | `morok-sealedblob` | `sealed_blob` | Encrypts explicit `.morok.sealed` byte-array globals and rewrites supported reads through per-blob lazy accessors keyed by RuntimeSeal/external-proof material. |
+| Sealed blobs | `morok-sealedblob` | `sealed_blob` | Encrypts explicit `.morok.sealed` byte-array globals and rewrites supported reads through per-blob lazy accessors keyed by RuntimeSeal/external-proof material, with optional runtime-keyed magic-prefix diagnostics. |
 | Function-call obfuscation | `morok-fco` | `function_call_obfuscate` | Hides external calls behind per-site import indirection. Linux/macOS 64-bit paths use manual export-by-hash resolvers where supported; unsupported targets use per-site cloaked dynamic lookup. |
 | Caller-keyed dispatch | `morok-ckd` | `caller_keyed_dispatch` | Collapses surviving direct user calls through a shared dispatch hub keyed by caller context and post-link sealed integrity bytes. |
 | Function wrapper | `morok-funcwrap` | `function_wrapper` | Wraps calls after per-function transforms so callers see proxy edges. |
@@ -593,6 +593,11 @@ Sealed blobs are opt-in: mark a private byte-array global with section
 `.morok.sealed` or a `morok.sealed.` prefix. Supported load/no-capture call
 uses materialize into per-use stack buffers via a per-blob `morok.sealed.open.*`
 helper, then volatile-zero the temporary buffer when configured.
+With `runtime_keyed_magic=true`, each generated accessor derives a per-blob
+prefix tag from the anti-debug RuntimeSeal channel and the blob id, compares it
+against the materialized plaintext prefix without early exit, and stores only an
+opaque volatile diagnostic word. The compare is not the primary access gate and
+does not require a plaintext sentinel to survive in `.rodata`.
 
 ### Virtualization and Integrity Entanglement
 
@@ -734,7 +739,7 @@ shares where needed.
 | `hash_gated_self_decrypt` | `enabled`, `probability`, `max_payloads`, `max_payload_bytes`, `context_keying` |
 | `external_secret_binding` | `enabled`, `mode`, `public_key`, `identity_policy`, `bind_to_runtime_seal`, `virtualize_helpers` |
 | `tracer_attestation` | `enabled`, `mode`, `shares`, `renewal`, `bind_to_runtime_seal`, `virtualize_helpers` |
-| `sealed_blob` | `enabled`, `max_blobs`, `max_blob_bytes`, `key_sources`, `delivery`, `zeroize_after_use` |
+| `sealed_blob` | `enabled`, `max_blobs`, `max_blob_bytes`, `key_sources`, `delivery`, `zeroize_after_use`, `runtime_keyed_magic`, `magic_bytes` |
 | `self_checksum_constants` | `enabled`, `probability`, `max_constants`, `region_bytes` |
 | `data_flow_integrity` | `enabled`, `probability`, `max_tables`, `region_bytes` |
 | `mutual_guard_graph` | `enabled`, `probability`, `nodes`, `region_bytes`, `max_returns` |

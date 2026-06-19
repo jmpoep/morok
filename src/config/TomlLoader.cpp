@@ -264,6 +264,8 @@ void parseSealedBlob(const toml::table &t, SealedBlobConfig &c) {
     readStrArr(t["key_sources"], c.key_sources);
     c.delivery = readString(t["delivery"]);
     c.zeroize_after_use = readBool(t["zeroize_after_use"]);
+    c.runtime_keyed_magic = readBool(t["runtime_keyed_magic"]);
+    c.magic_bytes = readU32(t["magic_bytes"]);
 }
 
 void parseSelfChecksum(const toml::table &t, SelfChecksumConfig &c) {

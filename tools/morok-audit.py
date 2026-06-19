@@ -61,6 +61,16 @@ HIGH_VALUE_MARKERS = (
     b"PLACEHOLDER_CIPHERTEXT",
     b"UNSEALED_MANIFEST",
 )
+PLAINTEXT_SENTINEL_MARKERS = (
+    b"MOROK_MAGIC",
+    b"MOROK_SENTINEL",
+    b"MOROK_SEALED_MAGIC",
+    b"MOROK_SEALED_SENTINEL",
+    b"SEALED_BLOB_MAGIC",
+    b"SEALED_BLOB_SENTINEL",
+    b"placeholder_magic",
+    b"PLACEHOLDER_MAGIC",
+)
 
 
 @dataclass
@@ -204,6 +214,14 @@ class Auditor:
                     "plaintext-high-value-marker",
                     path,
                     f"release artifact contains plaintext marker {marker!r}",
+                )
+                break
+        for marker in PLAINTEXT_SENTINEL_MARKERS:
+            if marker in data:
+                self.emit_finding(
+                    "plaintext-sentinel-marker",
+                    path,
+                    f"release artifact contains plaintext sentinel {marker!r}",
                 )
                 break
 

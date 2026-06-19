@@ -315,6 +315,8 @@ TEST_CASE("high preset matches the documented table") {
     CHECK(c.sealed_blob.key_sources[0] == "runtime_seal");
     CHECK(c.sealed_blob.delivery == "eager");
     CHECK(c.sealed_blob.zeroize_after_use == true);
+    CHECK(c.sealed_blob.runtime_keyed_magic == true);
+    CHECK(c.sealed_blob.magic_bytes == 8u);
     CHECK(c.self_checksum.enabled == true);
     CHECK(c.self_checksum.probability == 20u);
     CHECK(c.self_checksum.max_constants == 4u);
@@ -428,6 +430,8 @@ TEST_CASE("max preset enables every pass at full intensity") {
     CHECK(c.tracer_attestation.enabled == true);
     CHECK(c.sealed_blob.enabled == true);
     CHECK(c.sealed_blob.max_blobs == 16u);
+    CHECK(c.sealed_blob.runtime_keyed_magic == true);
+    CHECK(c.sealed_blob.magic_bytes == 16u);
     CHECK(c.self_checksum.enabled == true);
     CHECK(c.data_flow_integrity.enabled == true);
     CHECK(c.mutual_guard.enabled == true);

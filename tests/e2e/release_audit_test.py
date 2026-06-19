@@ -157,6 +157,15 @@ def main(argv: list[str]) -> int:
                 str(allowlist),
             )
         )
+
+        sentinel = tmp / "sentinel"
+        sentinel.mkdir()
+        write_synthetic_elf(sentinel / "app", sealed=True)
+        (sentinel / "manifest.bin").write_bytes(b"prefix-MOROK_SEALED_MAGIC-suffix")
+        require_fail(
+            run(tool, sentinel, "--require-sealed-manifest"),
+            "plaintext-sentinel-marker",
+        )
     return 0
 
 

@@ -687,6 +687,27 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   remain outside later function-local transforms.  Already FPP-protected
   payloads are mutable and skipped.
 
+## Sealed blobs — explicit byte-array payloads
+- The pass only selects private byte-array globals explicitly marked with
+  section `.morok.sealed` or a `morok.sealed.` name prefix.  Supported
+  load/no-capture call uses are rewritten through per-blob accessors that
+  materialize a stack-local copy at the use site and optionally volatile-zero it
+  after use.  Unsupported escaping uses leave the original global untouched
+  instead of creating a partially protected payload.
+- Storage is replaced with per-blob ciphertext and the accessor derives its
+  stream from per-blob salts plus selected runtime sources (`runtime_seal`,
+  `external_proof`, and a stable code-region zero).  Runtime sources are
+  volatile-loaded or KDFed at the accessor, so there is no central decrypt-all
+  routine for selected blobs.
+- With `runtime_keyed_magic=true`, the accessor also derives a per-blob prefix
+  tag from the anti-debug RuntimeSeal channel, the blob id, and the blob salts.
+  It xors each materialized prefix byte against the derived tag byte and
+  accumulates the result for the configured `magic_bytes` window without
+  branching on the compare result.  The final word is KDFed and volatile-stored
+  to a private per-blob sink for diagnostics/dataflow provenance; the compare is
+  not the primary access gate and no plaintext sentinel needs to live in
+  `.rodata`.
+
 ## Self-checksum-fused constants — IR structure
 - True code-region checksums need post-link byte ranges.  The IR pass emits the
   runtime/data-flow contract over private `morok.sc.region.*` byte regions,

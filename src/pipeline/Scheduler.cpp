@@ -311,6 +311,9 @@ passes::SealedBlobParams sealedBlobParams(const config::SealedBlobConfig &C) {
         P.key_sources = C.key_sources;
     P.delivery = C.delivery.value_or(P.delivery);
     P.zeroize_after_use = C.zeroize_after_use.value_or(P.zeroize_after_use);
+    P.runtime_keyed_magic =
+        C.runtime_keyed_magic.value_or(P.runtime_keyed_magic);
+    P.magic_bytes = C.magic_bytes.value_or(P.magic_bytes);
     return P;
 }
 
