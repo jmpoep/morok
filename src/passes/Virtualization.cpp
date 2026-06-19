@@ -75,6 +75,7 @@ using Builder = IRBuilder<NoFolder>;
 
 constexpr std::uint32_t kInstrStride = 16;
 constexpr std::uint64_t kImmPcSalt = 0x9E3779B97F4A7C15ULL;
+constexpr std::uint32_t kVmTargetTableSlots = 256;
 
 // Bound the size of a function we are willing to demote + lift, so a giant
 // function (e.g. a fully-inlined `main`) is never demoted-then-rejected (which
@@ -1429,7 +1430,8 @@ void shuffleSpecs(std::vector<HandlerSpec> &Specs, ir::IRRandom &Rng) {
     }
 }
 
-HandlerLayout makeLayout(ir::IRRandom &Rng, std::uint32_t NumCalls) {
+std::optional<HandlerLayout> makeLayout(ir::IRRandom &Rng,
+                                        std::uint32_t NumCalls) {
     HandlerLayout Layout;
     Layout.specs = {
         {VmOp::Const, 0, "const"},  {VmOp::Ret, 0, "ret"},
@@ -1469,6 +1471,8 @@ HandlerLayout makeLayout(ir::IRRandom &Rng, std::uint32_t NumCalls) {
         Layout.specs.push_back(
             {VmOp::Call, static_cast<std::uint8_t>(I),
              std::string("call.") + std::to_string(I)});
+    if (Layout.specs.size() > kVmTargetTableSlots)
+        return std::nullopt;
     for (std::uint32_t I = 0; I < Layout.specs.size(); ++I)
         Layout.ids[opIndex(Layout.specs[I].op)].push_back(
             static_cast<std::uint8_t>(I));
@@ -1665,6 +1669,96 @@ Value *emitDecodeImm(Builder &B, GlobalVariable *Bytecode, Value *Pc,
     return B.CreateXor(Acc, Salt, "morok.vm.imm.dec");
 }
 
+Value *loadPoison(Builder &B, AllocaInst *PoisonSlot, const Twine &Name) {
+    auto *Load = B.CreateLoad(B.getInt64Ty(), PoisonSlot, Name);
+    Load->setVolatile(true);
+    Load->setAlignment(Align(8));
+    return Load;
+}
+
+void storePoison(Builder &B, AllocaInst *PoisonSlot, Value *Value) {
+    auto *Store = B.CreateStore(Value, PoisonSlot);
+    Store->setVolatile(true);
+    Store->setAlignment(Align(8));
+}
+
+Value *mixPoison(Builder &B, Value *Cur, Value *Data, std::uint64_t Salt,
+                 const Twine &Name) {
+    auto *I64 = B.getInt64Ty();
+    Value *Wide =
+        Data->getType()->isIntegerTy(64)
+            ? Data
+            : B.CreateZExtOrTrunc(Data, I64, Twine(Name).concat(".wide"));
+    Value *X = B.CreateXor(Cur, Wide, Twine(Name).concat(".data"));
+    X = B.CreateXor(X, ConstantInt::get(I64, Salt), Twine(Name).concat(".salt"));
+    X = B.CreateMul(X, ConstantInt::get(I64, 0xD6E8FEB86659FD93ULL),
+                    Twine(Name).concat(".mul"));
+    Value *Rot = B.CreateOr(
+        B.CreateShl(X, ConstantInt::get(I64, 17), Twine(Name).concat(".shl")),
+        B.CreateLShr(X, ConstantInt::get(I64, 47), Twine(Name).concat(".shr")),
+        Twine(Name).concat(".rot"));
+    return B.CreateXor(X, Rot, Name);
+}
+
+void recordPoisonFlag(Builder &B, AllocaInst *PoisonSlot, Value *Flag,
+                      Value *Data, std::uint64_t Salt, const Twine &Name) {
+    Value *Cur = loadPoison(B, PoisonSlot, Twine(Name).concat(".old"));
+    Value *Mixed = mixPoison(B, Cur, Data, Salt, Twine(Name).concat(".mix"));
+    Value *Next = B.CreateSelect(Flag, Mixed, Cur, Twine(Name).concat(".next"));
+    storePoison(B, PoisonSlot, Next);
+}
+
+Value *applyPoison(Builder &B, AllocaInst *PoisonSlot, Value *Input,
+                   const Twine &Name) {
+    auto *I64 = B.getInt64Ty();
+    Value *Poison = loadPoison(B, PoisonSlot, Twine(Name).concat(".poison"));
+    Value *Wide =
+        Input->getType()->isIntegerTy(64)
+            ? Input
+            : B.CreateZExtOrTrunc(Input, I64, Twine(Name).concat(".wide"));
+    Value *Mixed = B.CreateXor(Wide, Poison, Name);
+    return Input->getType()->isIntegerTy(64)
+               ? Mixed
+               : B.CreateTrunc(Mixed, Input->getType(),
+                               Twine(Name).concat(".trunc"));
+}
+
+Value *safeIndex(Builder &B, AllocaInst *PoisonSlot, Value *Idx,
+                 std::uint32_t Limit, std::uint64_t Salt,
+                 const Twine &Name) {
+    auto *I32 = B.getInt32Ty();
+    Value *LimitV = ConstantInt::get(I32, Limit);
+    Value *Bad = B.CreateICmpUGE(Idx, LimitV, Twine(Name).concat(".bad"));
+    Value *Wrapped =
+        B.CreateURem(Idx, LimitV, Twine(Name).concat(".wrap"));
+    recordPoisonFlag(B, PoisonSlot, Bad, Idx, Salt, Twine(Name).concat(".poison"));
+    return B.CreateSelect(Bad, Wrapped, Idx, Name);
+}
+
+Value *safePc(Builder &B, AllocaInst *PoisonSlot, Value *Pc,
+              std::uint32_t InstrCount, const Twine &Name) {
+    auto *I32 = B.getInt32Ty();
+    const std::uint32_t ByteSize = InstrCount * kInstrStride;
+    Value *Stride = ConstantInt::get(I32, kInstrStride);
+    Value *ByteSizeV = ConstantInt::get(I32, ByteSize);
+    Value *Misaligned =
+        B.CreateICmpNE(B.CreateURem(Pc, Stride, Twine(Name).concat(".rem")),
+                       ConstantInt::get(I32, 0), Twine(Name).concat(".unaligned"));
+    Value *OutOfRange =
+        B.CreateICmpUGE(Pc, ByteSizeV, Twine(Name).concat(".range"));
+    Value *Bad = B.CreateOr(Misaligned, OutOfRange, Twine(Name).concat(".bad"));
+    Value *Instr =
+        B.CreateUDiv(Pc, Stride, Twine(Name).concat(".instr"));
+    Value *WrappedInstr =
+        B.CreateURem(Instr, ConstantInt::get(I32, InstrCount),
+                     Twine(Name).concat(".wrap"));
+    Value *WrappedPc =
+        B.CreateMul(WrappedInstr, Stride, Twine(Name).concat(".pc"));
+    recordPoisonFlag(B, PoisonSlot, Bad, Pc, 0xAEF17502108EF2D9ULL,
+                     Twine(Name).concat(".poison"));
+    return B.CreateSelect(Bad, WrappedPc, Pc, Name);
+}
+
 Value *regPtr(Builder &B, AllocaInst *Regs, ArrayType *RegsTy, Value *Idx) {
     return B.CreateInBoundsGEP(RegsTy, Regs,
                                {ConstantInt::get(B.getInt32Ty(), 0), Idx},
@@ -1692,9 +1786,23 @@ Value *bitwiseNot(Builder &B, Value *V, const Twine &Name) {
 // so handlers never mask or sign-extend implicitly.  Shift counts are masked to
 // <64 (a valid refinement of an out-of-range/poison shift).
 Value *emitBinary(Builder &B, VmOp Op, std::uint8_t Variant, Value *L, Value *R,
-                  Value *Pc) {
+                  Value *Pc, AllocaInst *PoisonSlot) {
     auto *I64 = B.getInt64Ty();
     Value *Shift = B.CreateAnd(R, ConstantInt::get(I64, 63), "morok.vm.sh.amt");
+    Value *RNonZero = B.CreateSelect(
+        B.CreateICmpEQ(R, ConstantInt::get(I64, 0), "morok.vm.div.zero"),
+        ConstantInt::get(I64, 1), R, "morok.vm.div.safe");
+    Value *SignedOverflow = B.CreateAnd(
+        B.CreateICmpEQ(L, ConstantInt::get(I64, 0x8000000000000000ULL),
+                       "morok.vm.div.min"),
+        B.CreateICmpEQ(R, ConstantInt::get(I64, ~0ULL), "morok.vm.div.neg1"),
+        "morok.vm.div.overflow");
+    Value *SignedBad = B.CreateOr(
+        B.CreateICmpEQ(R, ConstantInt::get(I64, 0), "morok.vm.sdiv.zero"),
+        SignedOverflow, "morok.vm.sdiv.bad");
+    Value *RSignedSafe =
+        B.CreateSelect(SignedBad, ConstantInt::get(I64, 1), R,
+                       "morok.vm.sdiv.safe");
     Value *Out = nullptr;
     switch (Op) {
     case VmOp::Add:
@@ -1765,20 +1873,34 @@ Value *emitBinary(Builder &B, VmOp Op, std::uint8_t Variant, Value *L, Value *R,
             L, Shift, Variant == 0 ? "morok.vm.ashr" : "morok.vm.ashr.alt");
         break;
     case VmOp::UDiv:
+        recordPoisonFlag(B, PoisonSlot,
+                         B.CreateICmpEQ(R, ConstantInt::get(I64, 0),
+                                        "morok.vm.udiv.bad"),
+                         Pc, 0x9D290A9474F83A43ULL, "morok.vm.udiv.poison");
         Out = B.CreateUDiv(
-            L, R, Variant == 0 ? "morok.vm.udiv" : "morok.vm.udiv.alt");
+            L, RNonZero, Variant == 0 ? "morok.vm.udiv" : "morok.vm.udiv.alt");
         break;
     case VmOp::SDiv:
+        recordPoisonFlag(B, PoisonSlot, SignedBad, Pc,
+                         0xBE78E99AC8103477ULL, "morok.vm.sdiv.poison");
         Out = B.CreateSDiv(
-            L, R, Variant == 0 ? "morok.vm.sdiv" : "morok.vm.sdiv.alt");
+            L, RSignedSafe,
+            Variant == 0 ? "morok.vm.sdiv" : "morok.vm.sdiv.alt");
         break;
     case VmOp::URem:
+        recordPoisonFlag(B, PoisonSlot,
+                         B.CreateICmpEQ(R, ConstantInt::get(I64, 0),
+                                        "morok.vm.urem.bad"),
+                         Pc, 0x91EC3DF1D8F1C5BBULL, "morok.vm.urem.poison");
         Out = B.CreateURem(
-            L, R, Variant == 0 ? "morok.vm.urem" : "morok.vm.urem.alt");
+            L, RNonZero, Variant == 0 ? "morok.vm.urem" : "morok.vm.urem.alt");
         break;
     case VmOp::SRem:
+        recordPoisonFlag(B, PoisonSlot, SignedBad, Pc,
+                         0xE05D1B9604146815ULL, "morok.vm.srem.poison");
         Out = B.CreateSRem(
-            L, R, Variant == 0 ? "morok.vm.srem" : "morok.vm.srem.alt");
+            L, RSignedSafe,
+            Variant == 0 ? "morok.vm.srem" : "morok.vm.srem.alt");
         break;
     case VmOp::ICmpEQ:
         Out = B.CreateZExt(B.CreateICmpEQ(L, R, "morok.vm.icmp.eq"), I64,
@@ -1850,14 +1972,20 @@ void setPc(Builder &B, AllocaInst *PcSlot, Value *NewPc, BasicBlock *Dispatch) {
 
 GlobalVariable *createTargetTable(Module &M, Function *Helper,
                                   ArrayRef<BasicBlock *> Blocks,
+                                  BasicBlock *PoisonBlock,
                                   StringRef SourceName) {
     LLVMContext &Ctx = M.getContext();
     auto *PtrTy = PointerType::getUnqual(Ctx);
-    auto *ArrTy = ArrayType::get(PtrTy, Blocks.size());
-    SmallVector<Constant *, 24> Entries;
-    Entries.reserve(Blocks.size());
-    for (BasicBlock *BB : Blocks)
-        Entries.push_back(BlockAddress::get(Helper, BB));
+    auto *ArrTy = ArrayType::get(PtrTy, kVmTargetTableSlots);
+    SmallVector<Constant *, kVmTargetTableSlots> Entries;
+    Entries.reserve(kVmTargetTableSlots);
+    Constant *Poison = BlockAddress::get(Helper, PoisonBlock);
+    for (std::uint32_t I = 0; I < kVmTargetTableSlots; ++I) {
+        if (I < Blocks.size())
+            Entries.push_back(BlockAddress::get(Helper, Blocks[I]));
+        else
+            Entries.push_back(Poison);
+    }
     return new GlobalVariable(
         M, ArrTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
         ConstantArray::get(ArrTy, Entries),
@@ -1936,9 +2064,11 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
     for (const HandlerSpec &Spec : Layout.specs)
         Handlers.push_back(BasicBlock::Create(
             Ctx, std::string("morok.vm.h.") + Spec.name, Helper));
+    BasicBlock *PoisonHandler =
+        BasicBlock::Create(Ctx, "morok.vm.h.poison", Helper);
 
     GlobalVariable *Targets =
-        createTargetTable(M, Helper, Handlers, Src->getName());
+        createTargetTable(M, Helper, Handlers, PoisonHandler, Src->getName());
     GlobalVariable *PointerTable =
         createPointerTable(M, ArrayRef<Constant *>(P.pointer_constants),
                            Src->getName());
@@ -1949,6 +2079,15 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
     AllocaInst *PcSlot = EB.CreateAlloca(I32, nullptr, "morok.vm.pc");
     PcSlot->setAlignment(Align(4));
     EB.CreateStore(ConstantInt::get(I32, 0), PcSlot);
+    AllocaInst *PoisonSlot = EB.CreateAlloca(I64, nullptr, "morok.vm.poison");
+    PoisonSlot->setAlignment(Align(8));
+    EB.CreateStore(ConstantInt::get(I64, 0), PoisonSlot)->setVolatile(true);
+    AllocaInst *PoisonScratch =
+        EB.CreateAlloca(I64, nullptr, "morok.vm.poison.mem");
+    PoisonScratch->setAlignment(Align(8));
+    EB.CreateStore(ConstantInt::get(I64, 0), PoisonScratch)->setVolatile(true);
+    Value *PoisonScratchAddr =
+        EB.CreatePtrToInt(PoisonScratch, I64, "morok.vm.poison.mem.addr");
 
     std::uint32_t ArgIndex = 0;
     for (Argument &Arg : Helper->args()) {
@@ -1980,7 +2119,10 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
     EB.CreateBr(Dispatch);
 
     Builder DB(Dispatch);
-    Value *Pc = DB.CreateLoad(I32, PcSlot, "morok.vm.pc");
+    Value *Pc = safePc(DB, PoisonSlot,
+                       DB.CreateLoad(I32, PcSlot, "morok.vm.pc"),
+                       static_cast<std::uint32_t>(P.code.size()),
+                       "morok.vm.pc.safe");
     Value *Op = DB.CreateZExt(emitDecodeByte(DB, Bytecode, Pc, 0, Enc), I32,
                               "morok.vm.op");
     auto *TargetsTy = cast<ArrayType>(Targets->getValueType());
@@ -1989,20 +2131,67 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
                              "morok.vm.target.slot");
     Value *Target = DB.CreateLoad(PtrTy, Slot, "morok.vm.target");
     auto *IB =
-        DB.CreateIndirectBr(Target, static_cast<unsigned>(Handlers.size()));
+        DB.CreateIndirectBr(Target, static_cast<unsigned>(Handlers.size() + 1));
     for (BasicBlock *Handler : Handlers)
         IB->addDestination(Handler);
+    IB->addDestination(PoisonHandler);
+
+    auto emitPoisonReturn = [&](Builder &B, Value *Data) {
+        recordPoisonFlag(B, PoisonSlot, ConstantInt::getTrue(Ctx), Data,
+                         0xC7A45A6E03D27A41ULL, "morok.vm.poison.op");
+        Value *Ret = loadPoison(B, PoisonSlot, "morok.vm.ret.poison");
+        if (P.ret_kind == RetKind::Void) {
+            B.CreateRetVoid();
+            return;
+        }
+        Type *RetTy = Src->getReturnType();
+        if (P.ret_kind == RetKind::Ptr)
+            B.CreateRet(B.CreateIntToPtr(Ret, RetTy, "morok.vm.ret.ptr"));
+        else if (RetTy->getIntegerBitWidth() < 64)
+            B.CreateRet(B.CreateTrunc(Ret, RetTy, "morok.vm.ret.trunc"));
+        else
+            B.CreateRet(Ret);
+    };
+    auto decodeReg = [&](Builder &B, Value *Pc, std::uint32_t Field,
+                         std::uint64_t Salt, const Twine &Name) {
+        return safeIndex(B, PoisonSlot, emitDecodeReg(B, Bytecode, Pc, Field, Enc),
+                         P.reg_count, Salt, Name);
+    };
+    auto safeAddress = [&](Builder &B, Value *Addr, const Twine &Name) {
+        Value *Poison = loadPoison(B, PoisonSlot, Twine(Name).concat(".state"));
+        Value *HasPoison = B.CreateICmpNE(Poison, ConstantInt::get(I64, 0),
+                                          Twine(Name).concat(".active"));
+        return B.CreateSelect(HasPoison, PoisonScratchAddr, Addr, Name);
+    };
+
+    {
+        Builder PB(PoisonHandler);
+        Value *BadPc = PB.CreateLoad(I32, PcSlot, "morok.vm.poison.pc");
+        Value *BadOp = PB.CreateZExt(
+            emitDecodeByte(PB, Bytecode,
+                           safePc(PB, PoisonSlot, BadPc,
+                                  static_cast<std::uint32_t>(P.code.size()),
+                                  "morok.vm.poison.pc.safe"),
+                           0, Enc),
+            I64, "morok.vm.poison.opcode");
+        emitPoisonReturn(PB, BadOp);
+    }
 
     for (std::size_t I = 0; I < Layout.specs.size(); ++I) {
         const HandlerSpec &Spec = Layout.specs[I];
         Builder B(Handlers[I]);
-        Value *CurPc = B.CreateLoad(I32, PcSlot, "morok.vm.pc.h");
+        Value *CurPc = safePc(B, PoisonSlot,
+                              B.CreateLoad(I32, PcSlot, "morok.vm.pc.h"),
+                              static_cast<std::uint32_t>(P.code.size()),
+                              "morok.vm.pc.h.safe");
 
         switch (Spec.op) {
         case VmOp::Const: {
-            Value *Dst = emitDecodeReg(B, Bytecode, CurPc, 1, Enc);
+            Value *Dst = decodeReg(B, CurPc, 1, 0xB58C5A1D77422445ULL,
+                                   "morok.vm.const.dst");
             Value *Imm = emitDecodeImm(B, Bytecode, CurPc, Enc);
-            storeReg(B, Regs, RegsTy, Dst, Imm);
+            storeReg(B, Regs, RegsTy, Dst,
+                     applyPoison(B, PoisonSlot, Imm, "morok.vm.const.poison"));
             advancePc(B, PcSlot, Dispatch);
             continue;
         }
@@ -2011,8 +2200,11 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
                 B.CreateRetVoid();
                 continue;
             }
-            Value *RetIdx = emitDecodeReg(B, Bytecode, CurPc, 2, Enc);
-            Value *Ret = loadReg(B, Regs, RegsTy, RetIdx);
+            Value *RetIdx = decodeReg(B, CurPc, 2, 0xAA0F6C39F92E3D83ULL,
+                                      "morok.vm.ret.idx");
+            Value *Ret =
+                applyPoison(B, PoisonSlot, loadReg(B, Regs, RegsTy, RetIdx),
+                            "morok.vm.ret.value");
             Type *RetTy = Src->getReturnType();
             if (P.ret_kind == RetKind::Ptr)
                 B.CreateRet(B.CreateIntToPtr(Ret, RetTy, "morok.vm.ret.ptr"));
@@ -2024,12 +2216,18 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
             continue;
         }
         case VmOp::Select: {
-            Value *Dst = emitDecodeReg(B, Bytecode, CurPc, 1, Enc);
-            Value *CondIdx = emitDecodeReg(B, Bytecode, CurPc, 2, Enc);
-            Value *TrueIdx = emitDecodeReg(B, Bytecode, CurPc, 3, Enc);
+            Value *Dst = decodeReg(B, CurPc, 1, 0x87B1979F2B951D2FULL,
+                                   "morok.vm.select.dst");
+            Value *CondIdx = decodeReg(B, CurPc, 2, 0x54863022317338E7ULL,
+                                       "morok.vm.select.cond.idx");
+            Value *TrueIdx = decodeReg(B, CurPc, 3, 0xA4E3160B29D81245ULL,
+                                       "morok.vm.select.true.idx");
             Value *FalseIdx = B.CreateTrunc(
                 emitDecodeImm(B, Bytecode, CurPc, Enc), I32,
                 "morok.vm.select.false.idx");
+            FalseIdx = safeIndex(B, PoisonSlot, FalseIdx, P.reg_count,
+                                 0x34E8C1CC19A8FBA9ULL,
+                                 "morok.vm.select.false.safe");
             Value *Cond = loadReg(B, Regs, RegsTy, CondIdx);
             Value *TrueVal = loadReg(B, Regs, RegsTy, TrueIdx);
             Value *FalseVal = loadReg(B, Regs, RegsTy, FalseIdx);
@@ -2045,6 +2243,9 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
             Value *JmpTarget =
                 B.CreateTrunc(emitDecodeImm(B, Bytecode, CurPc, Enc), I32,
                               "morok.vm.jmp.target");
+            JmpTarget = safePc(B, PoisonSlot, JmpTarget,
+                               static_cast<std::uint32_t>(P.code.size()),
+                               "morok.vm.jmp.safe");
             if (Spec.variant != 0) {
                 Value *Zero =
                     B.CreateXor(JmpTarget, JmpTarget, "morok.vm.jmp.zero");
@@ -2054,13 +2255,20 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
             continue;
         }
         case VmOp::BrCond: {
-            Value *CondIdx = emitDecodeReg(B, Bytecode, CurPc, 1, Enc);
+            Value *CondIdx = decodeReg(B, CurPc, 1, 0xA2D6A3B2F17E6A2BULL,
+                                       "morok.vm.br.cond.idx");
             Value *Packed = emitDecodeImm(B, Bytecode, CurPc, Enc);
             Value *Taken =
                 B.CreateTrunc(Packed, I32, "morok.vm.br.taken");
             Value *NotTaken = B.CreateTrunc(
                 B.CreateLShr(Packed, ConstantInt::get(I64, 32)), I32,
                 "morok.vm.br.nottaken");
+            Taken = safePc(B, PoisonSlot, Taken,
+                           static_cast<std::uint32_t>(P.code.size()),
+                           "morok.vm.br.taken.safe");
+            NotTaken = safePc(B, PoisonSlot, NotTaken,
+                              static_cast<std::uint32_t>(P.code.size()),
+                              "morok.vm.br.nottaken.safe");
             Value *Cond = loadReg(B, Regs, RegsTy, CondIdx);
             Value *Take = B.CreateICmpNE(Cond, ConstantInt::get(I64, 0),
                                          "morok.vm.br.cond");
@@ -2074,9 +2282,12 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
             continue;
         }
         case VmOp::Sext: {
-            Value *Dst = emitDecodeReg(B, Bytecode, CurPc, 1, Enc);
-            Value *SextSrc = loadReg(B, Regs, RegsTy,
-                                     emitDecodeReg(B, Bytecode, CurPc, 2, Enc));
+            Value *Dst = decodeReg(B, CurPc, 1, 0xDB94A7C6F31D9531ULL,
+                                   "morok.vm.sext.dst");
+            Value *SextSrc = loadReg(
+                B, Regs, RegsTy,
+                decodeReg(B, CurPc, 2, 0xC9F6D08A1C77B45DULL,
+                          "morok.vm.sext.src"));
             Value *W = emitDecodeImm(B, Bytecode, CurPc, Enc);
             Value *Sh = B.CreateAnd(
                 B.CreateSub(ConstantInt::get(I64, 64), W, "morok.vm.sext.sh"),
@@ -2100,10 +2311,18 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
                                    : Spec.op == VmOp::Load16 ? 2
                                    : Spec.op == VmOp::Load32 ? 4
                                                              : 8;
-            Value *Dst = emitDecodeReg(B, Bytecode, CurPc, 1, Enc);
-            Value *Addr = loadReg(B, Regs, RegsTy,
-                                  emitDecodeReg(B, Bytecode, CurPc, 2, Enc));
-            storeReg(B, Regs, RegsTy, Dst, emitMemLoad(B, Addr, Bytes));
+            Value *Dst = decodeReg(B, CurPc, 1, 0x95D401D6F7E45E11ULL,
+                                   "morok.vm.load.dst");
+            Value *Addr = loadReg(
+                B, Regs, RegsTy,
+                decodeReg(B, CurPc, 2, 0x91DEB2F7D97E044FULL,
+                          "morok.vm.load.addr.idx"));
+            storeReg(B, Regs, RegsTy, Dst,
+                     applyPoison(B, PoisonSlot,
+                                 emitMemLoad(B, safeAddress(B, Addr,
+                                                            "morok.vm.load.addr"),
+                                             Bytes),
+                                 "morok.vm.load.poison"));
             advancePc(B, PcSlot, Dispatch);
             continue;
         }
@@ -2115,22 +2334,34 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
                                    : Spec.op == VmOp::Store16 ? 2
                                    : Spec.op == VmOp::Store32 ? 4
                                                               : 8;
-            Value *Addr = loadReg(B, Regs, RegsTy,
-                                  emitDecodeReg(B, Bytecode, CurPc, 2, Enc));
-            Value *Val = loadReg(B, Regs, RegsTy,
-                                 emitDecodeReg(B, Bytecode, CurPc, 3, Enc));
-            emitMemStore(B, Addr, Val, Bytes);
+            Value *Addr = loadReg(
+                B, Regs, RegsTy,
+                decodeReg(B, CurPc, 2, 0xEC71A1B54DA2D137ULL,
+                          "morok.vm.store.addr.idx"));
+            Value *Val = loadReg(
+                B, Regs, RegsTy,
+                decodeReg(B, CurPc, 3, 0x809C7A9B7F3E6011ULL,
+                          "morok.vm.store.val.idx"));
+            emitMemStore(B, safeAddress(B, Addr, "morok.vm.store.addr"),
+                         applyPoison(B, PoisonSlot, Val,
+                                     "morok.vm.store.poison"),
+                         Bytes);
             advancePc(B, PcSlot, Dispatch);
             continue;
         }
         case VmOp::PtrConst: {
-            Value *Dst = emitDecodeReg(B, Bytecode, CurPc, 1, Enc);
+            Value *Dst = decodeReg(B, CurPc, 1, 0x86585C8B8E1AD5A7ULL,
+                                   "morok.vm.ptr.dst");
             Value *Idx =
                 B.CreateTrunc(emitDecodeImm(B, Bytecode, CurPc, Enc), I32,
                               "morok.vm.ptr.idx");
             Value *Ptr = ConstantPointerNull::get(PtrTy);
             if (PointerTable) {
                 auto *PtrTableTy = cast<ArrayType>(PointerTable->getValueType());
+                Idx = safeIndex(
+                    B, PoisonSlot, Idx,
+                    static_cast<std::uint32_t>(P.pointer_constants.size()),
+                    0xC9382AA877E5B7B3ULL, "morok.vm.ptr.safe");
                 Value *PtrSlot = B.CreateInBoundsGEP(
                     PtrTableTy, PointerTable,
                     {ConstantInt::get(I32, 0), Idx}, "morok.vm.ptr.slot");
@@ -2190,12 +2421,19 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
         }
 
         // Generic binary / comparison handler.
-        Value *Dst = emitDecodeReg(B, Bytecode, CurPc, 1, Enc);
-        Value *LIdx = emitDecodeReg(B, Bytecode, CurPc, 2, Enc);
-        Value *RIdx = emitDecodeReg(B, Bytecode, CurPc, 3, Enc);
+        Value *Dst = decodeReg(B, CurPc, 1, 0xE01551368CA6D7F5ULL,
+                               "morok.vm.bin.dst");
+        Value *LIdx = decodeReg(B, CurPc, 2, 0x8E7BE1E4322EF725ULL,
+                                "morok.vm.bin.lhs");
+        Value *RIdx = decodeReg(B, CurPc, 3, 0xDB042D265F6E21D3ULL,
+                                "morok.vm.bin.rhs");
         Value *L = loadReg(B, Regs, RegsTy, LIdx);
         Value *R = loadReg(B, Regs, RegsTy, RIdx);
-        Value *Out = emitBinary(B, Spec.op, Spec.variant, L, R, CurPc);
+        Value *Out =
+            applyPoison(B, PoisonSlot,
+                        emitBinary(B, Spec.op, Spec.variant, L, R, CurPc,
+                                   PoisonSlot),
+                        "morok.vm.bin.poison");
         storeReg(B, Regs, RegsTy, Dst, Out);
         advancePc(B, PcSlot, Dispatch);
     }
@@ -2224,12 +2462,14 @@ void rewriteAsWrapper(Function &F, Function *Helper) {
 }
 
 bool materializeProgram(Module &M, Program &P, ir::IRRandom &Rng) {
-    HandlerLayout Layout =
+    std::optional<HandlerLayout> Layout =
         makeLayout(Rng, static_cast<std::uint32_t>(P.calls.size()));
+    if (!Layout)
+        return false;
     Encoding Enc = makeEncoding(Rng);
-    std::vector<std::uint8_t> Bytes = encodeBytecode(P, Layout, Enc, Rng);
+    std::vector<std::uint8_t> Bytes = encodeBytecode(P, *Layout, Enc, Rng);
     GlobalVariable *Bytecode = createBytecode(M, Bytes, P.source->getName());
-    Function *Helper = buildHelper(M, P, Bytecode, Layout, Enc);
+    Function *Helper = buildHelper(M, P, Bytecode, *Layout, Enc);
     rewriteAsWrapper(*P.source, Helper);
     invalidateCallerEffects(*P.source);
     return true;

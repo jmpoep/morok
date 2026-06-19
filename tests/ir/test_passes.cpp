@@ -6843,6 +6843,14 @@ entry:
     REQUIRE(Helper);
     CHECK(countGlobals(*M, "morok.vm.bytecode") == 1u);
     CHECK(countGlobals(*M, "morok.vm.targets") == 1u);
+    GlobalVariable *Targets = nullptr;
+    for (GlobalVariable &GV : M->globals())
+        if (GV.getName().starts_with("morok.vm.targets"))
+            Targets = &GV;
+    REQUIRE(Targets != nullptr);
+    auto *TargetsTy = dyn_cast<ArrayType>(Targets->getValueType());
+    REQUIRE(TargetsTy != nullptr);
+    CHECK(TargetsTy->getNumElements() == 256u);
 
     GlobalVariable *Bytecode = nullptr;
     for (GlobalVariable &GV : M->globals())
@@ -6871,9 +6879,11 @@ entry:
     std::size_t addHandlers = 0;
     std::size_t xorHandlers = 0;
     bool hasBytecodeDecrypt = false;
+    bool hasPoisonHandler = false;
     for (BasicBlock &BB : *Helper) {
         addHandlers += BB.getName().starts_with("morok.vm.h.add") ? 1u : 0u;
         xorHandlers += BB.getName().starts_with("morok.vm.h.xor") ? 1u : 0u;
+        hasPoisonHandler |= BB.getName() == "morok.vm.h.poison";
         for (Instruction &I : BB) {
             indirects += isa<IndirectBrInst>(&I) ? 1u : 0u;
             switches += isa<SwitchInst>(&I) ? 1u : 0u;
@@ -6885,6 +6895,11 @@ entry:
     CHECK(addHandlers >= 2u);
     CHECK(xorHandlers >= 2u);
     CHECK(hasBytecodeDecrypt);
+    CHECK(hasPoisonHandler);
+    CHECK(countNamedInstructions(*Helper, "morok.vm.pc.safe.bad") >= 1u);
+    CHECK(countNamedInstructions(*Helper, "morok.vm.bin.dst.bad") >= 1u);
+    CHECK(countNamedInstructions(*Helper, "morok.vm.poison.op.next") >= 1u);
+    CHECK(countNamedInstructions(*Helper, "morok.vm.ret.value") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -7360,6 +7375,10 @@ entry:
     CHECK(countOpcode(*M, Instruction::SDiv) >= 1u);
     CHECK(countOpcode(*M, Instruction::URem) >= 1u);
     CHECK(countOpcode(*M, Instruction::SRem) >= 1u);
+    CHECK(countNamedInstructions(*Helper, "morok.vm.div.safe") >= 1u);
+    CHECK(countNamedInstructions(*Helper, "morok.vm.sdiv.safe") >= 1u);
+    CHECK(countNamedInstructions(*Helper, "morok.vm.udiv.poison.next") >= 1u);
+    CHECK(countNamedInstructions(*Helper, "morok.vm.sdiv.poison.next") >= 1u);
 
     std::size_t wrapperCalls = 0;
     std::size_t wrapperBinops = 0;
@@ -7915,6 +7934,8 @@ entry:
     bool helperCallsSeal = false;
     bool hasGate = false;
     bool hasTrap = false;
+    bool hasSilentFailPoison = false;
+    bool failBranchesToExit = false;
     bool hasAtomicReadyLoad = false;
     bool hasReadyClaim = false;
     bool hasReadyWait = false;
@@ -7980,6 +8001,8 @@ entry:
     for (Instruction &I : instructions(*Ensure)) {
         if (I.getName().starts_with("morok.sdb.gate"))
             hasGate = true;
+        if (I.getName().starts_with("morok.sdb.fail.poison"))
+            hasSilentFailPoison = true;
         if (I.getName().starts_with("morok.sdb.context.zero"))
             hasContextZero = true;
         if (I.getName().starts_with("morok.sdb.key.context"))
@@ -8107,6 +8130,10 @@ entry:
                       BI->getSuccessor(1)->getName() == "fail") ||
                      (BI->getSuccessor(0)->getName() == "fail" &&
                       BI->getSuccessor(1)->getName() == "ready"));
+            if (BB.getName() == "fail")
+                failBranchesToExit =
+                    BI->isUnconditional() &&
+                    BI->getSuccessor(0)->getName() == "exit";
         }
     }
     for (Instruction &I : instructions(*Seal)) {
@@ -8193,7 +8220,9 @@ entry:
     CHECK(helperCallsEnsure);
     CHECK(helperCallsSeal);
     CHECK(hasGate);
-    CHECK(hasTrap);
+    CHECK_FALSE(hasTrap);
+    CHECK(hasSilentFailPoison);
+    CHECK(failBranchesToExit);
     CHECK(hasAtomicReadyLoad);
     CHECK(hasReadyClaim);
     CHECK(hasReadyWait);

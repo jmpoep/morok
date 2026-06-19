@@ -815,9 +815,32 @@ Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
     GB.CreateBr(DecryptLoop);
 
     Builder FB(Fail);
-    Function *Trap = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::trap);
-    FB.CreateCall(Trap);
-    FB.CreateUnreachable();
+    Value *FailDiff = FB.CreateXor(NextHash, ExpectedHash,
+                                   "morok.sdb.fail.diff");
+    Value *FailMix = FB.CreateXor(
+        FailDiff, FB.CreateLShr(FailDiff, ConstantInt::get(I64, 32)),
+        "morok.sdb.fail.mix");
+    FailMix = FB.CreateXor(
+        FailMix, FB.CreateLShr(FailMix, ConstantInt::get(I64, 16)),
+        "morok.sdb.fail.mix");
+    FailMix = FB.CreateXor(
+        FailMix, FB.CreateLShr(FailMix, ConstantInt::get(I64, 8)),
+        "morok.sdb.fail.mix");
+    Value *PoisonByte =
+        FB.CreateOr(FB.CreateTrunc(FailMix, I8, "morok.sdb.fail.byte"),
+                    ConstantInt::get(I8, 1), "morok.sdb.fail.byte");
+    Value *First = payloadPtr(FB, P.bytecode, ConstantInt::get(I32, 0));
+    auto *OldFirst = FB.CreateLoad(I8, First, "morok.sdb.fail.old");
+    OldFirst->setVolatile(true);
+    OldFirst->setAlignment(Align(1));
+    auto *PoisonStore = FB.CreateStore(
+        FB.CreateXor(OldFirst, PoisonByte, "morok.sdb.fail.poison"), First);
+    PoisonStore->setVolatile(true);
+    PoisonStore->setAlignment(Align(1));
+    auto *FailReady = FB.CreateStore(ConstantInt::get(I32, 2), Ready);
+    FailReady->setAtomic(AtomicOrdering::Release);
+    FailReady->setAlignment(Align(4));
+    FB.CreateBr(Exit);
 
     Builder DB(DecryptLoop);
     PHINode *DecI = DB.CreatePHI(I32, 2, "morok.sdb.dec.i");

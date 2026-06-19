@@ -600,6 +600,14 @@ user strings are encrypted, length-padded where safe, and materialized lazily.
 | Data-flow integrity | `morok-dfi` | `data_flow_integrity` | Decodes narrow op tables from runtime integrity hashes and decoy hidden state. |
 | Execution-trace keying | `morok-tracekey` | `execution_trace_keying` | Carries a rolling trace accumulator and delayed tamper samples through data/control state. |
 
+VM dispatch is total over all 256 decoded handler IDs. Invalid decoded opcodes,
+registers, pointer-table indexes, branch targets, and unsafe div/rem operands
+are folded into a local poison accumulator and canonicalized to in-bounds state
+instead of trapping or indexing out of range. Hash-gated self-decrypt follows the
+same release-mode policy: a failed payload hash poisons the bytecode and
+publishes it as ready so tamper surfaces as wrong VM output, not a fixed
+`llvm.trap` oracle.
+
 The scheduler runs a second, restricted VM/hardening stage over allowlisted
 generated protection helpers so anti-debug, anti-hook, decryptor, and integrity
 logic is not left as a simple native plaintext island.
