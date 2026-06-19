@@ -198,6 +198,16 @@ Function *opaqueZeroHelper(Module &M) {
     return Fn;
 }
 
+AllocaInst *entryAlloca(IRBuilderBase &B, Type *Ty, const Twine &Name) {
+    if (BasicBlock *BB = B.GetInsertBlock())
+        if (Function *F = BB->getParent()) {
+            BasicBlock &Entry = F->getEntryBlock();
+            IRBuilder<> EntryB(&Entry, Entry.getFirstInsertionPt());
+            return EntryB.CreateAlloca(Ty, nullptr, Name);
+        }
+    return B.CreateAlloca(Ty, nullptr, Name);
+}
+
 } // namespace
 
 std::uint64_t keystreamValue(unsigned variant, std::uint64_t k0,
@@ -324,7 +334,7 @@ Value *emitRuntimeOpaqueZero(IRBuilderBase &B, Module &M, std::uint64_t salt,
     auto *I8 = Type::getInt8Ty(M.getContext());
     auto *I64 = Type::getInt64Ty(M.getContext());
 
-    AllocaInst *Anchor = B.CreateAlloca(I8, nullptr, Twine(prefix) + ".anchor");
+    AllocaInst *Anchor = entryAlloca(B, I8, Twine(prefix) + ".anchor");
     Value *Addr = B.CreatePtrToInt(Anchor, I64, Twine(prefix) + ".addr");
     Function *Helper = opaqueZeroHelper(M);
     return B.CreateCall(Helper->getFunctionType(), Helper,
@@ -397,7 +407,7 @@ Value *emitCloakedSymbol(IRBuilderBase &B, Module &M, StringRef symbol,
         ConstantArray::get(ArrTy, CipherBytes), "morok.cloak.c");
     CipherGV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
 
-    AllocaInst *Buf = B.CreateAlloca(ArrTy, nullptr, "morok.cloak.buf");
+    AllocaInst *Buf = entryAlloca(B, ArrTy, "morok.cloak.buf");
     LoadInst *SeedLoad =
         B.CreateLoad(I64, Seed, /*isVolatile=*/true, "morok.cloak.k");
     emitStaticAnalysisBarrier(B, M);

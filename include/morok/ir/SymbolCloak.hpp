@@ -111,8 +111,10 @@ llvm::GlobalVariable *cloakSeed(llvm::Module &M, IRRandom &rng);
 
 /// Emit, at `B`'s current insertion point, an inline per-site decryption of the
 /// C symbol name `symbol` into a fresh stack buffer, and return an `i8*` to the
-/// recovered NUL-terminated string.  No readable copy of `symbol` exists in the
-/// artifact: each call site carries its own ciphertext (a private
+/// recovered NUL-terminated string.  The stack slots are allocated once in the
+/// parent function entry block, while the decrypting stores stay at `B`'s
+/// insertion point.  No readable copy of `symbol` exists in the artifact: each
+/// call site carries its own ciphertext (a private
 /// `morok.cloak.c` byte global) and its own unrolled keystream — one of several
 /// generators, XOR- or ADD-combined, chosen per site — keyed on `k0 = (volatile
 /// load of the mutable module seed `morok.cloak.seed`) ^ siteKey`.  The

@@ -142,6 +142,15 @@ std::size_t countNamedAllocas(Function &F, StringRef prefix) {
     return n;
 }
 
+std::size_t countNamedAllocas(BasicBlock &BB, StringRef prefix) {
+    std::size_t n = 0;
+    for (Instruction &I : BB)
+        if (auto *AI = dyn_cast<AllocaInst>(&I))
+            if (AI->getName().starts_with(prefix))
+                ++n;
+    return n;
+}
+
 std::size_t countNamedInstructions(Function &F, StringRef prefix) {
     std::size_t n = 0;
     for (Instruction &I : instructions(F))
@@ -10962,6 +10971,56 @@ lpad:
         countStoresToBaseWithOpaqueSource(*M, "morok.cloak.buf");
     CHECK(cloakStores >= 1u);
     CHECK(opaqueCloakStores == cloakStores);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("functionCallObfuscateModule hoists cloaked symbol slots out of loops") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+declare i32 @puts(ptr)
+
+define i32 @caller(i32 %n, ptr %p) {
+entry:
+  br label %loop
+
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %r = call i32 @puts(ptr %p)
+  %next = add i32 %i, 1
+  %done = icmp eq i32 %next, %n
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret i32 %r
+}
+)ir");
+    Function *Caller = M->getFunction("caller");
+    REQUIRE(Caller);
+    BasicBlock *Entry = &Caller->getEntryBlock();
+    BasicBlock *Loop = nullptr;
+    for (BasicBlock &BB : *Caller)
+        if (BB.getName() == "loop")
+            Loop = &BB;
+    REQUIRE(Loop);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(3501);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::functionCallObfuscateModule(*M, {/*prob=*/100}, rng));
+
+    CHECK(countCallsTo(*Caller, "puts") == 0u);
+    CHECK(countCallsTo(*Caller, "dlsym") == 1u);
+    CHECK(countNamedAllocas(*Loop, "morok.cloak.") == 0u);
+
+    std::size_t cloakAllocas = 0;
+    for (Instruction &I : instructions(*Caller)) {
+        auto *AI = dyn_cast<AllocaInst>(&I);
+        if (!AI || !AI->getName().starts_with("morok.cloak."))
+            continue;
+        ++cloakAllocas;
+        CHECK(AI->getParent() == Entry);
+    }
+    CHECK(cloakAllocas >= 3u);
+    CHECK(countNamedAllocas(*Entry, "morok.cloak.") == cloakAllocas);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
