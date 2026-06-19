@@ -2017,6 +2017,24 @@ bool linuxSyscallNumbers(const Triple &TT, std::uint32_t &Ptrace,
     }
 }
 
+bool linuxSeccompInstall(const Triple &TT, std::uint32_t &Seccomp,
+                         std::uint32_t &AuditArch, bool &RejectX32) {
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        Seccomp = 317;
+        AuditArch = 0xC000003E; // AUDIT_ARCH_X86_64
+        RejectX32 = true;
+        return true;
+    case Triple::aarch64:
+        Seccomp = 277;
+        AuditArch = 0xC00000B7; // AUDIT_ARCH_AARCH64
+        RejectX32 = false;
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool linuxLandlockSyscalls(const Triple &TT, std::uint32_t &CreateRuleset,
                            std::uint32_t &RestrictSelf) {
     switch (TT.getArch()) {
@@ -2128,6 +2146,11 @@ void emitLinuxSeccompFilter(IRBuilder<> &B, Module &M, const Triple &TT,
     std::uint32_t writevNr = 0;
     if (!linuxSyscallNumbers(TT, ptraceNr, readvNr, writevNr))
         return;
+    std::uint32_t seccompNr = 0;
+    std::uint32_t auditArch = 0;
+    bool rejectX32 = false;
+    if (!linuxSeccompInstall(TT, seccompNr, auditArch, rejectX32))
+        return;
 
     LLVMContext &ctx = M.getContext();
     auto *i8 = Type::getInt8Ty(ctx);
@@ -2138,15 +2161,19 @@ void emitLinuxSeccompFilter(IRBuilder<> &B, Module &M, const Triple &TT,
 
     constexpr std::uint16_t kBpfLdWAbs = 0x20;
     constexpr std::uint16_t kBpfJmpJeqK = 0x15;
+    constexpr std::uint16_t kBpfAluAndK = 0x54;
     constexpr std::uint16_t kBpfRetK = 0x06;
     constexpr std::uint32_t kSeccompDataNr = 0;
+    constexpr std::uint32_t kSeccompDataArch = 4;
     constexpr std::uint32_t kSeccompRetKillProcess = 0x80000000U;
     constexpr std::uint32_t kSeccompRetAllow = 0x7fff0000U;
-    constexpr std::uint32_t kPrSetSeccomp = 22;
-    constexpr std::uint32_t kSeccompModeFilter = 2;
+    constexpr std::uint32_t kSeccompSetModeFilter = 1;
+    constexpr std::uint32_t kSeccompFilterFlagTsync = 1;
+    constexpr std::uint32_t kX32SyscallBit = 0x40000000U;
+    constexpr std::uint32_t kFilterCapacity = 17;
 
     auto *filterTy = StructType::get(ctx, {i16, i8, i8, i32});
-    auto *filtersTy = ArrayType::get(filterTy, 10);
+    auto *filtersTy = ArrayType::get(filterTy, kFilterCapacity);
     auto *progTy = StructType::get(ctx, {i16, ptr});
     auto *filters =
         B.CreateAlloca(filtersTy, nullptr, "morok.antidbg.seccomp.filters");
@@ -2166,56 +2193,52 @@ void emitLinuxSeccompFilter(IRBuilder<> &B, Module &M, const Triple &TT,
         B.CreateStore(ConstantInt::get(i32, k),
                       B.CreateStructGEP(filterTy, slot, 3));
     };
+    std::uint32_t filterCount = 0;
+    auto appendFilter = [&](std::uint16_t code, std::uint8_t jt,
+                            std::uint8_t jf, std::uint32_t k) {
+        storeFilter(filterCount++, code, jt, jf, k);
+    };
 
-    storeFilter(0, kBpfLdWAbs, 0, 0, kSeccompDataNr);
+    appendFilter(kBpfLdWAbs, 0, 0, kSeccompDataArch);
+    appendFilter(kBpfJmpJeqK, 1, 0, auditArch);
+    appendFilter(kBpfRetK, 0, 0, kSeccompRetKillProcess);
+    if (rejectX32) {
+        appendFilter(kBpfLdWAbs, 0, 0, kSeccompDataNr);
+        appendFilter(kBpfAluAndK, 0, 0, kX32SyscallBit);
+        appendFilter(kBpfJmpJeqK, 1, 0, 0);
+        appendFilter(kBpfRetK, 0, 0, kSeccompRetKillProcess);
+    }
+    appendFilter(kBpfLdWAbs, 0, 0, kSeccompDataNr);
     if (AllowSelfTrace) {
         constexpr std::uint32_t kSeccompDataArg0 = 16;
         constexpr std::uint32_t kPtraceTraceme = 0;
-        storeFilter(1, kBpfJmpJeqK, 0, 3, ptraceNr);
-        storeFilter(2, kBpfLdWAbs, 0, 0, kSeccompDataArg0);
-        storeFilter(3, kBpfJmpJeqK, 5, 0, kPtraceTraceme);
-        storeFilter(4, kBpfRetK, 0, 0, kSeccompRetKillProcess);
-        storeFilter(5, kBpfLdWAbs, 0, 0, kSeccompDataNr);
-        storeFilter(6, kBpfJmpJeqK, 1, 0, readvNr);
-        storeFilter(7, kBpfJmpJeqK, 0, 1, writevNr);
-        storeFilter(8, kBpfRetK, 0, 0, kSeccompRetKillProcess);
+        appendFilter(kBpfJmpJeqK, 0, 3, ptraceNr);
+        appendFilter(kBpfLdWAbs, 0, 0, kSeccompDataArg0);
+        appendFilter(kBpfJmpJeqK, 5, 0, kPtraceTraceme);
+        appendFilter(kBpfRetK, 0, 0, kSeccompRetKillProcess);
+        appendFilter(kBpfLdWAbs, 0, 0, kSeccompDataNr);
+        appendFilter(kBpfJmpJeqK, 1, 0, readvNr);
+        appendFilter(kBpfJmpJeqK, 0, 1, writevNr);
+        appendFilter(kBpfRetK, 0, 0, kSeccompRetKillProcess);
     } else {
-        storeFilter(1, kBpfJmpJeqK, 6, 0, ptraceNr);
-        storeFilter(2, kBpfJmpJeqK, 5, 0, readvNr);
-        storeFilter(3, kBpfJmpJeqK, 4, 0, writevNr);
-        storeFilter(4, kBpfRetK, 0, 0, kSeccompRetAllow);
-        storeFilter(5, kBpfRetK, 0, 0, kSeccompRetAllow);
-        storeFilter(6, kBpfRetK, 0, 0, kSeccompRetAllow);
-        storeFilter(7, kBpfRetK, 0, 0, kSeccompRetAllow);
-        storeFilter(8, kBpfRetK, 0, 0, kSeccompRetKillProcess);
+        appendFilter(kBpfJmpJeqK, 2, 0, ptraceNr);
+        appendFilter(kBpfJmpJeqK, 1, 0, readvNr);
+        appendFilter(kBpfJmpJeqK, 0, 1, writevNr);
+        appendFilter(kBpfRetK, 0, 0, kSeccompRetKillProcess);
     }
-    storeFilter(9, kBpfRetK, 0, 0, kSeccompRetAllow);
+    appendFilter(kBpfRetK, 0, 0, kSeccompRetAllow);
 
     Value *filterPtr = B.CreateInBoundsGEP(
         filtersTy, filters, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)});
-    B.CreateStore(ConstantInt::get(i16, 10),
+    B.CreateStore(ConstantInt::get(i16, filterCount),
                   B.CreateStructGEP(progTy, prog, 0));
     B.CreateStore(filterPtr, B.CreateStructGEP(progTy, prog, 1));
 
-    std::uint32_t corePtraceNr = 0;
-    std::uint32_t prctlNr = 0;
-    std::uint32_t openatNr = 0;
-    std::uint32_t readNrCore = 0;
-    std::uint32_t closeNrCore = 0;
-    if (linuxCoreSyscalls(TT, corePtraceNr, prctlNr, openatNr, readNrCore,
-                          closeNrCore)) {
-        emitLinuxSyscall(B, M, TT, prctlNr,
-                         {ConstantInt::get(ip, kPrSetSeccomp),
-                          ConstantInt::get(ip, kSeccompModeFilter), prog,
-                          ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)});
-    } else {
-        FunctionCallee prctl = M.getOrInsertFunction(
-            "prctl", FunctionType::get(i32, {i32, ip, ip, ip, ip}, false));
-        B.CreateCall(prctl, {ConstantInt::get(i32, kPrSetSeccomp),
-                             ConstantInt::get(ip, kSeccompModeFilter),
-                             B.CreatePtrToInt(prog, ip),
-                             ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)});
-    }
+    Value *rc = emitLinuxSyscall(
+        B, M, TT, seccompNr,
+        {ConstantInt::get(ip, kSeccompSetModeFilter),
+         ConstantInt::get(ip, kSeccompFilterFlagTsync), prog});
+    rc->setName("morok.antidbg.seccomp.tsync");
 }
 
 void emitLinuxWatcherStart(IRBuilder<> &B, Module &M, Function *WatchFn) {

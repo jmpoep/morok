@@ -166,6 +166,20 @@ std::uint64_t maxStaticAllocaArrayBytes(Function &F, StringRef prefix) {
     return maxBytes;
 }
 
+std::uint64_t maxStaticAllocaArrayElements(Function &F, StringRef prefix) {
+    std::uint64_t maxElements = 0;
+    for (Instruction &I : instructions(F)) {
+        auto *AI = dyn_cast<AllocaInst>(&I);
+        if (!AI || !AI->getName().starts_with(prefix))
+            continue;
+        auto *AT = dyn_cast<ArrayType>(AI->getAllocatedType());
+        if (!AT)
+            continue;
+        maxElements = std::max(maxElements, AT->getNumElements());
+    }
+    return maxElements;
+}
+
 std::size_t countNamedInstructions(Function &F, StringRef prefix) {
     std::size_t n = 0;
     for (Instruction &I : instructions(F))
@@ -263,6 +277,27 @@ bool namedInstructionUsesConstant(Function &F, StringRef name,
                 if (CI->getZExtValue() == value)
                     return true;
     }
+    return false;
+}
+
+bool constantContainsInt(const Constant *C, std::uint64_t value) {
+    if (!C)
+        return false;
+    if (auto *CI = dyn_cast<ConstantInt>(C))
+        return CI->getZExtValue() == value;
+    for (const Use &U : C->operands())
+        if (auto *Child = dyn_cast<Constant>(U.get()))
+            if (constantContainsInt(Child, value))
+                return true;
+    return false;
+}
+
+bool functionHasConstantInt(Function &F, std::uint64_t value) {
+    for (Instruction &I : instructions(F))
+        for (const Use &U : I.operands())
+            if (auto *C = dyn_cast<Constant>(U.get()))
+                if (constantContainsInt(C, value))
+                    return true;
     return false;
 }
 
@@ -13110,6 +13145,13 @@ entry:
     CHECK(countNamedInstructions(*AntiDbg,
                                  "morok.antidbg.dr.child.no_new_privs") >= 1u);
     CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.ptrace.init") == 0u);
+    CHECK(maxStaticAllocaArrayElements(
+              *AntiDbg, "morok.antidbg.seccomp.filters") == 17u);
+    CHECK(countNamedInstructions(*AntiDbg,
+                                 "morok.antidbg.seccomp.tsync") >= 1u);
+    CHECK(functionHasConstantInt(*AntiDbg, 317u));       // seccomp syscall
+    CHECK(functionHasConstantInt(*AntiDbg, 0xC000003E)); // AUDIT_ARCH_X86_64
+    CHECK(functionHasConstantInt(*AntiDbg, 0x40000000)); // __X32_SYSCALL_BIT
     BasicBlock *DrChild = nullptr;
     for (BasicBlock &BB : *AntiDbg)
         if (BB.getName() == "morok.antidbg.dr.child")
@@ -13141,6 +13183,30 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/task"));
     CHECK_FALSE(hasReadableByteString(*M, "TracerPid"));
     CHECK_FALSE(hasReadableByteString(*M, ".nscd-cache"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("antiDebuggingModule emits aarch64 Linux seccomp TSYNC arch filter") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "aarch64-unknown-linux-gnu"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8822);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::antiDebuggingModule(*M, rng,
+                                             /*allowSelfTrace=*/false));
+
+    Function *Ctor = M->getFunction("morok.antidbg");
+    REQUIRE(Ctor != nullptr);
+    CHECK(maxStaticAllocaArrayElements(
+              *Ctor, "morok.antidbg.seccomp.filters") == 17u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antidbg.seccomp.tsync") >= 1u);
+    CHECK(functionHasConstantInt(*Ctor, 277u));       // seccomp syscall
+    CHECK(functionHasConstantInt(*Ctor, 0xC00000B7)); // AUDIT_ARCH_AARCH64
+    CHECK(M->getFunction("prctl") == nullptr);
+    CHECK(M->getFunction("syscall") != nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
