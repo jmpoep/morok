@@ -1162,9 +1162,12 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   bytes with `PTRACE_PEEKDATA` against its fork-clean copy, and exits on
   mismatch.  The parent stores the buddy PID and its watchdog checks
   `kill(pid, 0)` plus `wait4(..., WNOHANG)` with direct syscalls, folding a
-  missing or exited child into the hidden anti-debug state.  When that helper is
-  present it replaces the self-trace re-arm path, because a process cannot be
-  simultaneously self-traced and scrubbed by a helper tracer.  On macOS
+  missing or exited child into the hidden anti-debug state.  The parent also
+  tracks a volatile DR-active flag that is set only after the helper is forked
+  and `PR_SET_PTRACER` succeeds; if startup fails or the watchdog later marks
+  the buddy missing, Morok clears that flag and dynamically re-arms the
+  `PTRACE_TRACEME` fallback instead of relying on a compile-time helper-present
+  decision.  On macOS
   x86_64/arm64, a pthread watchdog enumerates Mach threads with `task_threads`,
   reads the architecture debug state, clears the x86 DR slots or ARM
   breakpoint/watchpoint/MDSCR state, writes it back with `thread_set_state`, and

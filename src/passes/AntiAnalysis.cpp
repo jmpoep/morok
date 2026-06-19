@@ -157,6 +157,21 @@ GlobalVariable *antiDebugBuddyPid(Module &M) {
     return gv;
 }
 
+GlobalVariable *antiDebugDrActive(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.antidbg.dr.active",
+                                /*AllowInternal=*/true))
+        return existing;
+    LLVMContext &ctx = M.getContext();
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *gv = new GlobalVariable(
+        M, i1, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::getFalse(ctx), "morok.antidbg.dr.active");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(1));
+    return gv;
+}
+
 GlobalVariable *antiDebugWatchdogHeartbeat(Module &M, ir::IRRandom &rng) {
     if (auto *existing =
             M.getGlobalVariable("morok.watchdog.heartbeat",
@@ -520,6 +535,42 @@ Value *emitLinuxPtrace(IRBuilder<> &B, Module &M, const Triple &TT,
         {ConstantInt::getSigned(ip, request), ConstantInt::get(ip, 0),
          ConstantPointerNull::get(ptr), ConstantInt::get(ip, 0)});
     return B.CreateTruncOrBitCast(rc, i32);
+}
+
+void emitLinuxSelfTraceFallback(IRBuilder<> &B, Module &M,
+                                GlobalVariable *State,
+                                GlobalVariable *SentinelActive,
+                                const Triple &TT, const Twine &Name,
+                                std::uint64_t Salt) {
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto trace = [&]() {
+        Value *traceRc = emitLinuxPtrace(B, M, TT, 0);
+        foldFlag(B, State,
+                 B.CreateICmpSLT(traceRc, ConstantInt::getSigned(i32, 0)),
+                 Salt, Name);
+    };
+    if (!SentinelActive) {
+        trace();
+        return;
+    }
+
+    std::string base = Name.str();
+    LLVMContext &ctx = M.getContext();
+    auto *fn = B.GetInsertBlock()->getParent();
+    auto *traceBB = BasicBlock::Create(ctx, base + ".trace", fn);
+    auto *contBB = BasicBlock::Create(ctx, base + ".cont", fn);
+    auto *active =
+        B.CreateLoad(Type::getInt1Ty(ctx), SentinelActive,
+                     base + ".active.load");
+    active->setVolatile(true);
+    active->setAlignment(Align(1));
+    B.CreateCondBr(active, contBB, traceBB);
+
+    B.SetInsertPoint(traceBB);
+    trace();
+    B.CreateBr(contBB);
+
+    B.SetInsertPoint(contBB);
 }
 
 Value *emitLinuxPrctl(IRBuilder<> &B, Module &M, const Triple &TT,
@@ -1521,7 +1572,8 @@ bool linuxBuddyLivenessSyscalls(const Triple &TT, std::uint32_t &Kill,
 
 Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
                            GlobalVariable *State, GlobalVariable *BuddyPid,
-                           const Triple &TT, bool AllowSelfTrace) {
+                           GlobalVariable *SentinelActive, const Triple &TT,
+                           bool AllowSelfTrace) {
     if (Function *existing = M.getFunction("morok.antidbg.linux.watch"))
         return existing;
 
@@ -1544,6 +1596,8 @@ Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
         watchBuddy ? BasicBlock::Create(ctx, "buddy.check", fn) : nullptr;
     auto *buddyLiveBB =
         watchBuddy ? BasicBlock::Create(ctx, "buddy.live", fn) : nullptr;
+    auto *buddyMissingBB =
+        watchBuddy ? BasicBlock::Create(ctx, "buddy.missing", fn) : nullptr;
     auto *nextBB = watchBuddy ? BasicBlock::Create(ctx, "next", fn) : nullptr;
     auto *retBB = BasicBlock::Create(ctx, "ret", fn);
 
@@ -1567,7 +1621,9 @@ Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
         M.getOrInsertFunction("sleep", FunctionType::get(i32, {i32}, false));
     BB.CreateCall(sleepFn, {ConstantInt::get(i32, 1)});
     if (AllowSelfTrace)
-        emitLinuxPtrace(BB, M, TT, 0);
+        emitLinuxSelfTraceFallback(BB, M, State, SentinelActive, TT,
+                                   "morok.antidbg.watch.ptrace",
+                                   0x6FAE31D54B8C9721ULL);
     Value *status = BB.CreateCall(StatusFn);
     Value *stat4 = BB.CreateCall(StatFn);
     foldFlag(BB, State, BB.CreateICmpNE(status, ConstantInt::get(i32, 0)),
@@ -1580,8 +1636,10 @@ Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
         IRBuilder<> CB(buddyCheckBB);
         auto *pid = CB.CreateLoad(ip, BuddyPid, "morok.antidbg.buddy.pid.load");
         pid->setVolatile(true);
-        CB.CreateCondBr(CB.CreateICmpSGT(pid, ConstantInt::get(ip, 1)),
-                        buddyLiveBB, nextBB);
+        CB.CreateCondBr(
+            CB.CreateICmpSGT(pid, ConstantInt::get(ip, 1),
+                             "morok.antidbg.buddy.pid.valid"),
+            buddyLiveBB, buddyMissingBB);
 
         IRBuilder<> BuddyB(buddyLiveBB);
         Value *killRc =
@@ -1596,11 +1654,25 @@ Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
         Value *missing = BuddyB.CreateOr(
             BuddyB.CreateICmpNE(killRc, ConstantInt::get(ip, 0)),
             BuddyB.CreateICmpEQ(waitRc, pid), "morok.antidbg.buddy.missing");
-        foldFlag(BuddyB, State, missing, 0xDF0E7318A649C2B5ULL,
-                 "morok.antidbg.buddy.missing");
         foldState(BuddyB, State, waitRc, 0x5B47E91D2C806A3FULL,
                   "morok.antidbg.buddy.wait");
-        BuddyB.CreateBr(nextBB);
+        BuddyB.CreateCondBr(missing, buddyMissingBB, nextBB);
+
+        IRBuilder<> MissingB(buddyMissingBB);
+        foldFlag(MissingB, State, ConstantInt::getTrue(ctx),
+                 0xDF0E7318A649C2B5ULL, "morok.antidbg.buddy.missing");
+        if (SentinelActive) {
+            auto *inactive = MissingB.CreateStore(ConstantInt::getFalse(ctx),
+                                                  SentinelActive);
+            inactive->setVolatile(true);
+            inactive->setAlignment(Align(1));
+            if (AllowSelfTrace)
+                emitLinuxSelfTraceFallback(MissingB, M, State, SentinelActive,
+                                           TT,
+                                           "morok.antidbg.buddy.ptrace",
+                                           0x3E42A7168C9D50BFULL);
+        }
+        MissingB.CreateBr(nextBB);
 
         IRBuilder<> NB(nextBB);
         Value *next =
@@ -1963,8 +2035,9 @@ Function *linuxDrSentinelProcess(Module &M, ir::IRRandom &rng,
 }
 
 bool emitLinuxDrSentinelStart(IRBuilder<> &B, Module &M, GlobalVariable *State,
-                              GlobalVariable *BuddyPid, ir::IRRandom &rng,
-                              const Triple &TT) {
+                              GlobalVariable *BuddyPid,
+                              GlobalVariable *SentinelActive,
+                              ir::IRRandom &rng, const Triple &TT) {
     std::uint32_t forkNr = 0;
     std::uint32_t getppidNr = 0;
     std::uint32_t getdentsNr = 0;
@@ -1975,7 +2048,7 @@ bool emitLinuxDrSentinelStart(IRBuilder<> &B, Module &M, GlobalVariable *State,
                                  nanosleepNr, exitNr))
         return false;
     Function *helper = linuxDrSentinelProcess(M, rng, TT);
-    if (!helper || !BuddyPid)
+    if (!helper || !BuddyPid || !SentinelActive)
         return false;
 
     LLVMContext &ctx = M.getContext();
@@ -2008,8 +2081,14 @@ bool emitLinuxDrSentinelStart(IRBuilder<> &B, Module &M, GlobalVariable *State,
     IRBuilder<> ParentB(parentBB);
     auto *buddyStore = ParentB.CreateStore(pid, BuddyPid);
     buddyStore->setVolatile(true);
-    ParentB.CreateCondBr(ParentB.CreateICmpSGT(pid, ConstantInt::get(ip, 0)),
-                         setPtracerBB, contBB);
+    auto *inactive =
+        ParentB.CreateStore(ConstantInt::getFalse(ctx), SentinelActive);
+    inactive->setVolatile(true);
+    inactive->setAlignment(Align(1));
+    ParentB.CreateCondBr(
+        ParentB.CreateICmpSGT(pid, ConstantInt::get(ip, 0),
+                              "morok.antidbg.dr.pid.valid"),
+        setPtracerBB, contBB);
 
     IRBuilder<> PB(setPtracerBB);
     std::uint32_t ptraceNr = 0;
@@ -2025,6 +2104,11 @@ bool emitLinuxDrSentinelStart(IRBuilder<> &B, Module &M, GlobalVariable *State,
     prctlRc->setName("morok.antidbg.dr.ptracer.rc");
     foldState(PB, State, prctlRc, 0x419C75EF62D3A80BULL,
               "morok.antidbg.dr.ptracer");
+    Value *ptracerOk = PB.CreateICmpEQ(prctlRc, ConstantInt::get(ip, 0),
+                                       "morok.antidbg.dr.ptracer.ok");
+    auto *activeStore = PB.CreateStore(ptracerOk, SentinelActive);
+    activeStore->setVolatile(true);
+    activeStore->setAlignment(Align(1));
     PB.CreateBr(contBB);
 
     B.SetInsertPoint(contBB);
@@ -2511,21 +2595,23 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
     IRBuilder<> B(&Ctor->getEntryBlock());
 
     GlobalVariable *buddyPid = nullptr;
+    GlobalVariable *drActive = nullptr;
     bool drSentinel = false;
     if (StartLiveWatchers) {
         buddyPid = antiDebugBuddyPid(M);
+        drActive = antiDebugDrActive(M);
         drSentinel =
-            emitLinuxDrSentinelStart(B, M, State, buddyPid, rng, TT);
-        if (!drSentinel)
+            emitLinuxDrSentinelStart(B, M, State, buddyPid, drActive, rng, TT);
+        if (!drSentinel) {
             buddyPid = nullptr;
+            drActive = nullptr;
+        }
     }
     emitLinuxHardening(B, M, TT, drSentinel);
-    if (AllowSelfTrace && !drSentinel) {
-        Value *traceRc = emitLinuxPtrace(B, M, TT, 0);
-        foldFlag(B, State,
-                 B.CreateICmpSLT(traceRc, ConstantInt::getSigned(i32, 0)),
-                 0x3D2D7F2BAE63D5C9ULL, "morok.antidbg.ptrace.init");
-    }
+    if (AllowSelfTrace)
+        emitLinuxSelfTraceFallback(B, M, State, drActive, TT,
+                                   "morok.antidbg.ptrace.init",
+                                   0x3D2D7F2BAE63D5C9ULL);
 
     Function *statusFn = linuxStatusTracerCheck(M, rng, TT);
     Function *statFn = linuxStatField4Check(M, rng, TT);
@@ -2535,11 +2621,11 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
              0xA4756E49F2D31219ULL, "morok.antidbg.status");
     foldState(B, State, stat4, 0xDA942042E4DD58B5ULL, "morok.antidbg.stat4");
     emitLinuxLandlockSandbox(B, M, State, TT);
-    emitLinuxSeccompFilter(B, M, TT, AllowSelfTrace && !drSentinel);
+    emitLinuxSeccompFilter(B, M, TT, AllowSelfTrace);
 
     if (StartLiveWatchers) {
         Function *watch = linuxWatchThread(M, statusFn, statFn, State, buddyPid,
-                                           TT, AllowSelfTrace && !drSentinel);
+                                           drActive, TT, AllowSelfTrace);
         emitLinuxWatcherStart(B, M, watch);
     }
     B.CreateRetVoid();

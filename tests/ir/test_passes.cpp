@@ -13072,6 +13072,7 @@ entry:
 
     CHECK(M->getGlobalVariable("morok.antidbg.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antidbg.buddy.pid", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.dr.active", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.watchdog.heartbeat", true) != nullptr);
     CHECK(M->getGlobalVariable("environ") != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.status") != nullptr);
@@ -13133,9 +13134,19 @@ entry:
     CHECK(countNamedInstructions(*Memfd,
                                  "morok.antidbg.memfd.execve.procfd") >= 1u);
     CHECK(countNamedInstructions(*Memfd, "morok.antidbg.memfd.write") >= 1u);
+    CHECK(countNamedInstructions(*Watch,
+                                 "morok.antidbg.buddy.pid.valid") >= 1u);
+    CHECK(countNamedInstructions(*Watch,
+                                 "morok.antidbg.buddy.missing") >= 1u);
     CHECK(countNamedInstructions(*Watch, "morok.antidbg.buddy.kill") >= 1u);
     CHECK(countNamedInstructions(*Watch, "morok.antidbg.buddy.wait") >= 1u);
     CHECK(countNamedInstructions(*Watch, "morok.antidbg.watch.keep") >= 1u);
+    CHECK(countNamedInstructions(*Watch,
+                                 "morok.antidbg.watch.ptrace.active.load") >=
+          1u);
+    CHECK(countNamedInstructions(*Watch,
+                                 "morok.antidbg.buddy.ptrace.active.load") >=
+          1u);
     CHECK(hasInlineAsmCall(*Scrub));
     CHECK(countNamedInstructions(*Scrub, "morok.antidbg.dr.seize") >= 1u);
     CHECK(countNamedInstructions(*Scrub, "morok.antidbg.dr.interrupt") >= 1u);
@@ -13172,13 +13183,20 @@ entry:
     CHECK(countMonotonicAtomicStoresTo(*HeartbeatWatch,
                                        "morok.watchdog.crypto") >= 1u);
     CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.dr.fork") >= 1u);
+    CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.dr.pid.valid") >=
+          1u);
+    CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.dr.ptracer.ok") >=
+          1u);
     CHECK(countNamedInstructions(*AntiDbg,
                                  "morok.antidbg.dr.child.dumpable") >= 1u);
     CHECK(countNamedInstructions(*AntiDbg,
                                  "morok.antidbg.dr.child.ptracer") >= 1u);
     CHECK(countNamedInstructions(*AntiDbg,
                                  "morok.antidbg.dr.child.no_new_privs") >= 1u);
-    CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.ptrace.init") == 0u);
+    CHECK(countNamedInstructions(*AntiDbg,
+                                 "morok.antidbg.ptrace.init.active.load") >=
+          1u);
+    CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.ptrace.init") >= 1u);
     CHECK(maxStaticAllocaArrayElements(
               *AntiDbg, "morok.antidbg.seccomp.filters") == 17u);
     CHECK(countNamedInstructions(*AntiDbg,
@@ -13288,9 +13306,16 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Watch != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.status") != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.stat4") != nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.dr.active", true) != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.dr.sentinel") != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.dr.scrub") != nullptr);
+    CHECK(countNamedInstructions(*Ctor, "morok.antidbg.dr.ptracer.ok") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.antidbg.ptrace.init") == 0u);
+    CHECK(countNamedInstructions(*Watch, "morok.antidbg.watch.ptrace") == 0u);
+    CHECK(countNamedInstructions(*Watch, "morok.antidbg.buddy.ptrace") == 0u);
+    CHECK(countNamedInstructions(*Watch, "morok.antidbg.buddy.pid.valid") >=
+          1u);
+    CHECK(countNamedInstructions(*Watch, "morok.antidbg.buddy.missing") >= 1u);
     CHECK(hasInlineAsmCall(*Watch));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
