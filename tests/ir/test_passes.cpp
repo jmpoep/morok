@@ -11520,6 +11520,87 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+// Regression for #21: caller-keyed dispatch self-sealed at startup.  The
+// constructor recomputed each site's encoded target from the LIVE code bytes
+// whenever the mutable code_size slot read the unsealed sentinel, then stored
+// it back.  A static attacker who patched a caller region AND reset the
+// code_size slot to the sentinel therefore made the constructor re-hash and
+// re-seal the tampered bytes at startup, defeating the post-link binding.  In a
+// sealed-release build (seal_required) the constructor must never recompute
+// from live bytes: the post-link sealer is the sole source of truth, and an
+// unsealed / downgrade-reset slot must poison the target instead of self-
+// sealing it.  The dispatch site's own live-byte decode is unchanged, so a
+// patched caller still decodes a wrong target (tamper-evidence preserved).
+TEST_CASE("callerKeyedDispatchModule seal_required drops startup self-seal") {
+    auto build = [](LLVMContext &ctx) {
+        return parse(ctx, R"ir(
+target triple = "arm64-apple-macosx14.0.0"
+define internal i32 @inc(i32 %x) {
+entry:
+  %r = add i32 %x, 1
+  ret i32 %r
+}
+
+define i32 @caller(i32 %x) {
+entry:
+  %a = call i32 @inc(i32 %x)
+  ret i32 %a
+}
+)ir");
+    };
+
+    // Sealed-release mode: the constructor neither hashes the live code bytes
+    // (no morok.ckd.byte* loads) nor adds a recomputed target; it poisons the
+    // encoded slot whenever the runtime observes it unsealed.
+    {
+        LLVMContext ctx;
+        auto M = build(ctx);
+        auto engine = morok::core::Xoshiro256pp::fromSeed(2101);
+        morok::ir::IRRandom rng(engine);
+        morok::passes::CallerKeyedDispatchParams params;
+        params.probability = 100;
+        params.max_calls = 16;
+        params.region_bytes = 8;
+        params.seal_required = true;
+        CHECK(morok::passes::callerKeyedDispatchModule(*M, params, rng));
+
+        Function *Init = M->getFunction("morok.ckd.init");
+        Function *Caller = M->getFunction("caller");
+        REQUIRE(Init);
+        REQUIRE(Caller);
+        CHECK(countNamedInstructions(*Init, "morok.ckd.byte") == 0u);
+        CHECK(countNamedInstructions(*Init, "morok.ckd.target.enc") == 0u);
+        CHECK(countNamedInstructions(*Init, "morok.ckd.enc.poison") >= 1u);
+        // The dispatch-site decode still hashes the live bytes, so a patched
+        // caller region still decodes a wrong target.
+        CHECK(countNamedInstructions(*Caller, "morok.ckd.byte") >= 1u);
+        CHECK_FALSE(verifyModule(*M, &errs()));
+    }
+
+    // Default (unsealed dev) mode keeps the self-recovering fallback so unsealed
+    // builds still run: the constructor recomputes from live bytes and never
+    // poisons.
+    {
+        LLVMContext ctx;
+        auto M = build(ctx);
+        auto engine = morok::core::Xoshiro256pp::fromSeed(2101);
+        morok::ir::IRRandom rng(engine);
+        morok::passes::CallerKeyedDispatchParams params;
+        params.probability = 100;
+        params.max_calls = 16;
+        params.region_bytes = 8;
+        // params.seal_required defaults to false.
+        CHECK(morok::passes::callerKeyedDispatchModule(*M, params, rng));
+
+        Function *Init = M->getFunction("morok.ckd.init");
+        REQUIRE(Init);
+        CHECK(countNamedInstructions(*Init, "morok.ckd.byte") >= 1u);
+        CHECK(countNamedInstructions(*Init, "morok.ckd.target.enc") >= 1u);
+        CHECK(countNamedInstructions(*Init, "morok.ckd.enc.poison") == 0u);
+        CHECK_FALSE(verifyModule(*M, &errs()));
+    }
+}
+
 // Regression for #76: the carrier register (r14 on x86_64) is only callee-saved
 // under the C calling convention.  x86_regcallcc passes later integer arguments
 // in r14, so rewriting such a call would let argument setup overwrite the

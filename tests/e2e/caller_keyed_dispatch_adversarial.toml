@@ -8,3 +8,9 @@ enabled = true
 probability = 100
 max_calls = 8
 region_bytes = 16
+# Sealed-release mode (#21): the constructor must not self-recover the encoded
+# target from live bytes, so a static patch that also resets the code_size
+# sentinel cannot make startup re-seal the tampered code.  The adversarial
+# harness always post-link seals before running, so HasCode is true and the
+# sealed binary runs normally; the poison path only triggers on tamper.
+seal_required = true

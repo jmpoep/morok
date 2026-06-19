@@ -320,6 +320,7 @@ struct CallerKeyedDispatchConfig {
     Opt<std::uint32_t> probability;
     Opt<std::uint32_t> max_calls;
     Opt<std::uint32_t> region_bytes;
+    Opt<bool> seal_required;
 };
 
 struct NanomiteConfig {

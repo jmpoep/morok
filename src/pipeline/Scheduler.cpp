@@ -1190,6 +1190,8 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
             config_.passes.caller_keyed_dispatch.max_calls.value_or(4096);
         p.region_bytes =
             config_.passes.caller_keyed_dispatch.region_bytes.value_or(16);
+        p.seal_required =
+            config_.passes.caller_keyed_dispatch.seal_required.value_or(false);
         changed |= passes::callerKeyedDispatchModule(M, p, rng);
     }
 

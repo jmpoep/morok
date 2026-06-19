@@ -369,6 +369,7 @@ void parseCallerKeyedDispatch(const toml::table &t,
     c.probability = readU32(t["probability"]);
     c.max_calls = readU32(t["max_calls"]);
     c.region_bytes = readU32(t["region_bytes"]);
+    c.seal_required = readBool(t["seal_required"]);
 }
 
 void parseNanomites(const toml::table &t, NanomiteConfig &c) {

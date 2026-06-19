@@ -327,6 +327,8 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.caller_keyed_dispatch.max_calls);
     mergeOpt(dst.caller_keyed_dispatch.region_bytes,
              src.caller_keyed_dispatch.region_bytes);
+    mergeOpt(dst.caller_keyed_dispatch.seal_required,
+             src.caller_keyed_dispatch.seal_required);
     // Trap-mediated branch nanomites
     mergeOpt(dst.nanomites.enabled, src.nanomites.enabled);
     mergeOpt(dst.nanomites.probability, src.nanomites.probability);

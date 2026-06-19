@@ -103,6 +103,15 @@ cl::opt<std::string>
 cl::opt<std::uint64_t>
     MorokSeed("morok-seed", cl::init(0),
               cl::desc("Deterministic PRNG seed (0 = entropy)."));
+// Force caller-keyed dispatch into sealed-release mode (no startup self-seal
+// fallback).  Release builds that are guaranteed to be post-link sealed set
+// this so a static patcher that resets the code_size sentinel cannot make the
+// startup constructor re-seal the tampered bytes (#21).  Off by default so
+// unsealed dev/differential builds keep the self-recovering fallback.
+cl::opt<bool> MorokCkdSealRequired(
+    "morok-ckd-seal-required", cl::init(false),
+    cl::desc("Caller-keyed dispatch: assume post-link sealing; drop the "
+             "startup self-seal fallback and poison unsealed targets."));
 
 // Whether the auto-injection (clang -fpass-plugin) entry points should fire.
 // On Unix this is driven by the `-morok` cl::opt (`-mllvm -morok`).  On Windows
@@ -157,6 +166,14 @@ morok::config::Config loadConfig() {
             seed = std::strtoull(env, nullptr, 0);
     if (seed != 0)
         cfg.seed = seed;
+
+    // A sealed-release build (driven by the build pipeline only on platforms
+    // where post-link sealing actually runs) forces caller-keyed dispatch out
+    // of its self-seal fallback regardless of preset/file, so the shipped
+    // binary cannot self-adapt to pre-start static patches (#21).  Env mirrors
+    // the flag for the Windows static-LLVM registry where cl::opts are unseen.
+    if (MorokCkdSealRequired || std::getenv("MOROK_CKD_SEAL_REQUIRED") != nullptr)
+        cfg.passes.caller_keyed_dispatch.seal_required = true;
 
     return cfg;
 }

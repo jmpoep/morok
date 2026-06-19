@@ -24,6 +24,13 @@ struct CallerKeyedDispatchParams {
     std::uint32_t probability = 100;  ///< per direct call-site chance, 0..100
     std::uint32_t max_calls = 4096;   ///< transformed direct call-site cap
     std::uint32_t region_bytes = 16;  ///< live code bytes hashed per site
+    /// Sealed-release mode.  When true, the startup constructor never recomputes
+    /// the encoded target from live code bytes: the post-link sealer is the sole
+    /// source of truth, and an unsealed (or downgrade-reset) seal slot poisons
+    /// the target instead of self-sealing the live bytes.  Defaults false so
+    /// unsealed dev/differential builds keep the self-recovering fallback.  Only
+    /// enable it for builds guaranteed to be post-link sealed (#21).
+    bool seal_required = false;
 };
 
 /// Collapse eligible direct internal calls through one native dispatcher.  The

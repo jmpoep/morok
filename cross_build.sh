@@ -356,6 +356,18 @@ build_macos() {
   fi
   [ -d "$sdk" ] || die "macOS SDK not found: $sdk"
 
+  # macOS artifacts are post-link sealed on this Darwin host (seal_binary), so
+  # bind caller-keyed dispatch to the sealer: drop the startup self-seal
+  # fallback and poison unsealed targets, so a static patcher cannot reset the
+  # code_size sentinel to make startup re-seal tampered code (#21).  Only set
+  # this where sealing actually runs; an unsealed seal_required build would
+  # poison its own dispatch.  (Linux artifacts are not sealed, so build_linux
+  # deliberately leaves the self-recovering fallback in place.)
+  local ckd_seal=()
+  if [ "$SEAL_BINARIES" -eq 1 ]; then
+    ckd_seal=(-mllvm -morok-ckd-seal-required)
+  fi
+
   local arch
   for arch in $MACOS_ARCHES; do
     local target
@@ -370,7 +382,8 @@ build_macos() {
     local out="$OUT_DIR/$STEM-macos-$suffix"
     echo ">> macos $suffix -> $out"
     "$COMPILER" "${target_args[@]}" -isysroot "$sdk" \
-      -mmacosx-version-min="$MACOS_MIN" "${MOROK_CONFIG[@]}" "${COMMON[@]}" \
+      -mmacosx-version-min="$MACOS_MIN" "${MOROK_CONFIG[@]}" "${ckd_seal[@]}" \
+      "${COMMON[@]}" \
       -o "$out"
     strip_macos "$out"
     seal_binary "$out"

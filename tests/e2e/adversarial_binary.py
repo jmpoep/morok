@@ -837,6 +837,48 @@ def patch_ckd_code(path: Path) -> int:
     return 0
 
 
+def patch_ckd_downgrade(path: Path) -> int:
+    # Regression for #21: simulate a static attacker who resets the mutable
+    # code_size seal slot back to the unsealed sentinel to downgrade a sealed
+    # binary.  Pre-fix, the startup constructor treats the unsealed slot as
+    # "compute from scratch", re-hashes the live bytes, and re-seals the encoded
+    # target — so a downgraded (and, in the full attack, also code-patched)
+    # binary silently self-adapts and runs identically to the sealed baseline.
+    # With the sealed-release fix the constructor never recomputes; an unsealed
+    # slot poisons the encoded target, so the downgraded binary MUST diverge
+    # from the sealed baseline.
+    #
+    # We reset the seal slot WITHOUT corrupting an executing instruction on
+    # purpose: a code-byte patch would crash the process by itself (instruction
+    # corruption) regardless of the seal logic, which would mask the very
+    # behaviour under test.  Resetting the flag alone isolates the fix — pre-fix
+    # the binary self-seals and behaves normally; post-fix it poisons and
+    # diverges.  The full code-patch+downgrade attack is covered transitively:
+    # if the bare flag reset already poisons, adding a code patch cannot rescue
+    # it.
+    binary = Binary(path)
+    manifests = binary.find_ckd_manifests(require_patchable=False)
+    if not manifests or not manifests[0].nodes:
+        print("no caller-keyed-dispatch manifests to patch", file=sys.stderr)
+        return 1
+    reset = 0
+    for manifest in manifests:
+        for node in manifest.nodes:
+            code_size_off = binary.fileoff_for_addr(node.code_size)
+            if code_size_off is None:
+                continue
+            binary.put_u32(code_size_off, MG_UNSEALED_CODE_SIZE)
+            reset += 1
+    if reset == 0:
+        print("caller-keyed-dispatch code_size slot not addressable",
+              file=sys.stderr)
+        return 1
+    binary.write()
+    print(f"reset caller-keyed-dispatch code_size slots={reset} to unsealed "
+          "sentinel")
+    return 0
+
+
 def patch_rdtscp_sequences(binary: Binary) -> int:
     # lfence; rdtscp; lfence
     sequence = b"\x0f\xae\xe8\x0f\x01\xf9\x0f\xae\xe8"
@@ -913,6 +955,9 @@ def main(argv: list[str]) -> int:
     p_ckd_code = sub.add_parser("patch-ckd-code")
     p_ckd_code.add_argument("binary", type=Path)
 
+    p_ckd_downgrade = sub.add_parser("patch-ckd-downgrade")
+    p_ckd_downgrade.add_argument("binary", type=Path)
+
     p_timing = sub.add_parser("patch-timing")
     p_timing.add_argument("binary", type=Path)
 
@@ -928,6 +973,8 @@ def main(argv: list[str]) -> int:
         return patch_mutualguard_code(args.binary)
     if args.cmd == "patch-ckd-code":
         return patch_ckd_code(args.binary)
+    if args.cmd == "patch-ckd-downgrade":
+        return patch_ckd_downgrade(args.binary)
     if args.cmd == "patch-timing":
         return patch_timing(args.binary)
     if args.cmd == "assert-no-postlink-oracles":

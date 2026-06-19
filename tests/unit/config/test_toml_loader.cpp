@@ -145,6 +145,17 @@ TEST_CASE("caller keyed dispatch opt-in inherits usable preset knobs") {
     CHECK(max.config.passes.caller_keyed_dispatch.probability == 100u);
     CHECK(max.config.passes.caller_keyed_dispatch.max_calls == 4096u);
     CHECK(max.config.passes.caller_keyed_dispatch.region_bytes == 16u);
+
+    // The sealed-release knob (#21) parses from an explicit table and is unset
+    // (nullopt) when absent so presets keep the self-recovering dev fallback.
+    const auto sealed = loadFromString(R"(
+    [passes.caller_keyed_dispatch]
+    enabled = true
+    seal_required = true
+  )");
+    REQUIRE(sealed.ok);
+    CHECK(sealed.config.passes.caller_keyed_dispatch.seal_required == true);
+    CHECK_FALSE(high.config.passes.caller_keyed_dispatch.seal_required.has_value());
 }
 
 TEST_CASE("preset is the base and [passes.*] overrides it") {

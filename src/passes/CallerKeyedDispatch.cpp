@@ -297,7 +297,7 @@ void emitCarrierAnchor(IRBuilder<> &B, Value *Carrier,
 }
 
 void emitInit(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
-              std::uint32_t RegionBytes) {
+              std::uint32_t RegionBytes, bool SealRequired) {
     if (Sites.empty())
         return;
 
@@ -328,13 +328,34 @@ void emitInit(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
         LoadInst *Existing =
             B.CreateLoad(I64, S.encoded, /*isVolatile=*/true,
                          "morok.ckd.enc.sealed");
-        Value *Target = ptrToI64(B, S.callee);
-        Value *Delta = B.CreateSub(Target, Disp, "morok.ckd.target.delta");
-        Value *H = emitSiteHash(B, M, Dispatcher, S.caller, S.block, S,
-                                RegionBytes);
-        Value *Computed = B.CreateAdd(Delta, H, "morok.ckd.target.enc");
+        Value *Fallback;
+        if (SealRequired) {
+            // Sealed-release build: the post-link sealer is the sole source of
+            // the encoded target, so NEVER recompute it from the live code
+            // bytes.  Recomputing is exactly the self-seal hole (#21): a static
+            // attacker who patches a caller region and also resets the mutable
+            // code_size slot back to the unsealed sentinel would otherwise make
+            // this constructor re-hash and re-seal the tampered bytes at start.
+            // When the slot reads unsealed here — never sealed, or a downgrade
+            // patch reset the sentinel — poison the encoded target so the
+            // dispatcher decodes a wrong address (silent mis-dispatch) instead
+            // of adapting to the patch.  A nonzero per-site twist guarantees the
+            // poisoned value differs from any genuine sealed target.
+            Fallback = B.CreateXor(Existing,
+                                   ConstantInt::get(I64, S.salt | 1ULL),
+                                   "morok.ckd.enc.poison");
+        } else {
+            // Unsealed dev/differential build: no sealer ran, so recover the
+            // encoded target from the live bytes at startup.  This mode makes no
+            // tamper-resistance claim; it only keeps unsealed builds runnable.
+            Value *Target = ptrToI64(B, S.callee);
+            Value *Delta = B.CreateSub(Target, Disp, "morok.ckd.target.delta");
+            Value *H = emitSiteHash(B, M, Dispatcher, S.caller, S.block, S,
+                                    RegionBytes);
+            Fallback = B.CreateAdd(Delta, H, "morok.ckd.target.enc");
+        }
         Value *Encoded =
-            B.CreateSelect(HasCode, Existing, Computed, "morok.ckd.target.enc");
+            B.CreateSelect(HasCode, Existing, Fallback, "morok.ckd.target.sel");
         B.CreateStore(Encoded, S.encoded, /*isVolatile=*/true);
     }
     B.CreateRetVoid();
@@ -481,7 +502,7 @@ bool callerKeyedDispatchModule(Module &M,
         return false;
 
     emitPostlinkManifest(M, Dispatcher, Sites, RegionBytes);
-    emitInit(M, Dispatcher, Sites, RegionBytes);
+    emitInit(M, Dispatcher, Sites, RegionBytes, params.seal_required);
     for (const Site &S : Sites)
         rewriteSite(M, Dispatcher, S, *Layout, RegionBytes);
     return true;

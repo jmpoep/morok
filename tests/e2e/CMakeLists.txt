@@ -236,6 +236,26 @@ if(APPLE AND Python3_EXECUTABLE)
       "$<TARGET_FILE:morok_plugin>;${_adversarial_driver};${_adversarial_ckd_config};${_adversarial_ckd_workload}"
     TIMEOUT 120)
 
+  # Regression for #21: downgrade attack — reset the mutable code_size seal slot
+  # to the unsealed sentinel.  In sealed-release mode (seal_required) the startup
+  # constructor must poison the encoded target instead of re-sealing from live
+  # bytes, so the downgraded binary diverges from the sealed baseline.
+  add_test(NAME "e2e/adversarial_ckd_downgrade"
+    COMMAND bash "${_adversarial_driver}"
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_C_COMPILER}"
+            "$<TARGET_FILE:morok_plugin>"
+            "${_sysroot}"
+            "${_adversarial_ckd_workload}"
+            "${_adversarial_ckd_config}"
+            "ckd-downgrade"
+            4242)
+  set_tests_properties("e2e/adversarial_ckd_downgrade" PROPERTIES
+    LABELS "e2e;adversarial;max"
+    REQUIRED_FILES
+      "$<TARGET_FILE:morok_plugin>;${_adversarial_driver};${_adversarial_ckd_config};${_adversarial_ckd_workload}"
+    TIMEOUT 120)
+
   add_test(NAME "e2e/adversarial_timing_probe_patch"
     COMMAND bash "${_adversarial_driver}"
             "${Python3_EXECUTABLE}"
