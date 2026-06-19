@@ -11880,7 +11880,32 @@ entry:
     CHECK(M->getGlobalVariable("morok.watchdog.heartbeat", true) != nullptr);
     // The verdict-bound anti-debug seal (M1): detectors fold into it and the
     // self-checksum diff consumes it, so detection actually corrupts the verdict.
-    CHECK(M->getGlobalVariable("morok.antidbg.seal", true) != nullptr);
+    auto *Seal = M->getGlobalVariable("morok.antidbg.seal", true);
+    REQUIRE(Seal != nullptr);
+    std::size_t sealStores = 0;
+    std::size_t sealSelectStores = 0;
+    std::size_t sealCleanKeepsCurrent = 0;
+    std::size_t sealDirectXorStores = 0;
+    for (User *U : Seal->users()) {
+        auto *SI = dyn_cast<StoreInst>(U);
+        if (!SI || SI->getPointerOperand() != Seal)
+            continue;
+        ++sealStores;
+        Value *Stored = SI->getValueOperand();
+        if (auto *Sel = dyn_cast<SelectInst>(Stored)) {
+            ++sealSelectStores;
+            if (auto *LI = dyn_cast<LoadInst>(Sel->getFalseValue()))
+                if (LI->getPointerOperand() == Seal)
+                    ++sealCleanKeepsCurrent;
+        }
+        if (auto *BO = dyn_cast<BinaryOperator>(Stored))
+            if (BO->getOpcode() == Instruction::Xor)
+                ++sealDirectXorStores;
+    }
+    CHECK(sealStores >= 6u);
+    CHECK(sealSelectStores == sealStores);
+    CHECK(sealCleanKeepsCurrent == sealStores);
+    CHECK(sealDirectXorStores == 0u);
     // On arm64 the trace checks are emitted as direct `svc` (no imported stub to
     // DYLD-interpose), so ptrace/sysctl/csops must NOT appear as imports (M2).
     CHECK(M->getFunction("ptrace") == nullptr);

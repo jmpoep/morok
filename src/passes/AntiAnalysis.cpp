@@ -242,7 +242,9 @@ GlobalVariable *antiDebugSeal(Module &M, ir::IRRandom &rng) {
     return gv;
 }
 
-// Fold a ZERO-ON-CLEAN detector flag into the seal: `seal ^= flag ? salt : 0`.
+// Fold a ZERO-ON-CLEAN detector flag into the seal.  Clean flags leave the seal
+// byte-for-byte at S0; tripped flags run the current seal through a non-
+// involutive mix, so repeated identical observations cannot cancel by parity.
 // Must only be called with flags that are false on a legitimate run (e.g. traced
 // / DYLD-inserted / debugger-parent) — otherwise it would corrupt clean runs.
 void sealFold(IRBuilderBase &B, Value *Flag, std::uint64_t Salt) {
@@ -252,12 +254,27 @@ void sealFold(IRBuilderBase &B, Value *Flag, std::uint64_t Salt) {
     if (!Seal)
         return;
     auto *i64 = B.getInt64Ty();
-    Value *contrib = B.CreateMul(B.CreateZExtOrTrunc(Flag, i64),
-                                 ConstantInt::get(i64, Salt | 1ull));
+    Value *tripped = B.CreateICmpNE(B.CreateZExtOrTrunc(Flag, i64),
+                                    ConstantInt::get(i64, 0),
+                                    "morok.antidbg.seal.trip");
     auto *cur = B.CreateLoad(i64, Seal, "morok.antidbg.seal.cur");
     cur->setVolatile(true);
     cur->setAlignment(Align(8));
-    auto *st = B.CreateStore(B.CreateXor(cur, contrib), Seal);
+    Value *rot = B.CreateOr(B.CreateShl(cur, ConstantInt::get(i64, 17)),
+                            B.CreateLShr(cur, ConstantInt::get(i64, 47)),
+                            "morok.antidbg.seal.rot");
+    Value *mixed = B.CreateXor(
+        rot, ConstantInt::get(i64, Salt ^ 0xD6E8FEB86659FD93ULL),
+        "morok.antidbg.seal.salt");
+    mixed = B.CreateMul(
+        mixed, ConstantInt::get(i64, (Salt ^ 0x9E3779B97F4A7C15ULL) | 1ULL),
+        "morok.antidbg.seal.mul");
+    mixed = B.CreateAdd(
+        mixed, ConstantInt::get(i64, (Salt + 0xA0761D6478BD642FULL) | 1ULL),
+        "morok.antidbg.seal.mix");
+    Value *next =
+        B.CreateSelect(tripped, mixed, cur, "morok.antidbg.seal.next");
+    auto *st = B.CreateStore(next, Seal);
     st->setVolatile(true);
     st->setAlignment(Align(8));
 }
