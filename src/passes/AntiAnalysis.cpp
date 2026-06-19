@@ -7776,9 +7776,11 @@ Value *emitCacheTimingChase(IRBuilder<> &B, Module &M,
         Value *idx64 =
             B.CreateURem(scrambled, ConstantInt::get(i64, Targets.size()),
                          "morok.cachetime.target.idx");
-        Value *base64 =
+        Value *basePtr =
             selectCacheTimingTarget(B, M, Targets, idx64, "morok.cachetime");
-        Value *base = B.CreateZExtOrTrunc(base64, ip, "morok.cachetime.base");
+        Value *base64 =
+            B.CreateZExtOrTrunc(basePtr, i64, "morok.cachetime.base.wide");
+        Value *base = B.CreateZExtOrTrunc(basePtr, ip, "morok.cachetime.base");
         Value *offset = B.CreateAnd(
             B.CreateLShr(state, ConstantInt::get(i64, (step % 13) + 3)),
             ConstantInt::get(i64, 63), "morok.cachetime.offset");
@@ -11864,6 +11866,8 @@ bool pageFaultTlbOracleModule(Module &M, ir::IRRandom &rng) {
 
 bool cacheTimingOracleModule(Module &M, ir::IRRandom &rng) {
     const Triple tt(M.getTargetTriple());
+    if (intPtrTy(M)->getBitWidth() != 64)
+        return false;
     constexpr std::uint32_t kMaxTargets = 16;
     std::vector<Function *> targets;
     targets.reserve(kMaxTargets);

@@ -12800,6 +12800,32 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("cacheTimingOracleModule skips 32-bit targets") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target datalayout = "e-m:e-p:32:32-i64:64-f80:128-n8:16:32-S128"
+target triple = "i386-unknown-linux-gnu"
+define internal i32 @hot(i32 %x) {
+entry:
+  %a = add i32 %x, 11
+  ret i32 %a
+}
+define i32 @main() {
+entry:
+  %v = call i32 @hot(i32 5)
+  ret i32 %v
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8891);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::cacheTimingOracleModule(*M, rng));
+    CHECK(M->getFunction("morok.cachetime") == nullptr);
+    CHECK(M->getFunction("morok.cachetime.oracle") == nullptr);
+    CHECK(M->getGlobalVariable("morok.cachetime.state", true) == nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("cacheTimingOracleModule emits Darwin mach code chase") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
