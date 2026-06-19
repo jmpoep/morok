@@ -13280,7 +13280,51 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getGlobalVariable("morok.timing.state", true) != nullptr);
     CHECK(M->getFunction("morok.timing") != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
-    CHECK(hasInlineAsmCall(*Oracle));
+    // The x86 timestamp read lives in a CPUID-gated helper (rdtscp + rdtsc
+    // fallback); the probe calls it rather than inlining the asm.
+    Function *Tsc = M->getFunction("morok.timing.tsc.read");
+    REQUIRE(Tsc);
+    CHECK(hasInlineAsmCall(*Tsc));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+// Regression for #55: RDTSCP raises #UD on x86 CPUs/VMs that lack it, so the
+// unconditional timing probe could crash protected binaries.  The timestamp
+// helper now executes RDTSCP only when CPUID(0x80000001).EDX[27] reports it,
+// falling back to plain RDTSC otherwise.
+TEST_CASE("timing helper gates rdtscp behind a CPUID feature check") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(5501);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::timingOracleModule(*M, rng));
+
+    Function *Tsc = M->getFunction("morok.timing.tsc.read");
+    REQUIRE(Tsc);
+    bool hasCpuid = false;
+    bool hasRdtscp = false;
+    bool hasRdtsc = false;
+    bool hasCondBranch = false;
+    for (Instruction &I : instructions(*Tsc)) {
+        if (auto *CB = dyn_cast<CallBase>(&I))
+            if (CB->isInlineAsm())
+                if (auto *A = dyn_cast<InlineAsm>(CB->getCalledOperand())) {
+                    StringRef s = A->getAsmString();
+                    hasCpuid |= s.contains("cpuid");
+                    hasRdtscp |= s.contains("rdtscp");
+                    // plain rdtsc (not the rdtscp substring)
+                    hasRdtsc |= s.contains("rdtsc\n") || s.contains("rdtsc ");
+                }
+        if (auto *BI = dyn_cast<BranchInst>(&I))
+            hasCondBranch |= BI->isConditional();
+    }
+    CHECK(hasCpuid);      // feature test
+    CHECK(hasRdtscp);     // fast path (guarded)
+    CHECK(hasRdtsc);      // fallback path
+    CHECK(hasCondBranch); // rdtscp only on the feature-present arm
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -13430,7 +13474,12 @@ entry:
     REQUIRE(Oracle != nullptr);
     CHECK(M->getGlobalVariable("morok.cachetime.state", true) != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
-    CHECK(hasInlineAsmCall(*Oracle));
+    // The x86 timestamp read is in the CPUID-gated helper the oracle calls.
+    {
+        Function *Tsc = M->getFunction("morok.timing.tsc.read");
+        REQUIRE(Tsc);
+        CHECK(hasInlineAsmCall(*Tsc));
+    }
     CHECK(countNamedInstructions(*Oracle, "morok.cachetime.byte") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.cachetime.target.idx") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.cachetime.primary.delta") >=
@@ -13514,7 +13563,12 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getGlobalVariable("morok.microcanary.line", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.microcanary.evict", true) != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
-    CHECK(hasInlineAsmCall(*Oracle));
+    // The x86 timestamp read is in the CPUID-gated helper the oracle calls.
+    {
+        Function *Tsc = M->getFunction("morok.timing.tsc.read");
+        REQUIRE(Tsc);
+        CHECK(hasInlineAsmCall(*Tsc));
+    }
     CHECK(countNamedInstructions(*Oracle, "morok.microcanary.train.idx") >=
           1u);
     CHECK(countNamedInstructions(*Oracle, "morok.microcanary.spec.byte") >=

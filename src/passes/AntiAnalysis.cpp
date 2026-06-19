@@ -6381,23 +6381,82 @@ bool isX86Target(const Triple &TT) {
     return TT.getArch() == Triple::x86 || TT.getArch() == Triple::x86_64;
 }
 
-Value *emitRdtscp(IRBuilder<> &B, Module &M) {
-    LLVMContext &ctx = M.getContext();
-    auto *i32 = Type::getInt32Ty(ctx);
-    auto *i64 = Type::getInt64Ty(ctx);
-    auto *pairTy = StructType::get(ctx, {i32, i32});
-    auto *asmTy = FunctionType::get(pairTy, false);
-    InlineAsm *rdtscp =
-        InlineAsm::get(asmTy, "lfence\nrdtscp\nlfence",
-                       "={eax},={edx},~{ecx},~{dirflag},~{fpsr},~{flags}",
-                       /*hasSideEffects=*/true);
-    Value *pair = B.CreateCall(asmTy, rdtscp, {}, "morok.timing.rdtscp");
+// Combine the EDX:EAX timestamp pair returned by an rdtsc/rdtscp asm into i64.
+Value *combineTscPair(IRBuilder<> &B, Value *pair) {
+    auto *i64 = Type::getInt64Ty(B.getContext());
     Value *lo = B.CreateExtractValue(pair, {0}, "morok.timing.tsc.lo");
     Value *hi = B.CreateExtractValue(pair, {1}, "morok.timing.tsc.hi");
     return B.CreateOr(
         B.CreateZExt(lo, i64),
         B.CreateShl(B.CreateZExt(hi, i64), ConstantInt::get(i64, 32)),
         "morok.timing.tsc");
+}
+
+// A noinline helper that reads the timestamp counter, gating RDTSCP behind a
+// CPUID(0x80000001).EDX[27] feature test.  RDTSCP raises #UD on x86 CPUs (old
+// or deliberately masked virtual machines) that lack it, which would crash the
+// protected binary on the first timing probe; when the feature bit is clear we
+// fall back to plain RDTSC (baseline since the original Pentium, never #UD).
+// Both paths bracket the read with lfence for serialization and consume only
+// the EDX:EAX timestamp.  The branch caches nothing per call, but the CPUID
+// cost is constant across the paired start/end reads so it cancels in the delta.
+Function *getOrCreateTscHelper(Module &M) {
+    if (Function *Existing = M.getFunction("morok.timing.tsc.read"))
+        return Existing;
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *pairTy = StructType::get(ctx, {i32, i32});
+    auto *asmTy = FunctionType::get(pairTy, false);
+
+    auto *Fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::InternalLinkage,
+                                "morok.timing.tsc.read", &M);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->setDSOLocal(true);
+
+    BasicBlock *Entry = BasicBlock::Create(ctx, "entry", Fn);
+    BasicBlock *PBB = BasicBlock::Create(ctx, "rdtscp", Fn);
+    BasicBlock *RBB = BasicBlock::Create(ctx, "rdtsc", Fn);
+    BasicBlock *Merge = BasicBlock::Create(ctx, "merge", Fn);
+
+    IRBuilder<> EB(Entry);
+    Value *cpuid = emitCpuid(EB, M, ConstantInt::get(i32, 0x80000001u),
+                             ConstantInt::get(i32, 0));
+    Value *edx = cpuidReg(EB, cpuid, 3, "morok.timing.feat.edx");
+    Value *bit = EB.CreateAnd(EB.CreateLShr(edx, ConstantInt::get(i32, 27)),
+                              ConstantInt::get(i32, 1), "morok.timing.feat.rdtscp");
+    EB.CreateCondBr(EB.CreateICmpNE(bit, ConstantInt::get(i32, 0)), PBB, RBB);
+
+    IRBuilder<> PB(PBB);
+    InlineAsm *rdtscp =
+        InlineAsm::get(asmTy, "lfence\nrdtscp\nlfence",
+                       "={eax},={edx},~{ecx},~{dirflag},~{fpsr},~{flags}",
+                       /*hasSideEffects=*/true);
+    Value *tscP =
+        combineTscPair(PB, PB.CreateCall(asmTy, rdtscp, {}, "morok.timing.rdtscp"));
+    PB.CreateBr(Merge);
+
+    IRBuilder<> RB(RBB);
+    InlineAsm *rdtsc =
+        InlineAsm::get(asmTy, "lfence\nrdtsc\nlfence",
+                       "={eax},={edx},~{dirflag},~{fpsr},~{flags}",
+                       /*hasSideEffects=*/true);
+    Value *tscR =
+        combineTscPair(RB, RB.CreateCall(asmTy, rdtsc, {}, "morok.timing.rdtsc"));
+    RB.CreateBr(Merge);
+
+    IRBuilder<> MB(Merge);
+    PHINode *Phi = MB.CreatePHI(i64, 2, "morok.timing.tsc.val");
+    Phi->addIncoming(tscP, PBB);
+    Phi->addIncoming(tscR, RBB);
+    MB.CreateRet(Phi);
+    return Fn;
+}
+
+Value *emitRdtscp(IRBuilder<> &B, Module &M) {
+    Function *H = getOrCreateTscHelper(M);
+    return B.CreateCall(H->getFunctionType(), H, {}, "morok.timing.tsc");
 }
 
 Value *emitClockGettimeNanos(IRBuilder<> &B, Module &M, std::int32_t ClockId,
