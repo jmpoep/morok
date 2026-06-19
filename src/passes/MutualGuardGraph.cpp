@@ -366,11 +366,12 @@ GlobalVariable *createPostlinkManifest(Module &M, StringRef Suffix,
     auto *NodeTy = StructType::get(Ctx, {PtrTy, PtrTy, I64, I64});
     SmallVector<Constant *, 16> NodeRecords;
     NodeRecords.reserve(Nodes.size());
+    auto *Scrubbed = ConstantInt::get(I64, 0);
     for (const NodeRuntime &Node : Nodes) {
+        // The retained manifest is a layout contract, not a recompute oracle.
+        // Keep live seeds and baked hashes only in the checker code/globals.
         NodeRecords.push_back(ConstantStruct::get(
-            NodeTy,
-            {Node.region, Node.expected, ConstantInt::get(I64, Node.seed),
-             ConstantInt::get(I64, Node.expected_hash)}));
+            NodeTy, {Node.region, Node.expected, Scrubbed, Scrubbed}));
     }
     auto *NodesTy = ArrayType::get(NodeTy, NodeRecords.size());
     auto *ManifestTy =

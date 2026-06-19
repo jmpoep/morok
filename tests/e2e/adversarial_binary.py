@@ -21,6 +21,9 @@ from pathlib import Path
 
 SC_MAGIC = 0xA7D13C5E9000C3B2
 SC_MANIFEST_SIZE = 72
+MG_MAGIC = 0x8E21B7C4005AF10D
+MG_HEADER_SIZE = 24
+MG_RECORD_SIZE = 32
 
 CPU_TYPE_X86_64 = 0x01000007
 CPU_TYPE_ARM64 = 0x0100000C
@@ -394,6 +397,8 @@ def seal(path: Path, window: int) -> int:
     manifests = binary.find_sc_manifests()
     sealed = 0
     for m in manifests:
+        if m.seed == 0 and m.expected_hash == 0:
+            continue
         region = binary.read_addr(m.region, m.region_size)
         target_seg = binary.segment_for_addr(m.target)
         target_off = binary.fileoff_for_addr(m.target)
@@ -415,13 +420,70 @@ def seal(path: Path, window: int) -> int:
         expected = hash_bytes(code, hash_bytes(region, m.seed))
         binary.put_u64(expected_off, expected)
         binary.put_u32(code_size_off, code_len)
-        binary.put_u64(m.offset + 48, expected)
+        binary.put_u64(m.offset + 40, 0)
+        binary.put_u64(m.offset + 48, 0)
         sealed += 1
     if sealed:
         binary.write()
         resign_macho(binary, path)
     print(f"sealed self-check manifests={sealed} binary={path}")
     return 0 if sealed else 1
+
+
+def postlink_oracle_findings(binary: Binary) -> list[str]:
+    findings: list[str] = []
+    for m in binary.find_sc_manifests():
+        if m.seed != 0 or m.expected_hash != 0:
+            findings.append(
+                f"self-check manifest at file+0x{m.offset:x} retains "
+                "seed/expected_hash"
+            )
+
+    needle = struct.pack("<Q", MG_MAGIC)
+    start = 0
+    while True:
+        off = binary.data.find(needle, start)
+        if off < 0:
+            break
+        start = off + 1
+        if off + MG_HEADER_SIZE > len(binary.data):
+            continue
+        version = binary.u32(off + 8)
+        count = binary.u32(off + 12)
+        region_size = binary.u32(off + 16)
+        if version != 2 or count == 0 or count > 1024 or region_size > 1 << 20:
+            continue
+        total_size = MG_HEADER_SIZE + count * MG_RECORD_SIZE
+        if off + total_size > len(binary.data):
+            continue
+        for i in range(count):
+            rec = off + MG_HEADER_SIZE + i * MG_RECORD_SIZE
+            region = binary.decode_pointer(binary.u64(rec))
+            expected = binary.decode_pointer(binary.u64(rec + 8))
+            if (
+                binary.fileoff_for_addr(region) is None
+                or binary.fileoff_for_addr(expected) is None
+            ):
+                continue
+            seed = binary.u64(rec + 16)
+            expected_hash = binary.u64(rec + 24)
+            if seed != 0 or expected_hash != 0:
+                findings.append(
+                    f"mutual-guard manifest at file+0x{off:x} node={i} "
+                    "retains seed/expected_hash"
+                )
+    return findings
+
+
+def assert_no_postlink_oracles(path: Path) -> int:
+    binary = Binary(path)
+    findings = postlink_oracle_findings(binary)
+    for finding in findings:
+        print(f"FAIL {finding}", file=sys.stderr)
+    if findings:
+        return 1
+    print(f"OK no retained post-link oracle data binary={path}")
+    return 0
 
 
 def patch_selfcheck_code(path: Path) -> int:
@@ -522,6 +584,9 @@ def main(argv: list[str]) -> int:
     p_timing = sub.add_parser("patch-timing")
     p_timing.add_argument("binary", type=Path)
 
+    p_oracles = sub.add_parser("assert-no-postlink-oracles")
+    p_oracles.add_argument("binary", type=Path)
+
     args = parser.parse_args(argv)
     if args.cmd == "seal":
         return seal(args.binary, args.window)
@@ -529,6 +594,8 @@ def main(argv: list[str]) -> int:
         return patch_selfcheck_code(args.binary)
     if args.cmd == "patch-timing":
         return patch_timing(args.binary)
+    if args.cmd == "assert-no-postlink-oracles":
+        return assert_no_postlink_oracles(args.binary)
     return 2
 
 

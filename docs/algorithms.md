@@ -682,9 +682,11 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   pointers to the `morok.sc.region.*` and `morok.sc.expected.*` globals, the
   region byte count, the hash seed, the current expected hash, the protected
   function pointer, and the `morok.sc.code.size.*` global.  A post-link rewriter
-  can use that manifest to keep the placeholder region, add a final code-byte
-  window, and patch the expected-hash global without reverse-engineering the IR
-  shape or leaving an ASCII product marker in the binary.
+  can use that manifest as a pre-seal contract to keep the placeholder region,
+  add a final code-byte window, and patch the expected-hash global without
+  reverse-engineering the IR shape or leaving an ASCII product marker in the
+  binary.  Shipping artifacts must not retain the seed/current-hash oracle: the
+  sealer scrubs those manifest fields after it patches the referenced globals.
 - Scheduler placement is after trace keying/dispatcherless routing and before
   constant encryption, so the integrity fusion is late while ordinary constant
   encryption can still hide the encoded constants introduced by this pass.
@@ -742,10 +744,10 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - The pass also emits a retained `morok.postlink.mg.*` manifest in
   `llvm.compiler.used`.  The manifest records a non-printable magic/version,
   node count, region byte count, coverage depth, and per-node records containing
-  the region pointer, expected-hash pointer, hash seed, and current expected
-  hash.  A post-link rewriter can patch every node region and expected global
-  from that single graph record, while preserving the ring-derived coverage
-  topology and avoiding a readable manifest marker.
+  the region pointer, expected-hash pointer, and scrubbed seed/hash placeholders.
+  Live seeds and baked expected hashes remain only in the checker code and
+  expected globals, so the retained manifest preserves the graph contract
+  without handing a local patcher the recomputation recipe.
 - Selected scalar integer and floating-point returns are rewritten as
   `ret_value ^ graph_diff` (truncated to the return width as needed).  Floating
   returns (`half`, `bfloat`, `float`, `double`) are bitcast to an equal-width
@@ -1422,8 +1424,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   so those passes remain finite even when invoked outside the scheduler.
 - IR-stage post-link contracts are emitted as retained `morok.postlink.*`
   manifests rather than implicit placeholder globals; downstream patchers should
-  consume those records and update the referenced region/expected globals.  The
-  manifest sentinels are fixed binary values, not printable `MOROK*` strings.
+  consume those records, update the referenced region/expected globals, and
+  strip or scrub sensitive seed/hash fields before release.  The manifest
+  sentinels are fixed binary values, not printable `MOROK*` strings.
 - MisleadingMetadata runs near the final symbol-hygiene phase and plants a
   bounded set of retained local decoy text symbols, internal aliases that create
   duplicate apparent function starts, and contradictory-but-valid DWARF

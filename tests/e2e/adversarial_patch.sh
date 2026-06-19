@@ -116,6 +116,10 @@ if ! "$PYTHON" "$TOOL" seal "$OBF" --window 262144; then
   echo "FAIL post-link seal produced no self-check manifests" >&2
   exit 1
 fi
+if ! "$PYTHON" "$TOOL" assert-no-postlink-oracles "$OBF"; then
+  echo "FAIL sealed binary retains post-link oracle data" >&2
+  exit 1
+fi
 resign_if_needed "$OBF" || exit 1
 
 run_capture "$CLEAN" "$TMP/clean.out" "$TMP/clean.rc"

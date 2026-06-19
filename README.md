@@ -47,8 +47,8 @@ Morok can do things an LLVM IR pass can produce:
   signal/exception handlers, direct syscalls, and platform-specific runtime
   probes into the target binary.
 - Generate deterministic per-build and per-callsite diversity from a seed.
-- Emit retained post-link manifests for later patching where final native
-  bytes are needed.
+- Emit post-link manifests for later patching where final native bytes are
+  needed, with release gates that scrub retained bypass data after sealing.
 - Keep growth bounded with function, module, callsite, table, payload, clone,
   route, and visit caps.
 

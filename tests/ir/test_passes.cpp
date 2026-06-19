@@ -8914,6 +8914,25 @@ entry:
         CHECK(constantReferencesGlobal(Manifest->getInitializer(), Region));
     for (GlobalVariable *Expected : expected)
         CHECK(constantReferencesGlobal(Manifest->getInitializer(), Expected));
+
+    auto *ManifestInit = dyn_cast<ConstantStruct>(Manifest->getInitializer());
+    REQUIRE(ManifestInit);
+    REQUIRE(ManifestInit->getNumOperands() == 6);
+    auto *Records = dyn_cast<ConstantArray>(ManifestInit->getOperand(5));
+    REQUIRE(Records);
+    REQUIRE(Records->getNumOperands() == nodes.size());
+    for (unsigned I = 0; I != Records->getNumOperands(); ++I) {
+        auto *Record = dyn_cast<ConstantStruct>(Records->getOperand(I));
+        REQUIRE(Record);
+        REQUIRE(Record->getNumOperands() == 4);
+        auto *Seed = dyn_cast<ConstantInt>(Record->getOperand(2));
+        auto *ExpectedHash = dyn_cast<ConstantInt>(Record->getOperand(3));
+        REQUIRE(Seed);
+        REQUIRE(ExpectedHash);
+        CHECK(Seed->getValue().isZero());
+        CHECK(ExpectedHash->getValue().isZero());
+    }
+
     GlobalVariable *Used = M->getGlobalVariable("llvm.compiler.used");
     REQUIRE(Used);
     REQUIRE(Used->hasInitializer());
