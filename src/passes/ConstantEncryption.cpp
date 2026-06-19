@@ -27,12 +27,15 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/NoFolder.h"
+#include "llvm/Support/Regex.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 #include <algorithm>
 #include <map>
 #include <optional>
+#include <string>
 #include <vector>
 
 using namespace llvm;
@@ -385,6 +388,44 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
     }
     const bool useFeistel = params.feistel && !hasMusttail;
     const bool useSubstitute = params.substitute_xor && !hasMusttail;
+
+    // Compile the value filters once.  Use llvm::Regex (not std::regex): this
+    // codebase builds with exceptions disabled, so a malformed std::regex would
+    // terminate the compiler — llvm::Regex reports invalidity without throwing,
+    // and a malformed pattern is simply dropped.
+    auto compile = [](const std::vector<std::string> &pats) {
+        std::vector<llvm::Regex> out;
+        for (const std::string &p : pats) {
+            llvm::Regex re(p, llvm::Regex::IgnoreCase);
+            if (re.isValid())
+                out.push_back(std::move(re));
+        }
+        return out;
+    };
+    const std::vector<llvm::Regex> skipRe = compile(params.skip_value);
+    const std::vector<llvm::Regex> forceRe = compile(params.force_value);
+    const bool haveFilters = !skipRe.empty() || !forceRe.empty();
+    // Classify a constant by value: Force (always encrypt), Skip (never), or
+    // Normal (defer to `probability`).  With no filters every constant is Normal
+    // so the rng draw sequence is byte-identical to the unfiltered pass.
+    enum class Decision { Normal, Skip, Force };
+    auto classify = [&](Constant *c) -> Decision {
+        if (!haveFilters)
+            return Decision::Normal;
+        auto *CI = dyn_cast<ConstantInt>(c);
+        if (!CI)
+            return Decision::Normal; // value filters apply to integer literals
+        const std::string hex =
+            llvm::utohexstr(CI->getZExtValue(), /*LowerCase=*/true);
+        for (const llvm::Regex &re : forceRe)
+            if (re.match(hex))
+                return Decision::Force;
+        for (const llvm::Regex &re : skipRe)
+            if (re.match(hex))
+                return Decision::Skip;
+        return Decision::Normal;
+    };
+
     bool changed = false;
     const std::size_t maxTargets = kMaxConstEncTargetsPerIteration;
 
@@ -481,8 +522,11 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
         };
 
         for (const Target &t : targets) {
-            if (!rng.chance(params.probability))
-                continue;
+            const Decision d = classify(t.value);
+            if (d == Decision::Skip)
+                continue; // value filtered out; never encrypt
+            if (d == Decision::Normal && !rng.chance(params.probability))
+                continue; // Force bypasses the probability roll
             Instruction *InsertBefore = insertionPoint(t);
             if (!InsertBefore)
                 continue;

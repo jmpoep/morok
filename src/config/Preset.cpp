@@ -73,8 +73,6 @@ PassConfig makeLow() {
     c.const_enc.feistel = false;
     c.const_enc.substitute_xor = false;
     c.const_enc.substitute_xor_prob = 0;
-    c.const_enc.globalize = false;
-    c.const_enc.globalize_prob = 0;
 
     c.split.enabled = true;
     c.split.splits = 2;
@@ -287,8 +285,6 @@ PassConfig makeMid() {
     c.const_enc.feistel = false;
     c.const_enc.substitute_xor = true;
     c.const_enc.substitute_xor_prob = 40;
-    c.const_enc.globalize = false;
-    c.const_enc.globalize_prob = 50;
 
     c.split.enabled = true;
     c.split.splits = 3;
@@ -507,8 +503,6 @@ PassConfig makeHigh() {
     c.const_enc.feistel = true;
     c.const_enc.substitute_xor = true;
     c.const_enc.substitute_xor_prob = 60;
-    c.const_enc.globalize = false;
-    c.const_enc.globalize_prob = 50;
 
     c.split.enabled = true;
     c.split.splits = 5;
@@ -741,8 +735,6 @@ PassConfig makeMax() {
     c.const_enc.feistel = true;
     c.const_enc.substitute_xor = true;
     c.const_enc.substitute_xor_prob = 100;
-    c.const_enc.globalize = true;
-    c.const_enc.globalize_prob = 100;
 
     c.split.enabled = true;
     c.split.splits = 8;

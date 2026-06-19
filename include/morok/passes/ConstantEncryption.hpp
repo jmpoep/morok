@@ -21,6 +21,8 @@
 #include "llvm/IR/PassManager.h"
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace llvm {
 class Function;
@@ -41,6 +43,13 @@ struct ConstEncParams {
     /// host function past the value-pass budget, so the immediate never survives
     /// as a patchable cleartext compare.
     bool conditions_only = false;
+    /// Value-based filtering: ECMAScript regexes matched against the lowercase
+    /// minimal hex of each integer constant.  A value matching any `force_value`
+    /// pattern is always encrypted (ignoring `probability`); a value matching
+    /// any `skip_value` pattern is never encrypted.  force_value wins ties.
+    /// Empty (the default) leaves selection entirely to `probability`.
+    std::vector<std::string> skip_value;
+    std::vector<std::string> force_value;
 };
 
 /// Encrypt eligible scalar constants in `F`.  Returns true if any changed.

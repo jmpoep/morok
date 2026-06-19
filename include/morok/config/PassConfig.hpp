@@ -296,6 +296,10 @@ struct ConstEncConfig {
     Opt<bool> feistel;
     Opt<bool> substitute_xor;
     Opt<std::uint32_t> substitute_xor_prob;
+    // Reserved: the XOR shares are ALWAYS emitted as private globals read with
+    // volatile loads (see ConstantEncryption.cpp), so globalization is applied
+    // unconditionally; these knobs are parsed for forward-compatibility but do
+    // not change the output, so presets must not vary them.
     Opt<bool> globalize;
     Opt<std::uint32_t> globalize_prob;
     std::vector<std::string> skip_value;

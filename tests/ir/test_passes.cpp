@@ -1800,6 +1800,67 @@ entry:
     CHECK(subkeys >= 1);
 }
 
+// Regression for #20: constant_encryption skip_value / force_value (regexes on
+// the lowercase hex of integer literals) were declared and documented but never
+// reached the pass.  skip_value must exempt a matching constant even at
+// probability=100; force_value must encrypt a matching constant even at
+// probability=0.
+TEST_CASE("constantEncryptFunction honors skip_value and force_value filters") {
+    auto hasConstInt = [](Function &F, std::uint64_t v) {
+        for (Instruction &I : instructions(F))
+            for (Use &U : I.operands())
+                if (auto *CI = dyn_cast<ConstantInt>(U.get()))
+                    if (CI->getType()->getIntegerBitWidth() <= 64 &&
+                        CI->getZExtValue() == v)
+                        return true;
+        return false;
+    };
+    const char *ir = R"ir(
+define i32 @filt(i32 %a) {
+entry:
+  %x = add i32 %a, 305419896
+  %y = add i32 %x, -1412567278
+  ret i32 %y
+}
+)ir"; // 305419896 = 0x12345678 ; -1412567278 as i32 = 0xabcdef12
+
+    // skip_value: 0x12345678 is exempted; 0xabcdef12 is still encrypted at p=100.
+    {
+        LLVMContext ctx;
+        auto M = parse(ctx, ir);
+        Function *F = M->getFunction("filt");
+        REQUIRE(F);
+        auto engine = morok::core::Xoshiro256pp::fromSeed(2001);
+        morok::ir::IRRandom rng(engine);
+        morok::passes::ConstEncParams p;
+        p.probability = 100;
+        p.share_count = 4;
+        p.skip_value = {"12345678"};
+        CHECK(morok::passes::constantEncryptFunction(*F, p, rng));
+        CHECK(hasConstInt(*F, 0x12345678u));      // skipped -> still a literal
+        CHECK_FALSE(hasConstInt(*F, 0xABCDEF12u)); // encrypted
+        CHECK_FALSE(verifyModule(*M, &errs()));
+    }
+
+    // force_value: 0xabcdef12 is forced even at p=0; 0x12345678 stays a literal.
+    {
+        LLVMContext ctx;
+        auto M = parse(ctx, ir);
+        Function *F = M->getFunction("filt");
+        REQUIRE(F);
+        auto engine = morok::core::Xoshiro256pp::fromSeed(2002);
+        morok::ir::IRRandom rng(engine);
+        morok::passes::ConstEncParams p;
+        p.probability = 0;
+        p.share_count = 4;
+        p.force_value = {"abcdef12"};
+        CHECK(morok::passes::constantEncryptFunction(*F, p, rng));
+        CHECK(hasConstInt(*F, 0x12345678u));      // p=0, not forced -> literal
+        CHECK_FALSE(hasConstInt(*F, 0xABCDEF12u)); // forced -> encrypted
+        CHECK_FALSE(verifyModule(*M, &errs()));
+    }
+}
+
 TEST_CASE("constantEncryptFunction supports sub-byte and odd-width literals") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

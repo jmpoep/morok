@@ -44,6 +44,17 @@ TEST_CASE("presets do not vary reserved chaos_state_machine knobs") {
     }
 }
 
+// Regression for #20: constant shares are unconditionally globalized, so the
+// globalize / globalize_prob knobs are reserved no-ops; no preset may imply
+// variation (low/mid/high/max previously set globalize and globalize_prob).
+TEST_CASE("presets do not vary the reserved constant_encryption globalize knob") {
+    for (Preset p : {Preset::Low, Preset::Mid, Preset::High, Preset::Max}) {
+        const PassConfig c = presetConfig(p);
+        CHECK_FALSE(c.const_enc.globalize.has_value());
+        CHECK_FALSE(c.const_enc.globalize_prob.has_value());
+    }
+}
+
 TEST_CASE("low preset matches the documented table") {
     const PassConfig c = presetConfig(Preset::Low);
     CHECK(c.bcf.probability == 30u);
