@@ -142,6 +142,20 @@ def write_fat_macho_stub(path: Path) -> None:
     path.write_bytes(data)
 
 
+def write_elf32_stub(path: Path) -> None:
+    data = bytearray(0x100)
+    data[:16] = b"\x7fELF" + bytes([1, 1, 1]) + b"\0" * 9
+    struct.pack_into("<HHI", data, 16, 2, 3, 1)
+    path.write_bytes(data)
+
+
+def write_big_endian_elf64_stub(path: Path) -> None:
+    data = bytearray(0x100)
+    data[:16] = b"\x7fELF" + bytes([2, 2, 1]) + b"\0" * 9
+    struct.pack_into(">HHI", data, 16, 2, 62, 1)
+    path.write_bytes(data)
+
+
 def run(tool: Path, bundle: Path, *extra: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(tool), str(bundle), "--release", *extra],
@@ -231,6 +245,24 @@ def main(argv: list[str]) -> int:
         require_fail(
             run(tool, fat_macho, "--require-sealed-manifest"),
             "unsupported-fat-macho-audit",
+        )
+
+        elf32 = tmp / "elf32"
+        elf32.mkdir()
+        write_synthetic_elf(elf32 / "app", sealed=True)
+        write_elf32_stub(elf32 / "legacy-helper")
+        require_fail(
+            run(tool, elf32, "--require-sealed-manifest"),
+            "unsupported-elf-audit",
+        )
+
+        elf_be = tmp / "elf-be"
+        elf_be.mkdir()
+        write_synthetic_elf(elf_be / "app", sealed=True)
+        write_big_endian_elf64_stub(elf_be / "be-helper")
+        require_fail(
+            run(tool, elf_be, "--require-sealed-manifest"),
+            "unsupported-elf-audit",
         )
 
         sidecar = tmp / "sidecar"

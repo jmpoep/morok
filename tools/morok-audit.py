@@ -77,6 +77,12 @@ FAT_MACHO_MAGICS = {
     b"\xca\xfe\xba\xbf",  # FAT_MAGIC_64
     b"\xbf\xba\xfe\xca",  # FAT_CIGAM_64
 }
+THIN_MACHO_MAGICS = {
+    b"\xfe\xed\xfa\xce",  # MH_MAGIC
+    b"\xce\xfa\xed\xfe",  # MH_CIGAM
+    b"\xfe\xed\xfa\xcf",  # MH_MAGIC_64 (big-endian byte order)
+    b"\xcf\xfa\xed\xfe",  # MH_CIGAM_64 / parser-supported little-endian form
+}
 
 
 @dataclass
@@ -426,24 +432,39 @@ class Auditor:
             sealed = False
         return sealed
 
+    def unsupported_binary_finding(self, data: bytes) -> tuple[str, str] | None:
+        if data.startswith(b"MZ"):
+            return (
+                "unsupported-pe-audit",
+                "PE release audit is not implemented yet for sealed-manifest verification",
+            )
+        if data[:4] in FAT_MACHO_MAGICS:
+            return (
+                "unsupported-fat-macho-audit",
+                "fat Mach-O release audit must verify every architecture slice",
+            )
+        if data.startswith(b"\x7fELF"):
+            return (
+                "unsupported-elf-audit",
+                "ELF release audit parser does not support this ELF class or byte order",
+            )
+        if data[:4] in THIN_MACHO_MAGICS:
+            return (
+                "unsupported-macho-audit",
+                "Mach-O release audit parser does not support this Mach-O variant",
+            )
+        return None
+
     def audit_binary(self, path: Path) -> None:
         data = self.read_bytes(path)
         try:
             binary = adv.Binary(path)
         except SystemExit:
             if self.require_sealed_manifest:
-                if data.startswith(b"MZ"):
-                    self.emit_finding(
-                        "unsupported-pe-audit",
-                        path,
-                        "PE release audit is not implemented yet for sealed-manifest verification",
-                    )
-                elif data[:4] in FAT_MACHO_MAGICS:
-                    self.emit_finding(
-                        "unsupported-fat-macho-audit",
-                        path,
-                        "fat Mach-O release audit must verify every architecture slice",
-                    )
+                finding = self.unsupported_binary_finding(data)
+                if finding:
+                    check, detail = finding
+                    self.emit_finding(check, path, detail)
             return
         except Exception as exc:
             self.emit_finding("binary-parse-error", path, str(exc))
