@@ -220,6 +220,7 @@ bool hasSensitiveGeneratedPrefix(StringRef Name) {
            Name.starts_with("morok.mg.node.") ||
            Name.starts_with("morok.mg.diff.") ||
            Name.starts_with("morok.antidbg") ||
+           Name.starts_with("morok.watchdog") ||
            Name.starts_with("morok.antihook") ||
            Name.starts_with("morok.vti.") || Name.starts_with("morok.timing") ||
            Name.starts_with("morok.trap");

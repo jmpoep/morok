@@ -1063,6 +1063,45 @@ TEST_CASE("MorokPass hardens sensitive generated decryptor helpers") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("MorokPass hardens generated watchdog helpers") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() { ret i32 0 }
+)ir");
+
+    morok::config::Config cfg;
+    cfg.seed = 713;
+    cfg.passes.anti_dbg.enabled = true;
+    cfg.passes.bcf.enabled = true;
+    cfg.passes.bcf.probability = 0;
+    cfg.passes.bcf.iterations = 1;
+    cfg.passes.external_op.enabled = true;
+    cfg.passes.external_op.probability = 0;
+    cfg.passes.external_op.max_blocks = 0;
+    cfg.passes.external_op.decoy_stores = 0;
+
+    ModuleAnalysisManager AM;
+    morok::pipeline::MorokPass(std::move(cfg)).run(*M, AM);
+
+    Function *WatchdogCtor = M->getFunction("morok.watchdog");
+    Function *HeartbeatWatch = M->getFunction("morok.watchdog.heartbeat.watch");
+    REQUIRE(WatchdogCtor != nullptr);
+    REQUIRE(HeartbeatWatch != nullptr);
+
+    auto hasBcfJunk = [](Function *F) {
+        for (BasicBlock &BB : *F)
+            if (BB.getName().starts_with("morok.bcf.junk"))
+                return true;
+        return false;
+    };
+    CHECK(hasBcfJunk(WatchdogCtor));
+    CHECK(hasBcfJunk(HeartbeatWatch));
+    CHECK(countNamedInstructions(*WatchdogCtor, "morok.extop.pred") >= 1u);
+    CHECK(countNamedInstructions(*HeartbeatWatch, "morok.extop.pred") >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("MorokPass keeps anti-debug and checksum helpers native") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
