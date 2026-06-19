@@ -144,7 +144,8 @@ void buildDecoyBlock(BasicBlock *Decoy, BasicBlock *Body,
     auto *I64 = B.getInt64Ty();
     Value *Acc = ConstantInt::get(I64, rng.next());
     const std::uint32_t Stores =
-        std::max<std::uint32_t>(Params.decoy_stores, 1);
+        std::clamp(Params.decoy_stores, 1u,
+                   kExternalOpaqueMaxDecoyStores);
     for (std::uint32_t I = 0; I != Stores; ++I) {
         Value *Prev = volatileLoad(B, I64, Scratch, "morok.extop.decoy.prev");
         Acc = B.CreateAdd(Acc, Prev, "morok.extop.decoy.add");
@@ -171,6 +172,8 @@ bool externalOpaquePredicatesFunction(Function &F,
         (!params.include_generated && isGeneratedFunction(F)) ||
         params.probability == 0 || params.max_blocks == 0)
         return false;
+    const std::uint32_t MaxBlocks =
+        std::min(params.max_blocks, kExternalOpaqueMaxBlocks);
 
     std::vector<BasicBlock *> Blocks;
     for (BasicBlock &BB : F)
@@ -182,7 +185,7 @@ bool externalOpaquePredicatesFunction(Function &F,
     bool Changed = false;
     std::uint32_t Count = 0;
     for (BasicBlock *Head : Blocks) {
-        if (Count >= params.max_blocks)
+        if (Count >= MaxBlocks)
             break;
         if (Head->isEHPad() || Head->isLandingPad() || isGeneratedBlock(*Head))
             continue;

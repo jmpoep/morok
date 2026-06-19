@@ -16,6 +16,7 @@
 #include "toml.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -26,14 +27,22 @@ namespace {
 using Node = toml::node_view<const toml::node>;
 
 Opt<std::uint32_t> readU32(const Node &v) {
-    if (auto i = v.value<std::int64_t>())
+    if (auto i = v.value<std::int64_t>()) {
+        if (*i < 0 ||
+            *i > static_cast<std::int64_t>(
+                     std::numeric_limits<std::uint32_t>::max()))
+            return std::nullopt;
         return static_cast<std::uint32_t>(*i);
+    }
     return std::nullopt;
 }
 
 Opt<std::uint64_t> readU64(const Node &v) {
-    if (auto i = v.value<std::int64_t>())
+    if (auto i = v.value<std::int64_t>()) {
+        if (*i < 0)
+            return std::nullopt;
         return static_cast<std::uint64_t>(*i);
+    }
     return std::nullopt;
 }
 
@@ -514,8 +523,8 @@ Config buildConfig(const toml::table &tbl) {
     if (const auto *global = tbl["global"].as_table()) {
         if (auto v = (*global)["preset"].value<std::string>())
             cfg.preset = parsePreset(*v);
-        if (auto v = (*global)["seed"].value<std::int64_t>())
-            cfg.seed = static_cast<std::uint64_t>(*v);
+        if (auto v = readU64((*global)["seed"]))
+            cfg.seed = *v;
         if (auto v = (*global)["verbose"].value<bool>())
             cfg.verbose = *v;
         if (auto v = (*global)["trace"].value<bool>())

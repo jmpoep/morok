@@ -25,6 +25,9 @@ class Function;
 
 namespace morok::passes {
 
+inline constexpr std::uint32_t kExternalOpaqueMaxBlocks = 16;
+inline constexpr std::uint32_t kExternalOpaqueMaxDecoyStores = 16;
+
 struct ExternalOpaqueParams {
     std::uint32_t probability = 35; ///< per-block chance, 0..100
     std::uint32_t max_blocks = 8;   ///< per-function transformed block cap

@@ -266,8 +266,12 @@ externalOpaqueParams(const config::ExternalOpConfig &C, bool Sensitive,
                      bool IncludeGenerated = false) {
     passes::ExternalOpaqueParams P;
     P.probability = raised(C.probability.value_or(35), 100, Sensitive);
-    P.max_blocks = raised(C.max_blocks.value_or(8), 12, Sensitive);
-    P.decoy_stores = raised(C.decoy_stores.value_or(2), 3, Sensitive);
+    P.max_blocks =
+        std::min(raised(C.max_blocks.value_or(8), 12, Sensitive),
+                 passes::kExternalOpaqueMaxBlocks);
+    P.decoy_stores =
+        std::min(raised(C.decoy_stores.value_or(2), 3, Sensitive),
+                 passes::kExternalOpaqueMaxDecoyStores);
     P.include_generated = IncludeGenerated;
     return P;
 }

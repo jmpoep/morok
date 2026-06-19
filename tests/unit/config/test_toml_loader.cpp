@@ -33,6 +33,27 @@ TEST_CASE("global section is parsed") {
     CHECK(r.config.demangle_names == false);
 }
 
+TEST_CASE("unsigned TOML integers reject negative and overflowing values") {
+    const auto r = loadFromString(R"(
+    [global]
+    seed = -1
+    [passes.split_blocks]
+    splits = -3
+    [passes.external_opaque_predicates]
+    enabled = true
+    probability = -25
+    max_blocks = -5
+    decoy_stores = 4294967296
+  )");
+    REQUIRE(r.ok);
+    CHECK(r.config.seed == 0u);
+    CHECK_FALSE(r.config.passes.split.splits.has_value());
+    CHECK(r.config.passes.external_op.enabled == true);
+    CHECK_FALSE(r.config.passes.external_op.probability.has_value());
+    CHECK_FALSE(r.config.passes.external_op.max_blocks.has_value());
+    CHECK_FALSE(r.config.passes.external_op.decoy_stores.has_value());
+}
+
 TEST_CASE("decoy_strings toggle is parsed") {
     const auto r = loadFromString(R"(
     [passes.decoy_strings]

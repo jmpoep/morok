@@ -4120,6 +4120,78 @@ merge:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("externalOpaquePredicatesFunction bounds oversized decoy parameters") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("extop-bounds", ctx);
+    Function *F = makeBranchChainFunction(
+        *M, morok::passes::kExternalOpaqueMaxBlocks + 8, "extop_bounds");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(100);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::externalOpaquePredicatesFunction(
+        *F,
+        {/*probability=*/100,
+         /*max_blocks=*/morok::passes::kExternalOpaqueMaxBlocks + 8,
+         /*decoy_stores=*/1000},
+        rng));
+
+    unsigned decoyBlocks = 0;
+    unsigned volatileStores = 0;
+    for (BasicBlock &BB : *F) {
+        const bool isDecoy = BB.getName().starts_with("morok.extop.decoy");
+        decoyBlocks += isDecoy;
+        if (!isDecoy)
+            continue;
+        for (Instruction &I : BB)
+            if (auto *SI = dyn_cast<StoreInst>(&I))
+                volatileStores += SI->isVolatile();
+    }
+
+    CHECK(decoyBlocks <= morok::passes::kExternalOpaqueMaxBlocks);
+    CHECK(volatileStores <=
+          decoyBlocks * morok::passes::kExternalOpaqueMaxDecoyStores);
+    CHECK(volatileStores >= decoyBlocks);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("MorokPass clamps external opaque oversized config knobs") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("extop-scheduler-bounds", ctx);
+    Function *F = makeBranchChainFunction(
+        *M, morok::passes::kExternalOpaqueMaxBlocks + 8,
+        "extop_scheduler_bounds");
+    REQUIRE(F);
+
+    morok::config::Config cfg;
+    cfg.seed = 101;
+    cfg.passes.external_op.enabled = true;
+    cfg.passes.external_op.probability = 100;
+    cfg.passes.external_op.max_blocks = 1000;
+    cfg.passes.external_op.decoy_stores = 1000;
+
+    ModuleAnalysisManager AM;
+    morok::pipeline::MorokPass(std::move(cfg)).run(*M, AM);
+
+    unsigned decoyBlocks = 0;
+    unsigned volatileStores = 0;
+    for (BasicBlock &BB : *F) {
+        const bool isDecoy = BB.getName().starts_with("morok.extop.decoy");
+        decoyBlocks += isDecoy;
+        if (!isDecoy)
+            continue;
+        for (Instruction &I : BB)
+            if (auto *SI = dyn_cast<StoreInst>(&I))
+                volatileStores += SI->isVolatile();
+    }
+
+    CHECK(decoyBlocks <= morok::passes::kExternalOpaqueMaxBlocks);
+    CHECK(volatileStores <=
+          decoyBlocks * morok::passes::kExternalOpaqueMaxDecoyStores);
+    CHECK(volatileStores >= decoyBlocks);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("externalOpaquePredicatesFunction honors zero probability") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
