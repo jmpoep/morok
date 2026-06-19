@@ -208,6 +208,11 @@ AllocaInst *entryAlloca(IRBuilderBase &B, Type *Ty, const Twine &Name) {
     return B.CreateAlloca(Ty, nullptr, Name);
 }
 
+bool isUsableCloakSeed(const GlobalVariable &GV) {
+    return GV.getValueType()->isIntegerTy(64) && GV.hasInitializer() &&
+           isa<ConstantInt>(GV.getInitializer());
+}
+
 } // namespace
 
 std::uint64_t keystreamValue(unsigned variant, std::uint64_t k0,
@@ -355,12 +360,15 @@ GlobalVariable *cloakSeed(Module &M, IRRandom &rng) {
         // non-ConstantInt initializer) must not be reused: emitCloakedSymbol
         // reads its initializer and the runtime loads it as i64, so reusing it
         // would crash/UB the compiler on untrusted IR or a future name clash.
-        if (Existing->getValueType()->isIntegerTy(64) &&
-            Existing->hasInitializer() &&
-            isa<ConstantInt>(Existing->getInitializer()))
+        if (isUsableCloakSeed(*Existing))
             return Existing;
-        // Fall through and create our own; GlobalVariable auto-renames on the
-        // name collision, and each cloak site then gets a self-consistent seed.
+        // A malformed canonical squatter must remain untouched: it may be an
+        // external/user symbol.  Reuse the first generated fallback from an
+        // earlier call so every cloak site still shares one module seed.
+        for (GlobalVariable &GV : M.globals())
+            if (GV.getName().starts_with("morok.cloak.seed.") &&
+                isUsableCloakSeed(GV))
+                return &GV;
     }
     auto *I64 = Type::getInt64Ty(M.getContext());
     auto *GV = new GlobalVariable(

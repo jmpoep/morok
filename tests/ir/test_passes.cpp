@@ -12026,7 +12026,7 @@ entry:
 // loaded it as i64.  A foreign/user-defined seed (external decl, wrong type, or
 // non-ConstantInt initializer) would crash/UB the compiler.  cloakSeed must
 // only reuse a valid i64 ConstantInt-initialized global and otherwise create a
-// fresh one.
+// stable generated fallback shared by every later call site.
 TEST_CASE("cloakSeed rejects a malformed pre-existing seed global") {
     auto check = [](const char *ir) {
         LLVMContext ctx;
@@ -12037,11 +12037,14 @@ TEST_CASE("cloakSeed rejects a malformed pre-existing seed global") {
 
         GlobalVariable *Seed = morok::ir::cloakSeed(*M, rng);
         REQUIRE(Seed);
+        GlobalVariable *Second = morok::ir::cloakSeed(*M, rng);
+        CHECK(Second == Seed);
         // The seed cloakSeed hands back must be a usable i64 ConstantInt global,
         // never the malformed squatter.
         CHECK(Seed->getValueType()->isIntegerTy(64));
         REQUIRE(Seed->hasInitializer());
         CHECK(isa<ConstantInt>(Seed->getInitializer()));
+        CHECK(Seed->getName().starts_with("morok.cloak.seed"));
 
         // End-to-end: emitting a cloaked symbol must not abort and must verify.
         auto *FT = FunctionType::get(Type::getVoidTy(ctx), false);
@@ -12217,6 +12220,45 @@ define i32 @caller() {
     Function *Caller = M->getFunction("caller");
     REQUIRE(Caller);
     CHECK(hasInlineAsmCall(*Caller));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("functionCallObfuscateModule reuses malformed-seed fallback") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@morok.cloak.seed = external global i64
+@.s = private constant [3 x i8] c"hi\00"
+declare i32 @puts(ptr)
+
+define i32 @caller() {
+entry:
+  %r = call i32 @puts(ptr @.s)
+  ret i32 %r
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(3702);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::functionCallObfuscateModule(*M, {/*prob=*/100}, rng));
+
+    SmallPtrSet<Value *, 4> SeedOperands;
+    for (Function &F : *M)
+        if (!F.isDeclaration())
+            for (Instruction &I : instructions(F))
+                if (auto *LI = dyn_cast<LoadInst>(&I))
+                    if (LI->getName().starts_with("morok.fco.ptr.seed"))
+                        SeedOperands.insert(
+                            LI->getPointerOperand()->stripPointerCasts());
+
+    CHECK(SeedOperands.size() == 1u);
+    REQUIRE_FALSE(SeedOperands.empty());
+    auto *Seed = dyn_cast<GlobalVariable>(*SeedOperands.begin());
+    REQUIRE(Seed);
+    CHECK(Seed != M->getGlobalVariable("morok.cloak.seed", true));
+    CHECK(Seed->getName().starts_with("morok.cloak.seed."));
+    CHECK(Seed->getValueType()->isIntegerTy(64));
+    REQUIRE(Seed->hasInitializer());
+    CHECK(isa<ConstantInt>(Seed->getInitializer()));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
