@@ -9671,9 +9671,12 @@ Function *windowsSyscallStubScanner(Module &M) {
         B.CreateAlloca(i32, nullptr, "morok.win.sys.gadget.slot");
     AllocaInst *foundSlot =
         B.CreateAlloca(i8, nullptr, "morok.win.sys.found.slot");
+    AllocaInst *gadgetFoundSlot =
+        B.CreateAlloca(i8, nullptr, "morok.win.sys.gadget.found.slot");
     B.CreateStore(ConstantInt::get(i32, 0), ssnSlot)->setVolatile(true);
     B.CreateStore(ConstantInt::get(i32, 0), gadgetSlot)->setVolatile(true);
     B.CreateStore(ConstantInt::get(i8, 0), foundSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i8, 0), gadgetFoundSlot)->setVolatile(true);
     B.CreateCondBr(B.CreateICmpNE(stub, ConstantPointerNull::get(ptr),
                                   "morok.win.sys.scan.stub.present"),
                    loopBB, retBB);
@@ -9681,8 +9684,10 @@ Function *windowsSyscallStubScanner(Module &M) {
     IRBuilder<> LB(loopBB);
     auto *idx = LB.CreatePHI(i32, 2, "morok.win.sys.scan.idx");
     idx->addIncoming(ConstantInt::get(i32, 0), entry);
-    LB.CreateCondBr(LB.CreateICmpULT(idx, ConstantInt::get(i32, 96)), bodyBB,
-                    neighborGateBB);
+    LB.CreateCondBr(
+        LB.CreateICmpULT(idx, ConstantInt::get(i32, 30),
+                         "morok.win.sys.scan.current.limit"),
+        bodyBB, neighborGateBB);
 
     IRBuilder<> SB(bodyBB);
     Value *idxIp = SB.CreateZExt(idx, ip, "morok.win.sys.scan.idx.ip");
@@ -9693,42 +9698,69 @@ Function *windowsSyscallStubScanner(Module &M) {
     Value *b2 = loadAt(SB, M, i8, stub,
                        SB.CreateAdd(idxIp, ConstantInt::get(ip, 2)),
                        "morok.win.sys.scan.b2");
-    Value *movEax =
-        SB.CreateICmpEQ(b0, ConstantInt::get(i8, 0xB8),
-                        "morok.win.sys.scan.mov.eax");
+    Value *p0 = loadAt(SB, M, i8, stub, 0ULL, "morok.win.sys.scan.p0");
+    Value *p1 = loadAt(SB, M, i8, stub, 1, "morok.win.sys.scan.p1");
+    Value *p2 = loadAt(SB, M, i8, stub, 2, "morok.win.sys.scan.p2");
+    Value *prologue = SB.CreateAnd(
+        SB.CreateAnd(SB.CreateICmpEQ(p0, ConstantInt::get(i8, 0x4C)),
+                     SB.CreateICmpEQ(p1, ConstantInt::get(i8, 0x8B))),
+        SB.CreateAnd(SB.CreateICmpEQ(p2, ConstantInt::get(i8, 0xD1)),
+                     SB.CreateICmpEQ(b0, ConstantInt::get(i8, 0xB8))),
+        "morok.win.sys.scan.prologue");
+    Value *movEax = SB.CreateAnd(
+        SB.CreateICmpEQ(idx, ConstantInt::get(i32, 3),
+                        "morok.win.sys.scan.mov.offset"),
+        prologue, "morok.win.sys.scan.mov.eax");
     Value *syscallRet = SB.CreateAnd(
         SB.CreateAnd(SB.CreateICmpEQ(b0, ConstantInt::get(i8, 0x0F)),
                      SB.CreateICmpEQ(b1, ConstantInt::get(i8, 0x05))),
         SB.CreateICmpEQ(b2, ConstantInt::get(i8, 0xC3)),
         "morok.win.sys.scan.syscall.ret");
-    Value *ssn = loadAt(SB, M, i32, stub,
-                        SB.CreateAdd(idxIp, ConstantInt::get(ip, 1)),
+    Value *oldFound =
+        SB.CreateLoad(i8, foundSlot, "morok.win.sys.scan.found.old");
+    cast<LoadInst>(oldFound)->setVolatile(true);
+    Value *ssnAccept = SB.CreateAnd(
+        movEax, SB.CreateICmpEQ(oldFound, ConstantInt::get(i8, 0)),
+        "morok.win.sys.scan.ssn.accept");
+    Value *ssn = loadAt(SB, M, i32, stub, 4ULL,
                         "morok.win.sys.scan.ssn");
     Value *oldSsn =
         SB.CreateLoad(i32, ssnSlot, "morok.win.sys.scan.ssn.old");
     cast<LoadInst>(oldSsn)->setVolatile(true);
     auto *ssnStore = SB.CreateStore(
-        SB.CreateSelect(movEax, ssn, oldSsn,
+        SB.CreateSelect(ssnAccept, ssn, oldSsn,
                         "morok.win.sys.scan.ssn.sel"),
         ssnSlot);
     ssnStore->setVolatile(true);
+    Value *newFound = SB.CreateSelect(ssnAccept, ConstantInt::get(i8, 1),
+                                      oldFound,
+                                      "morok.win.sys.scan.found.sel");
+    auto *foundStore = SB.CreateStore(newFound, foundSlot);
+    foundStore->setVolatile(true);
+    Value *oldGadgetFound = SB.CreateLoad(
+        i8, gadgetFoundSlot, "morok.win.sys.scan.gadget.found.old");
+    cast<LoadInst>(oldGadgetFound)->setVolatile(true);
+    Value *gadgetAccept = SB.CreateAnd(
+        syscallRet, SB.CreateICmpEQ(oldGadgetFound, ConstantInt::get(i8, 0)),
+        "morok.win.sys.scan.gadget.accept");
     Value *oldGadget =
         SB.CreateLoad(i32, gadgetSlot, "morok.win.sys.scan.gadget.old");
     cast<LoadInst>(oldGadget)->setVolatile(true);
     auto *gadgetStore = SB.CreateStore(
-        SB.CreateSelect(syscallRet, idx, oldGadget,
+        SB.CreateSelect(gadgetAccept, idx, oldGadget,
                         "morok.win.sys.scan.gadget.sel"),
         gadgetSlot);
     gadgetStore->setVolatile(true);
-    Value *oldFound =
-        SB.CreateLoad(i8, foundSlot, "morok.win.sys.scan.found.old");
-    cast<LoadInst>(oldFound)->setVolatile(true);
-    auto *foundStore = SB.CreateStore(
-        SB.CreateSelect(movEax, ConstantInt::get(i8, 1), oldFound,
-                        "morok.win.sys.scan.found.sel"),
-        foundSlot);
-    foundStore->setVolatile(true);
-    SB.CreateBr(nextBB);
+    Value *newGadgetFound =
+        SB.CreateSelect(gadgetAccept, ConstantInt::get(i8, 1),
+                        oldGadgetFound,
+                        "morok.win.sys.scan.gadget.found.sel");
+    SB.CreateStore(newGadgetFound, gadgetFoundSlot)->setVolatile(true);
+    Value *complete = SB.CreateAnd(
+        SB.CreateICmpNE(newFound, ConstantInt::get(i8, 0)),
+        SB.CreateICmpNE(newGadgetFound, ConstantInt::get(i8, 0)),
+        "morok.win.sys.scan.complete");
+    SB.CreateCondBr(complete, retBB, nextBB);
 
     IRBuilder<> NB(nextBB);
     Value *nextIdx =

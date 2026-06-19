@@ -12973,10 +12973,40 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.mov.eax") >= 1u);
     CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.syscall.ret") >=
           1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.current.limit") >=
+          1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.prologue") >= 1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.ssn.accept") >=
+          1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.gadget.accept") >=
+          1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.complete") >= 1u);
     CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.halo") >= 1u);
     CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.tartarus") >= 1u);
     CHECK(countNamedInstructions(*Scan,
                                  "morok.win.sys.scan.neighbor.gadget") >= 1u);
+    bool scanBoundedToCurrentStub = false;
+    BasicBlock *scanBody = nullptr;
+    for (BasicBlock &BB : *Scan) {
+        if (BB.getName() == "body")
+            scanBody = &BB;
+        for (Instruction &I : BB) {
+            if (I.getName() != "morok.win.sys.scan.current.limit")
+                continue;
+            auto *Cmp = dyn_cast<ICmpInst>(&I);
+            REQUIRE(Cmp != nullptr);
+            auto *Limit = dyn_cast<ConstantInt>(Cmp->getOperand(1));
+            REQUIRE(Limit != nullptr);
+            scanBoundedToCurrentStub = Limit->getZExtValue() == 30;
+        }
+    }
+    CHECK(scanBoundedToCurrentStub);
+    REQUIRE(scanBody != nullptr);
+    auto *scanBodyBr = dyn_cast<BranchInst>(scanBody->getTerminator());
+    REQUIRE(scanBodyBr != nullptr);
+    CHECK(scanBodyBr->isConditional());
+    CHECK((scanBodyBr->getSuccessor(0)->getName() == "ret" ||
+           scanBodyBr->getSuccessor(1)->getName() == "ret"));
     CHECK(countNamedInstructions(*Veh, "morok.win.veh.code") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
