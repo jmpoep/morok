@@ -71,6 +71,11 @@ struct GuardEntry {
     std::uint64_t cookie = 0;
 };
 
+struct VPtrStoreUpdates {
+    std::vector<StoreInst *> arm;
+    std::vector<StoreInst *> disarm;
+};
+
 bool isVTableGlobal(const GlobalVariable &GV) {
     return GV.hasInitializer() && GV.getName().starts_with("_ZTV");
 }
@@ -149,10 +154,58 @@ bool getVTableAddressPoint(Constant *C, const DataLayout &DL,
     return true;
 }
 
+bool getGlobalAddressPoint(Constant *C, const DataLayout &DL,
+                           GlobalVariable *&GV, std::uint64_t &Offset) {
+    GV = nullptr;
+    Offset = 0;
+    if (!C)
+        return false;
+
+    if (auto *GEP = dyn_cast<GEPOperator>(C)) {
+        Value *Base = GEP->getPointerOperand();
+        GV = baseGlobal(Base);
+        if (!GV)
+            return false;
+        const unsigned AS = Base->getType()->getPointerAddressSpace();
+        APInt RawOffset(DL.getIndexSizeInBits(AS), 0, true);
+        if (!GEP->accumulateConstantOffset(DL, RawOffset))
+            return false;
+        if (RawOffset.isNegative())
+            return false;
+        Offset = RawOffset.getZExtValue();
+        return true;
+    }
+
+    GV = baseGlobal(C);
+    return GV != nullptr;
+}
+
+bool isVTableLikeAddressPoint(Constant *C, const DataLayout &DL) {
+    GlobalVariable *GV = nullptr;
+    std::uint64_t Offset = 0;
+    if (!getGlobalAddressPoint(C, DL, GV, Offset) || !GV->hasInitializer())
+        return false;
+
+    const std::uint64_t PtrSize = DL.getPointerSize(GV->getAddressSpace());
+    if (PtrSize == 0 || Offset < 2 * PtrSize)
+        return false;
+
+    std::map<std::uint64_t, Constant *> Entries;
+    collectPointerEntries(GV->getInitializer(), DL, 0, Entries);
+    auto Cur = Entries.find(Offset);
+    auto Prev = Entries.find(Offset - PtrSize);
+    auto PrevPrev = Entries.find(Offset - 2 * PtrSize);
+    if (Cur == Entries.end() || Prev == Entries.end() ||
+        PrevPrev == Entries.end())
+        return false;
+    return isFunctionPointerConstant(Cur->second) &&
+           !isFunctionPointerConstant(Prev->second);
+}
+
 void collectStoredAddressPoints(
     Module &M, const DataLayout &DL,
     std::map<GlobalVariable *, std::set<std::uint64_t>> &AddressPoints,
-    std::vector<StoreInst *> *VPtrStores = nullptr) {
+    VPtrStoreUpdates *VPtrStores = nullptr) {
     for (Function &F : M) {
         if (F.isDeclaration() || F.getName().starts_with("morok."))
             continue;
@@ -161,15 +214,22 @@ void collectStoredAddressPoints(
                 auto *SI = dyn_cast<StoreInst>(&I);
                 if (!SI)
                     continue;
-                auto *C = dyn_cast<Constant>(SI->getValueOperand());
-                if (!C)
+                Value *Stored = SI->getValueOperand();
+                if (!Stored->getType()->isPointerTy())
                     continue;
                 GlobalVariable *GV = nullptr;
                 std::uint64_t Offset = 0;
-                if (getVTableAddressPoint(C, DL, GV, Offset)) {
+                auto *StoredConst = dyn_cast<Constant>(Stored);
+                if (StoredConst &&
+                    getVTableAddressPoint(StoredConst, DL, GV, Offset)) {
                     AddressPoints[GV].insert(Offset);
                     if (VPtrStores)
-                        VPtrStores->push_back(SI);
+                        VPtrStores->arm.push_back(SI);
+                } else if (VPtrStores) {
+                    if (StoredConst &&
+                        isVTableLikeAddressPoint(StoredConst, DL))
+                        continue;
+                    VPtrStores->disarm.push_back(SI);
                 }
             }
     }
@@ -196,7 +256,7 @@ void collectConventionalAddressPoints(
 
 std::vector<VTableInfo> collectVTables(Module &M, const DataLayout &DL,
                                        std::uint64_t PtrSize,
-                                       std::vector<StoreInst *> *VPtrStores) {
+                                       VPtrStoreUpdates *VPtrStores) {
     std::map<GlobalVariable *, std::set<std::uint64_t>> AddressPoints;
     collectStoredAddressPoints(M, DL, AddressPoints, VPtrStores);
 
@@ -397,7 +457,8 @@ Function *createSlotRemember(Module &M, GlobalVariable *SlotTable) {
     LLVMContext &Ctx = M.getContext();
     auto *VoidTy = Type::getVoidTy(Ctx);
     auto *PtrTy = PointerType::getUnqual(Ctx);
-    auto *FnTy = FunctionType::get(VoidTy, {PtrTy}, false);
+    auto *I1Ty = Type::getInt1Ty(Ctx);
+    auto *FnTy = FunctionType::get(VoidTy, {PtrTy, I1Ty}, false);
     auto *Fn = Function::Create(FnTy, GlobalValue::InternalLinkage,
                                 "morok.vti.remember", M);
     Fn->setDSOLocal(true);
@@ -406,31 +467,63 @@ Function *createSlotRemember(Module &M, GlobalVariable *SlotTable) {
 
     Value *SlotPtr = &*Fn->arg_begin();
     SlotPtr->setName("slot.addr");
+    Value *Arm = Fn->getArg(1);
+    Arm->setName("arm");
 
     BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", Fn);
+    BasicBlock *ArmBB = BasicBlock::Create(Ctx, "morok.vti.track.arm", Fn);
+    BasicBlock *ClearCheckBB =
+        BasicBlock::Create(Ctx, "morok.vti.track.clear.check", Fn);
+    BasicBlock *ClearBB = BasicBlock::Create(Ctx, "morok.vti.track.clear", Fn);
+    BasicBlock *DoneBB = BasicBlock::Create(Ctx, "morok.vti.track.done", Fn);
+
     IRBuilder<> B(EntryBB);
     auto *TableTy = cast<ArrayType>(SlotTable->getValueType());
     Value *Index = trackedSlotIndex(B, SlotPtr, "morok.vti.track");
     Value *Slot = B.CreateInBoundsGEP(
         TableTy, SlotTable, {ConstantInt::get(B.getInt64Ty(), 0), Index},
         "morok.vti.track.slot");
+    B.CreateCondBr(Arm, ArmBB, ClearCheckBB);
+
+    B.SetInsertPoint(ArmBB);
     auto *Store = B.CreateStore(SlotPtr, Slot);
     Store->setAtomic(AtomicOrdering::Release);
     Store->setAlignment(pointerAlign(M));
+    B.CreateBr(DoneBB);
+
+    B.SetInsertPoint(ClearCheckBB);
+    auto *Tracked = B.CreateLoad(PtrTy, Slot, "morok.vti.track.old");
+    Tracked->setAtomic(AtomicOrdering::Acquire);
+    Tracked->setAlignment(pointerAlign(M));
+    B.CreateCondBr(B.CreateICmpEQ(Tracked, SlotPtr,
+                                  "morok.vti.track.clear.same"),
+                   ClearBB, DoneBB);
+
+    B.SetInsertPoint(ClearBB);
+    auto *Clear = B.CreateStore(ConstantPointerNull::get(PtrTy), Slot);
+    Clear->setAtomic(AtomicOrdering::Release);
+    Clear->setAlignment(pointerAlign(M));
+    B.CreateBr(DoneBB);
+
+    B.SetInsertPoint(DoneBB);
     B.CreateRetVoid();
     return Fn;
 }
 
-bool instrumentVPtrStores(ArrayRef<StoreInst *> Stores, Function *Remember) {
+bool instrumentVPtrStores(const VPtrStoreUpdates &Stores, Function *Remember) {
     bool Changed = false;
-    for (StoreInst *SI : Stores) {
-        if (!SI || !SI->getParent())
-            continue;
-        IRBuilder<> B(SI->getNextNode());
-        B.CreateCall(Remember->getFunctionType(), Remember,
-                     {SI->getPointerOperand()});
-        Changed = true;
-    }
+    auto Emit = [&](ArrayRef<StoreInst *> Work, bool Arm) {
+        for (StoreInst *SI : Work) {
+            if (!SI || !SI->getParent())
+                continue;
+            IRBuilder<> B(SI->getNextNode());
+            B.CreateCall(Remember->getFunctionType(), Remember,
+                         {SI->getPointerOperand(), B.getInt1(Arm)});
+            Changed = true;
+        }
+    };
+    Emit(Stores.arm, true);
+    Emit(Stores.disarm, false);
     return Changed;
 }
 
@@ -617,7 +710,7 @@ bool vtableIntegrityModule(Module &M) {
     if (PtrSize == 0)
         return false;
 
-    std::vector<StoreInst *> VPtrStores;
+    VPtrStoreUpdates VPtrStores;
     std::vector<VTableInfo> VTables =
         collectVTables(M, DL, PtrSize, &VPtrStores);
     if (VTables.empty())
@@ -670,7 +763,7 @@ bool vtableIntegrityModule(Module &M) {
     Function *Verifier = createVerifier(M, Entries, TrackedSlots);
     auto *I64 = Type::getInt64Ty(M.getContext());
     bool Changed = false;
-    if (!VPtrStores.empty()) {
+    if (!VPtrStores.arm.empty()) {
         Function *Remember = createSlotRemember(M, TrackedSlots);
         Changed = instrumentVPtrStores(VPtrStores, Remember);
     }

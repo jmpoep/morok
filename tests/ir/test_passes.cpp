@@ -12466,6 +12466,91 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+// Regression for #48's storage-reuse angle: once a slot has been armed by a
+// real vtable store, a later non-vtable pointer store to that same storage must
+// disarm it.  Otherwise placement-new, arena, heap, or stack reuse can make a
+// legitimate ops-table dispatch trip the unknown-vptr path solely because the
+// raw slot address was remembered from a previous object lifetime.
+TEST_CASE("vtableIntegrityModule disarms reused vptr storage") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target datalayout = "e-p:64:64"
+@_ZTV4Base = linkonce_odr unnamed_addr constant { [4 x ptr] } { [4 x ptr] [ptr null, ptr null, ptr @virt0, ptr @virt1] }
+@ops = private constant [2 x ptr] [ptr @op0, ptr @op1]
+@fake = private constant [4 x ptr] [ptr null, ptr null, ptr @op0, ptr @op1]
+
+define i32 @virt0(ptr %this) {
+entry:
+  ret i32 7
+}
+
+define i32 @virt1(ptr %this) {
+entry:
+  ret i32 11
+}
+
+define i32 @op0(ptr %ctx) {
+entry:
+  ret i32 13
+}
+
+define i32 @op1(ptr %ctx) {
+entry:
+  ret i32 17
+}
+
+define void @reuse_slot(ptr %slot) {
+entry:
+  store ptr getelementptr inbounds ({ [4 x ptr] }, ptr @_ZTV4Base, i64 0, i32 0, i64 2), ptr %slot
+  store ptr @ops, ptr %slot
+  ret void
+}
+
+define void @tamper_slot(ptr %slot) {
+entry:
+  store ptr getelementptr inbounds ({ [4 x ptr] }, ptr @_ZTV4Base, i64 0, i32 0, i64 2), ptr %slot
+  store ptr getelementptr inbounds ([4 x ptr], ptr @fake, i64 0, i64 2), ptr %slot
+  ret void
+}
+
+define i32 @dispatch_reused(ptr %slot) {
+entry:
+  %vptr = load ptr, ptr %slot
+  %slotp = getelementptr ptr, ptr %vptr, i64 1
+  %fn = load ptr, ptr %slotp
+  %r = call i32 %fn(ptr %slot)
+  ret i32 %r
+}
+)ir");
+
+    CHECK(morok::passes::vtableIntegrityModule(*M));
+    Function *Remember = M->getFunction("morok.vti.remember");
+    REQUIRE(Remember);
+    Function *Verify = M->getFunction("morok.vti.verify");
+    REQUIRE(Verify);
+
+    unsigned armCalls = 0;
+    unsigned disarmCalls = 0;
+    for (User *U : Remember->users()) {
+        auto *CI = dyn_cast<CallInst>(U);
+        if (!CI)
+            continue;
+        auto *Arm = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+        REQUIRE(Arm);
+        if (Arm->isOne())
+            ++armCalls;
+        else
+            ++disarmCalls;
+    }
+
+    CHECK(armCalls == 2u);
+    CHECK(disarmCalls == 1u);
+    CHECK(countNamedInstructions(*Remember, "morok.vti.track.clear.same") >=
+          1u);
+    CHECK(countNamedInstructions(*Verify, "morok.vti.unknown.armed") >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("vtableIntegrityModule ignores non-vptr indirect calls") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
