@@ -95,6 +95,10 @@ TEST_CASE("low preset matches the documented table") {
     CHECK(c.trace_keying.enabled == false);
     CHECK(c.dispatcherless.enabled == false);
     CHECK(c.microcode_stress.enabled == false);
+    CHECK(c.caller_keyed_dispatch.enabled == false);
+    CHECK(c.caller_keyed_dispatch.probability == 100u);
+    CHECK(c.caller_keyed_dispatch.max_calls == 4096u);
+    CHECK(c.caller_keyed_dispatch.region_bytes == 16u);
     CHECK(c.vec.enabled == false);
     CHECK(c.csm.enabled == false);
     CHECK(c.flatten.enabled == false);
@@ -192,6 +196,10 @@ TEST_CASE("mid preset matches the documented table") {
     CHECK(c.dispatcherless.max_routes == 8u);
     CHECK(c.dispatcherless.max_terms == 3u);
     CHECK(c.microcode_stress.enabled == false);
+    CHECK(c.caller_keyed_dispatch.enabled == false);
+    CHECK(c.caller_keyed_dispatch.probability == 100u);
+    CHECK(c.caller_keyed_dispatch.max_calls == 4096u);
+    CHECK(c.caller_keyed_dispatch.region_bytes == 16u);
     CHECK(c.vec.width == 128u);
     CHECK(c.vec.shuffle == false);
     CHECK(c.vec.lift_comparisons == true);
@@ -340,9 +348,9 @@ TEST_CASE("high preset matches the documented table") {
     CHECK(c.microcode_stress.decoy_blocks == 4u);
     CHECK(c.microcode_stress.alias_stores == 1u);
     CHECK(c.caller_keyed_dispatch.enabled == false);
-    CHECK(c.caller_keyed_dispatch.probability == 0u);
-    CHECK(c.caller_keyed_dispatch.max_calls == 0u);
-    CHECK(c.caller_keyed_dispatch.region_bytes == 0u);
+    CHECK(c.caller_keyed_dispatch.probability == 100u);
+    CHECK(c.caller_keyed_dispatch.max_calls == 4096u);
+    CHECK(c.caller_keyed_dispatch.region_bytes == 16u);
     CHECK(c.vec.width == 256u);
     CHECK(c.vec.shuffle == true);
     CHECK(c.vec.lift_comparisons == true);
@@ -442,9 +450,9 @@ TEST_CASE("max preset enables every pass at full intensity") {
     CHECK(c.func_wrap.times == 2u);
     CHECK(c.nanomites.probability == 100u);
     CHECK(c.nanomites.max_sites == 16u);
-    CHECK(c.caller_keyed_dispatch.probability == 0u);
-    CHECK(c.caller_keyed_dispatch.max_calls == 0u);
-    CHECK(c.caller_keyed_dispatch.region_bytes == 0u);
+    CHECK(c.caller_keyed_dispatch.probability == 100u);
+    CHECK(c.caller_keyed_dispatch.max_calls == 4096u);
+    CHECK(c.caller_keyed_dispatch.region_bytes == 16u);
 
     // Max is strictly at least as strong as high on shared scalar knobs.
     const PassConfig h = presetConfig(Preset::High);

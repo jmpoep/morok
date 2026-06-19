@@ -114,6 +114,32 @@ TEST_CASE("a tuning section does not disable a preset-enabled pass") {
     CHECK(r.config.passes.bcf.iterations == base.bcf.iterations);
 }
 
+TEST_CASE("caller keyed dispatch opt-in inherits usable preset knobs") {
+    const auto high = loadFromString(R"(
+    [global]
+    preset = "high"
+    [passes.caller_keyed_dispatch]
+    enabled = true
+  )");
+    REQUIRE(high.ok);
+    CHECK(high.config.passes.caller_keyed_dispatch.enabled == true);
+    CHECK(high.config.passes.caller_keyed_dispatch.probability == 100u);
+    CHECK(high.config.passes.caller_keyed_dispatch.max_calls == 4096u);
+    CHECK(high.config.passes.caller_keyed_dispatch.region_bytes == 16u);
+
+    const auto max = loadFromString(R"(
+    [global]
+    preset = "max"
+    [passes.caller_keyed_dispatch]
+    enabled = true
+  )");
+    REQUIRE(max.ok);
+    CHECK(max.config.passes.caller_keyed_dispatch.enabled == true);
+    CHECK(max.config.passes.caller_keyed_dispatch.probability == 100u);
+    CHECK(max.config.passes.caller_keyed_dispatch.max_calls == 4096u);
+    CHECK(max.config.passes.caller_keyed_dispatch.region_bytes == 16u);
+}
+
 TEST_CASE("preset is the base and [passes.*] overrides it") {
     const auto r = loadFromString(R"(
     [global]

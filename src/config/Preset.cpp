@@ -236,9 +236,9 @@ PassConfig makeLow() {
     c.microcode_stress.alias_stores = 0;
 
     c.caller_keyed_dispatch.enabled = false;
-    c.caller_keyed_dispatch.probability = 0;
-    c.caller_keyed_dispatch.max_calls = 0;
-    c.caller_keyed_dispatch.region_bytes = 0;
+    c.caller_keyed_dispatch.probability = 100;
+    c.caller_keyed_dispatch.max_calls = 4096;
+    c.caller_keyed_dispatch.region_bytes = 16;
 
     c.vec.enabled = false;
     c.csm.enabled = false;
@@ -449,9 +449,9 @@ PassConfig makeMid() {
     c.microcode_stress.alias_stores = 0;
 
     c.caller_keyed_dispatch.enabled = false;
-    c.caller_keyed_dispatch.probability = 0;
-    c.caller_keyed_dispatch.max_calls = 0;
-    c.caller_keyed_dispatch.region_bytes = 0;
+    c.caller_keyed_dispatch.probability = 100;
+    c.caller_keyed_dispatch.max_calls = 4096;
+    c.caller_keyed_dispatch.region_bytes = 16;
 
     c.vec.enabled = true;
     c.vec.probability = 40;
@@ -670,11 +670,12 @@ PassConfig makeHigh() {
     // CKD hashes live call-site bytes and is useful as an opt-in
     // anti-live-patch/debugger primitive, but without a post-link expected hash
     // it self-seals pre-start static patches.  Keep it out of presets that imply
-    // final-binary static tamper resistance until the sealer is wired.
+    // final-binary static tamper resistance until the sealer is wired, but keep
+    // the normal tuning so sparse TOML opt-in does not inherit zeroed knobs.
     c.caller_keyed_dispatch.enabled = false;
-    c.caller_keyed_dispatch.probability = 0;
-    c.caller_keyed_dispatch.max_calls = 0;
-    c.caller_keyed_dispatch.region_bytes = 0;
+    c.caller_keyed_dispatch.probability = 100;
+    c.caller_keyed_dispatch.max_calls = 4096;
+    c.caller_keyed_dispatch.region_bytes = 16;
 
     c.vec.enabled = true;
     c.vec.probability = 75;
@@ -911,9 +912,9 @@ PassConfig makeMax() {
     // See makeHigh(): CKD remains manual opt-in until it has a post-link
     // immutable expected hash.
     c.caller_keyed_dispatch.enabled = false;
-    c.caller_keyed_dispatch.probability = 0;
-    c.caller_keyed_dispatch.max_calls = 0;
-    c.caller_keyed_dispatch.region_bytes = 0;
+    c.caller_keyed_dispatch.probability = 100;
+    c.caller_keyed_dispatch.max_calls = 4096;
+    c.caller_keyed_dispatch.region_bytes = 16;
 
     c.vec.enabled = true;
     c.vec.probability = 100;
