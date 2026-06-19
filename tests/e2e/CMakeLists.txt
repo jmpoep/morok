@@ -67,6 +67,13 @@ add_test(NAME "e2e/static_config_layering"
           "${CMAKE_SOURCE_DIR}/cross_build.sh")
 set_tests_properties("e2e/static_config_layering" PROPERTIES LABELS "e2e")
 
+# Build-tooling regression (issue #41): the helper must default to Morok's
+# entropy-seeded mode (per-build polymorphism), not a fixed seed.
+add_test(NAME "e2e/cross_build_seed"
+  COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/cross_build_seed.sh"
+          "${CMAKE_SOURCE_DIR}/cross_build.sh")
+set_tests_properties("e2e/cross_build_seed" PROPERTIES LABELS "e2e")
+
 foreach(preset low mid high)
   add_test(NAME "e2e/differential_${preset}"
     COMMAND bash "${_driver}"

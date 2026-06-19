@@ -19,7 +19,12 @@ CLANGXX="${CLANGXX:-clang++}"
 PLUGIN="${PLUGIN:-$BUILD_DIR/src/pipeline/libMorok.dylib}"
 PRESET="${PRESET:-max}"
 CONFIG=""
-SEED="${SEED:-832040}"
+# Default to Morok's entropy-seeded mode (seed 0): each build draws a fresh PRNG
+# stream, so layout decisions, salts, and generated runtime material differ per
+# build (per-build polymorphism).  A fixed nonzero default would make every
+# rebuild byte-comparable and fingerprintable.  Pass --seed N (or SEED=N) for an
+# intentionally reproducible build.
+SEED="${SEED:-0}"
 OPT_LEVEL="${OPT_LEVEL:--O3}"
 
 # Post-link self-check sealing.  The self_checksum/DFI passes emit a runtime
@@ -54,7 +59,7 @@ Options:
   --out-dir DIR          Output directory (default: build/cross)
   --preset NAME          Morok preset when --config is not used (default: max)
   --config PATH          Morok TOML config instead of a preset
-  --seed N               Morok seed (default: 832040)
+  --seed N               Morok seed; 0 = per-build entropy (default: 0)
   --clang PATH           C compiler with the Morok pass ABI (default: clang-23)
   --clangxx PATH         C++ compiler with the Morok pass ABI (default: clang++)
   --plugin PATH          Morok pass plugin (default: build/src/pipeline/libMorok.dylib)
@@ -141,6 +146,9 @@ while [ "$#" -gt 0 ]; do
     # Test hook: emit the derived static config and exit (see
     # tests/e2e/static_config_layering.sh).  Args: <src|""> <preset> <out>.
     --emit-static-config) derive_static_config "$2" "$3" "$4"; exit 0 ;;
+    # Test hook: print the resolved Morok seed and exit (see
+    # tests/e2e/cross_build_seed.sh).
+    --emit-seed) printf '%s\n' "$SEED"; exit 0 ;;
     --) shift; break ;;
     -*)
       die "unknown option: $1"
