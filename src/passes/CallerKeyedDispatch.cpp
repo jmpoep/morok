@@ -10,11 +10,11 @@
 // site computes the volatile caller-byte hash and then caches the recovered
 // target locally so hot loops do not replay the hash on every iteration.
 //
-// This is the strongest construction available at the IR layer without a
-// post-link byte/RVA manifest: the hash is over final in-memory code bytes at
+// This is an opt-in anti-live-patch/debugger primitive until a post-link
+// byte/RVA manifest exists: the hash is over final in-memory code bytes at
 // runtime, so debugger breakpoints or inline hooks planted after constructors
 // run perturb the dispatch target.  Pre-start static patching still requires a
-// later post-link precompute stage.
+// later post-link expected-hash stage, so presets keep CKD disabled.
 
 #include "morok/passes/CallerKeyedDispatch.hpp"
 

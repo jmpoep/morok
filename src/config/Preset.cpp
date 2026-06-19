@@ -664,10 +664,14 @@ PassConfig makeHigh() {
     c.microcode_stress.decoy_blocks = 4;
     c.microcode_stress.alias_stores = 1;
 
-    c.caller_keyed_dispatch.enabled = true;
-    c.caller_keyed_dispatch.probability = 100;
-    c.caller_keyed_dispatch.max_calls = 4096;
-    c.caller_keyed_dispatch.region_bytes = 16;
+    // CKD hashes live call-site bytes and is useful as an opt-in
+    // anti-live-patch/debugger primitive, but without a post-link expected hash
+    // it self-seals pre-start static patches.  Keep it out of presets that imply
+    // final-binary static tamper resistance until the sealer is wired.
+    c.caller_keyed_dispatch.enabled = false;
+    c.caller_keyed_dispatch.probability = 0;
+    c.caller_keyed_dispatch.max_calls = 0;
+    c.caller_keyed_dispatch.region_bytes = 0;
 
     c.vec.enabled = true;
     c.vec.probability = 75;
@@ -900,10 +904,12 @@ PassConfig makeMax() {
     c.microcode_stress.decoy_blocks = 8;
     c.microcode_stress.alias_stores = 2;
 
-    c.caller_keyed_dispatch.enabled = true;
-    c.caller_keyed_dispatch.probability = 100;
-    c.caller_keyed_dispatch.max_calls = 4096;
-    c.caller_keyed_dispatch.region_bytes = 16;
+    // See makeHigh(): CKD remains manual opt-in until it has a post-link
+    // immutable expected hash.
+    c.caller_keyed_dispatch.enabled = false;
+    c.caller_keyed_dispatch.probability = 0;
+    c.caller_keyed_dispatch.max_calls = 0;
+    c.caller_keyed_dispatch.region_bytes = 0;
 
     c.vec.enabled = true;
     c.vec.probability = 100;

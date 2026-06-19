@@ -336,10 +336,10 @@ TEST_CASE("high preset matches the documented table") {
     CHECK(c.microcode_stress.table_entries == 16u);
     CHECK(c.microcode_stress.decoy_blocks == 4u);
     CHECK(c.microcode_stress.alias_stores == 1u);
-    CHECK(c.caller_keyed_dispatch.enabled == true);
-    CHECK(c.caller_keyed_dispatch.probability == 100u);
-    CHECK(c.caller_keyed_dispatch.max_calls == 4096u);
-    CHECK(c.caller_keyed_dispatch.region_bytes == 16u);
+    CHECK(c.caller_keyed_dispatch.enabled == false);
+    CHECK(c.caller_keyed_dispatch.probability == 0u);
+    CHECK(c.caller_keyed_dispatch.max_calls == 0u);
+    CHECK(c.caller_keyed_dispatch.region_bytes == 0u);
     CHECK(c.vec.width == 256u);
     CHECK(c.vec.shuffle == true);
     CHECK(c.vec.lift_comparisons == true);
@@ -356,9 +356,10 @@ TEST_CASE("high preset matches the documented table") {
 TEST_CASE("max preset enables every pass at full intensity") {
     const PassConfig c = presetConfig(Preset::Max);
 
-    // Every toggleable pass is enabled — including the four the `high` preset
-    // leaves off (mutual_guard, adversarial_merge, adversarial_tuning, flatten)
-    // and the runtime anti-analysis trio.
+    // Every preset-safe toggleable pass is enabled — including the four the
+    // `high` preset leaves off (mutual_guard, adversarial_merge,
+    // adversarial_tuning, flatten) and the runtime anti-analysis trio.  CKD
+    // stays opt-in until its final-binary post-link expected hash exists.
     CHECK(c.bcf.enabled == true);
     CHECK(c.sub.enabled == true);
     CHECK(c.mba.enabled == true);
@@ -395,7 +396,7 @@ TEST_CASE("max preset enables every pass at full intensity") {
     CHECK(c.trace_keying.enabled == true);
     CHECK(c.dispatcherless.enabled == true);
     CHECK(c.microcode_stress.enabled == true);
-    CHECK(c.caller_keyed_dispatch.enabled == true);
+    CHECK(c.caller_keyed_dispatch.enabled == false);
     CHECK(c.vec.enabled == true);
     CHECK(c.csm.enabled == true);
     CHECK(c.flatten.enabled == true);
@@ -437,9 +438,9 @@ TEST_CASE("max preset enables every pass at full intensity") {
     CHECK(c.func_wrap.times == 2u);
     CHECK(c.nanomites.probability == 100u);
     CHECK(c.nanomites.max_sites == 16u);
-    CHECK(c.caller_keyed_dispatch.probability == 100u);
-    CHECK(c.caller_keyed_dispatch.max_calls == 4096u);
-    CHECK(c.caller_keyed_dispatch.region_bytes == 16u);
+    CHECK(c.caller_keyed_dispatch.probability == 0u);
+    CHECK(c.caller_keyed_dispatch.max_calls == 0u);
+    CHECK(c.caller_keyed_dispatch.region_bytes == 0u);
 
     // Max is strictly at least as strong as high on shared scalar knobs.
     const PassConfig h = presetConfig(Preset::High);
