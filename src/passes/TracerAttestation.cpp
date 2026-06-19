@@ -340,10 +340,21 @@ void emitShareRound(Module &M, Function &Ctor, IRBuilder<> &B,
                           FoldB.CreateZExtOrTrunc(Pid, I64), ParentSlotAddr,
                           ConstantInt::get(I64, Index)},
                          "morok.tracer.expected");
+    Value *WordDiff =
+        FoldB.CreateXor(Loaded, Expected, "morok.tracer.word.diff");
     Value *Mismatch = FoldB.CreateICmpNE(
-        FoldB.CreateXor(Loaded, Expected, "morok.tracer.word.diff"),
-        ConstantInt::get(I64, 0), "morok.tracer.word.bad");
-    runtime_seal::foldWord(FoldB, runtime_seal::kTracerChannel, Loaded,
+        WordDiff, ConstantInt::get(I64, 0), "morok.tracer.word.bad");
+    // Zero-on-clean (#97): fold the DIFF between the delivered share and the
+    // expected share into the tracer seal, NOT the raw delivered word.  On a
+    // clean attach the child pokes exactly the expected (non-zero) share, so the
+    // diff is zero and foldWord leaves the tracer channel at its S0 baseline —
+    // keeping the VM keystream and self-checksum consumers (encoded against the
+    // clean zero-delta state) correct.  Folding the always-non-zero raw word
+    // moved the seal off S0 on every clean run and corrupted untampered VM
+    // bytecode / checksum constants.  Tamper (a debugger steals the trace, so
+    // the child cannot poke the expected share) makes the diff non-zero, the
+    // seal diverges, and seal-dependent code fails closed.
+    runtime_seal::foldWord(FoldB, runtime_seal::kTracerChannel, WordDiff,
                            FoldSalt, "morok.tracer.seal");
     runtime_seal::foldFlag(FoldB, runtime_seal::kAntiDebugChannel, Mismatch,
                            FoldSalt ^ 0x8A6F0E4D27D5C139ULL,

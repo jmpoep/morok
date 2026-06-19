@@ -8986,6 +8986,23 @@ entry:
             childFailurePoisonsShare = true;
     }
     CHECK(childFailurePoisonsShare);
+
+    // Regression for #97: the tracer seal must fold the DIFF between the
+    // delivered and expected share (zero on a clean attach), not the raw,
+    // always-non-zero delivered word — otherwise a clean run moves the tracer
+    // channel off S0 and corrupts the VM keystream / self-checksum consumers.
+    // The diff XOR therefore feeds BOTH the mismatch flag and the seal fold, so
+    // each one has >= 2 uses; the raw delivered word load must NOT itself be a
+    // direct operand of the seal-fold mix.
+    std::size_t diffXors = 0;
+    for (Instruction &I : instructions(*Ctor)) {
+        if (I.getOpcode() != Instruction::Xor ||
+            !I.getName().starts_with("morok.tracer.word.diff"))
+            continue;
+        ++diffXors;
+        CHECK(I.getNumUses() >= 2u);
+    }
+    CHECK(diffXors == 2u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
