@@ -1712,6 +1712,46 @@ entry:
     CHECK(shares >= 4);
 }
 
+// Regression for #82: de-switching a wide-magic switch must keep successor
+// PHIs consistent even when a successor is reached by more than one rewritten
+// edge — in particular when a case destination is also the default
+// destination, and when two cases share a non-default destination.
+TEST_CASE("deSwitchGateConstantsFunction keeps shared-successor PHIs valid") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @license_gate(i32 %h) {
+entry:
+  switch i32 %h, label %reject [
+    i32 305419896, label %accept
+    i32 286331153, label %accept
+    i32 2271560481, label %reject
+  ]
+accept:
+  %pa = phi i32 [ 1, %entry ], [ 1, %entry ]
+  ret i32 %pa
+reject:
+  %pr = phi i32 [ 7, %entry ], [ 7, %entry ]
+  ret i32 %pr
+}
+)ir");
+    Function *F = M->getFunction("license_gate");
+    REQUIRE(F);
+    REQUIRE_FALSE(verifyModule(*M, &errs())); // fixture starts valid
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8201);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::deSwitchGateConstantsFunction(*F, {/*prob=*/100,
+                                                            /*k=*/2, 1},
+                                                       rng));
+    // The switch is fully lowered and the rebuilt successor PHIs are
+    // well-formed (no stale OrigBB entry, correct entry count per real edge).
+    bool hasSwitch = false;
+    for (Instruction &I : instructions(*F))
+        hasSwitch |= isa<SwitchInst>(&I);
+    CHECK_FALSE(hasSwitch);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("constantEncryptFunction feistel + substitute_xor layers are wired") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

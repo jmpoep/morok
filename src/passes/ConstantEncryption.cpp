@@ -301,40 +301,53 @@ bool deSwitchWideMagics(Function &F, Module &M, unsigned shareCount,
 
         for (unsigned i = 0; i < Cases.size(); ++i) {
             IRBuilder<NoFolder> B(ChainBB[i]);
-            auto *Eq = cast<ICmpInst>(B.CreateICmpEQ(Cond, Cases[i].val,
-                                                     "morok.deswitch.eq"));
             BasicBlock *FalseDest =
                 (i + 1 < Cases.size()) ? ChainBB[i + 1] : DefaultBB;
+            // When a case destination coincides with its fall-through (a case
+            // whose target is also the switch default), an equality test would
+            // emit `br %eq, S, S` — a degenerate two-edge branch that needs two
+            // matching PHI entries and survives into later CFG passes.  Collapse
+            // it to a plain branch; the compare carries no information here.
+            if (Cases[i].dest == FalseDest) {
+                B.CreateBr(Cases[i].dest);
+                continue;
+            }
+            auto *Eq = cast<ICmpInst>(B.CreateICmpEQ(Cond, Cases[i].val,
+                                                     "morok.deswitch.eq"));
             B.CreateCondBr(Eq, Cases[i].dest, FalseDest);
             // Replace the literal case value with its encrypted reconstruction.
             Value *Enc = reconstruct(M, *Eq, Cases[i].val, shareCount, rng);
             Eq->setOperand(1, Enc);
         }
 
-        // Rewire successor PHIs: the OrigBB edge becomes one edge per new chain
-        // predecessor.  Add the new incomings first, then drop the OrigBB entry.
-        for (unsigned i = 0; i < Cases.size(); ++i)
-            for (PHINode &Phi : Cases[i].dest->phis()) {
-                auto It = PhiFromOrig.find(&Phi);
-                if (It != PhiFromOrig.end())
-                    Phi.addIncoming(It->second, ChainBB[i]);
-            }
-        for (PHINode &Phi : DefaultBB->phis()) {
-            auto It = PhiFromOrig.find(&Phi);
-            if (It != PhiFromOrig.end())
-                Phi.addIncoming(It->second, ChainBB.back());
-        }
-
+        // Rebuild each successor PHI from the actual new edges.  A successor can
+        // now be reached by several distinct chain blocks (cases sharing a
+        // destination), by one chain block more than once (a not-collapsed
+        // degenerate branch), and a multi-edge switch successor already carried
+        // several OrigBB entries.  The old add-per-case / remove-one logic could
+        // not reconcile any of these (ChainBB[0] is OrigBB itself), leaving
+        // stale or duplicate entries.  Instead: drop every OrigBB entry, then
+        // add exactly one entry per real edge from each chain block.
         SmallPtrSet<BasicBlock *, 16> Succs;
         for (const CaseRec &C : Cases)
             Succs.insert(C.dest);
         Succs.insert(DefaultBB);
         for (BasicBlock *S : Succs)
             for (PHINode &Phi : S->phis()) {
-                int Idx = Phi.getBasicBlockIndex(OrigBB);
-                if (Idx >= 0)
+                auto It = PhiFromOrig.find(&Phi);
+                if (It == PhiFromOrig.end())
+                    continue;
+                Value *V = It->second;
+                for (int Idx = Phi.getBasicBlockIndex(OrigBB); Idx >= 0;
+                     Idx = Phi.getBasicBlockIndex(OrigBB))
                     Phi.removeIncomingValue(static_cast<unsigned>(Idx),
                                             /*DeletePHIIfEmpty=*/false);
+                for (BasicBlock *P : ChainBB) {
+                    Instruction *Term = P->getTerminator();
+                    for (unsigned s = 0; s < Term->getNumSuccessors(); ++s)
+                        if (Term->getSuccessor(s) == S)
+                            Phi.addIncoming(V, P);
+                }
             }
     }
     return true;
