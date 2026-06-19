@@ -6906,8 +6906,17 @@ Function *schedulerStepOracleProbe(Module &M, GlobalVariable *State,
               "morok.step.anomalous.samples");
     Value *anomaly = B.CreateICmpUGE(anomalousSamples, ConstantInt::get(i32, 2),
                                      "morok.step.anomaly.distribution");
-    foldEnforcedFlag(B, State, anomaly, 0xF18D47A6C2B9035EULL,
-                     "morok.step.anomaly.distribution");
+    // Telemetry only, NOT foldEnforcedFlag (#98): context-switch counts and
+    // thread-time skew are host/jitter-sensitive — a loaded host, a VM/container
+    // scheduler, or ordinary preemption trips this anomaly on a legitimate,
+    // untraced run.  foldEnforcedFlag would fold that false positive into the
+    // CONSUMED anti_debug seal channel (via sealFold), permanently moving the
+    // seal off S0 and making VM bytecode / sealed data decode garbage at
+    // startup.  Per the foldEnforcedFlag contract, host/jitter-sensitive probes
+    // must stay foldFlag telemetry (recorded in the per-probe state, never the
+    // consumed seal); only verdicts proven false on every clean run may enforce.
+    foldFlag(B, State, anomaly, 0xF18D47A6C2B9035EULL,
+             "morok.step.anomaly.distribution");
     B.CreateRetVoid();
     return fn;
 }

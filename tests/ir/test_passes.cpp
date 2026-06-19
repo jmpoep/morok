@@ -201,6 +201,15 @@ void checkSealEnforcement(Module &M, Function &F) {
     CHECK(countNamedInstructions(F, "morok.seal.fold.anti_debug.next") >= 1u);
 }
 
+// A host/jitter-sensitive probe must NOT fold its verdict into the consumed
+// anti_debug seal channel (#98): a false positive on a loaded host/VM would
+// permanently corrupt the seal and break clean-run VM/sealed-data decoding.
+// Such probes keep their anomaly as telemetry only, so the seal-fold helper
+// (morok.seal.fold.anti_debug.*) must be entirely absent from the probe.
+void checkNoSealEnforcement(Function &F) {
+    CHECK(countNamedInstructions(F, "morok.seal.fold.anti_debug") == 0u);
+}
+
 std::size_t countPhis(Function &F) {
     std::size_t n = 0;
     for (Instruction &I : instructions(F))
@@ -15559,7 +15568,7 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Ctor != nullptr);
     REQUIRE(Oracle != nullptr);
     CHECK(M->getGlobalVariable("morok.step.state", true) != nullptr);
-    checkSealEnforcement(*M, *Oracle);
+    checkNoSealEnforcement(*Oracle);
     CHECK(M->getFunction("getrusage") != nullptr);
     CHECK(M->getFunction("syscall") == nullptr);
     CHECK(hasInlineAsmCall(*Oracle));
@@ -15593,7 +15602,7 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getFunction("mach_thread_self") != nullptr);
     CHECK(M->getFunction("thread_info") != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
-    checkSealEnforcement(*M, *Oracle);
+    checkNoSealEnforcement(*Oracle);
     CHECK_FALSE(hasInlineAsmCall(*Oracle));
     CHECK(countNamedInstructions(*Oracle, "morok.step.cpu.delta") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.step.thread.skew") >= 1u);
@@ -15618,7 +15627,7 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getFunction("QueryThreadCycleTime") != nullptr);
     CHECK(M->getFunction("QueryPerformanceCounter") != nullptr);
     CHECK(M->getFunction("QueryPerformanceFrequency") != nullptr);
-    checkSealEnforcement(*M, *Oracle);
+    checkNoSealEnforcement(*Oracle);
     CHECK(countNamedInstructions(*Oracle, "morok.step.cpu.delta") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.step.cycles.delta") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.step.thread.skew") >= 1u);
