@@ -63,6 +63,7 @@ struct Runtime {
     GlobalVariable *region = nullptr;
     GlobalVariable *expected = nullptr;
     std::uint64_t expected_hash = 0;
+    bool decoy_state = false;
 };
 
 enum class TableOpKind { Binary, ICmp };
@@ -579,6 +580,7 @@ Runtime createRuntime(Function &F, const DataFlowIntegrityParams &Params,
     const std::uint64_t Seed = Rng.next();
     std::vector<std::uint8_t> Bytes = randomRegion(RegionSize, Rng);
     Runtime R;
+    R.decoy_state = Params.decoy_state;
     R.expected_hash =
         hashBytes(ArrayRef<std::uint8_t>(Bytes.data(), Bytes.size()), Seed);
     R.region = createRegion(M, Suffix, Bytes);
@@ -648,7 +650,21 @@ Value *emitLookup(Module &M, Function &F, Runtime &R, Target &T,
 
     Value *Diff = B.CreateCall(R.diff->getFunctionType(), R.diff, {},
                                "morok.dfi.hash.call");
-    if (auto *DecoyState = M.getGlobalVariable(kDecoyStateName, true)) {
+    GlobalVariable *DecoyState = M.getGlobalVariable(kDecoyStateName, true);
+    // When decoy entanglement is enabled, get-or-create the shared state global
+    // here so the load is emitted on every protected function regardless of
+    // module/RNG order — otherwise a function visited before any decoy selects
+    // and creates the global would emit its DFI lookups unpoisoned, leaving the
+    // tamper-to-DFI entanglement order-dependent.  The decoy pass writes the
+    // same global (matched by name) at runtime.  Created with the identical
+    // shape CoherentDecoys uses (private i64, zero-initialised, 8-byte aligned).
+    if (!DecoyState && R.decoy_state) {
+        DecoyState = new GlobalVariable(
+            M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+            ConstantInt::get(I64, 0), kDecoyStateName);
+        DecoyState->setAlignment(Align(8));
+    }
+    if (DecoyState) {
         if (DecoyState->getValueType()->isIntegerTy(64)) {
             auto *State =
                 B.CreateLoad(I64, DecoyState, "morok.dfi.decoy.state");

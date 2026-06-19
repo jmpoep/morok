@@ -24,6 +24,12 @@ struct DataFlowIntegrityParams {
     std::uint32_t probability = 100; ///< per eligible op/cmp, 0..100
     std::uint32_t max_tables = 4;    ///< per-function table cap
     std::uint32_t region_bytes = 32; ///< bytes hashed by the runtime stub
+    /// Entangle table lookups with the coherent-decoy hidden state.  When set,
+    /// DFI get-or-creates the shared `morok.decoy.state` global so the state
+    /// load is emitted on EVERY protected function, independent of whether a
+    /// decoy was selected earlier in module order (it was previously only
+    /// emitted if the global already happened to exist).
+    bool decoy_state = false;
 };
 
 /// Replace selected i1..i8 operations/comparisons and const-indexed i9..i16

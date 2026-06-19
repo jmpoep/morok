@@ -5826,6 +5826,68 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+// Regression for #53: the decoy-state load was emitted only if morok.decoy.state
+// already existed at transform time, so a function whose DFI ran before any
+// decoy created that global was left unpoisoned — the tamper-to-DFI
+// entanglement was order/RNG dependent.  With decoy_state set, DFI now
+// get-or-creates the global so the load is always emitted, no pre-existing
+// global required.
+TEST_CASE("dataFlowIntegrityFunction emits decoy state regardless of order") {
+    const char *ir = R"ir(
+define i8 @dfi_order(i8 %a, i8 %b) {
+entry:
+  %x = xor i8 %a, %b
+  ret i8 %x
+}
+)ir";
+    auto hasDecoyDiff = [](Function &F) {
+        for (Instruction &I : instructions(F))
+            if (I.getName().starts_with("morok.dfi.decoy.diff"))
+                return true;
+        return false;
+    };
+
+    // decoy_state=false and no pre-existing global: no entanglement (old path).
+    {
+        LLVMContext ctx;
+        auto M = parse(ctx, ir);
+        Function *F = M->getFunction("dfi_order");
+        REQUIRE(F);
+        auto engine = morok::core::Xoshiro256pp::fromSeed(5301);
+        morok::ir::IRRandom rng(engine);
+        morok::passes::DataFlowIntegrityParams p;
+        p.probability = 100;
+        p.max_tables = 1;
+        p.region_bytes = 32;
+        p.decoy_state = false;
+        CHECK(morok::passes::dataFlowIntegrityFunction(*F, p, rng));
+        CHECK(M->getGlobalVariable("morok.decoy.state", true) == nullptr);
+        CHECK_FALSE(hasDecoyDiff(*F));
+        CHECK_FALSE(verifyModule(*M, &errs()));
+    }
+
+    // decoy_state=true and no pre-existing global: DFI creates it and loads it.
+    {
+        LLVMContext ctx;
+        auto M = parse(ctx, ir);
+        Function *F = M->getFunction("dfi_order");
+        REQUIRE(F);
+        auto engine = morok::core::Xoshiro256pp::fromSeed(5301);
+        morok::ir::IRRandom rng(engine);
+        morok::passes::DataFlowIntegrityParams p;
+        p.probability = 100;
+        p.max_tables = 1;
+        p.region_bytes = 32;
+        p.decoy_state = true;
+        CHECK(morok::passes::dataFlowIntegrityFunction(*F, p, rng));
+        GlobalVariable *State = M->getGlobalVariable("morok.decoy.state", true);
+        REQUIRE(State);
+        CHECK(State->getValueType()->isIntegerTy(64));
+        CHECK(hasDecoyDiff(*F));
+        CHECK_FALSE(verifyModule(*M, &errs()));
+    }
+}
+
 TEST_CASE("dataFlowIntegrityFunction supports sub-byte arithmetic") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

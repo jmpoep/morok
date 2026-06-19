@@ -756,6 +756,10 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
                 p.max_tables = eff.data_flow_integrity.max_tables.value_or(2);
                 p.region_bytes =
                     eff.data_flow_integrity.region_bytes.value_or(32);
+                // Entangle with the coherent-decoy hidden state whenever decoys
+                // are enabled, so the state load is emitted on every protected
+                // function regardless of module/RNG visit order (#53).
+                p.decoy_state = eff.coherent_decoy.enabled.value_or(false);
                 changed |= passes::dataFlowIntegrityFunction(F, p, rng);
             }
 
