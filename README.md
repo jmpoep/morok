@@ -316,13 +316,14 @@ has no dynamic loader, so dynamic import lookup has no useful hiding surface and
 can crash if left enabled.
 
 Post-link sealing is mandatory for shippable binaries that rely on
-`self_checksum_constants` or `mutual_guard_graph` native-code windows. The IR
-passes reserve retained manifests, but final code byte ranges are only known
-after linking and stripping. `cross_build.sh` seals automatically after strip
-and fails closed if no manifests are present. It then runs `tools/morok-audit.py`
-over the final output directory to reject unsealed manifests, placeholder
-manifest state, private-key sidecars, embedded development paths, and plaintext
-high-value release markers before anything is shipped. Manual sealing is:
+`self_checksum_constants`, `mutual_guard_graph`, or `caller_keyed_dispatch`
+native-code windows. The IR passes reserve retained manifests, but final code
+byte ranges are only known after linking and stripping. `cross_build.sh` seals
+automatically after strip and fails closed if no manifests are present. It then
+runs `tools/morok-audit.py` over the final output directory to reject unsealed
+manifests, placeholder manifest state, private-key sidecars, embedded
+development paths, and plaintext high-value release markers before anything is
+shipped. Manual sealing is:
 
 ```sh
 python3 tests/e2e/adversarial_binary.py seal path/to/binary --window 262144
@@ -578,7 +579,7 @@ and private-linkage cleanup for generated `morok.*` helpers, are scheduler-only.
 |---|---|---|---|
 | String encryption | `morok-strenc` | `string_encryption` | Encrypts eligible private byte-array globals with a unique per-string cipher. Safe C-string callsites are materialized into per-use stack buffers; unsupported uses get per-string constructor decryptors. |
 | Function-call obfuscation | `morok-fco` | `function_call_obfuscate` | Hides external calls behind per-site import indirection. Linux/macOS 64-bit paths use manual export-by-hash resolvers where supported; unsupported targets use per-site cloaked dynamic lookup. |
-| Caller-keyed dispatch | `morok-ckd` | `caller_keyed_dispatch` | Collapses surviving direct user calls through a shared dispatch hub keyed by caller context and integrity bytes. |
+| Caller-keyed dispatch | `morok-ckd` | `caller_keyed_dispatch` | Collapses surviving direct user calls through a shared dispatch hub keyed by caller context and post-link sealed integrity bytes. |
 | Function wrapper | `morok-funcwrap` | `function_wrapper` | Wraps calls after per-function transforms so callers see proxy edges. |
 | VTable integrity | `morok-vtable` | `vtable_integrity` | Guards Itanium C++ virtual dispatches by expected vptr, slot, target, and cookie hash. |
 | Decoy strings | `morok-decoystr` | `decoy_strings` | Distributes retained plaintext honeypot diagnostics and fake logging infrastructure. |

@@ -14,6 +14,7 @@
 #include "morok/passes/SelfChecksumConstants.hpp"
 
 #include "morok/ir/InstUtil.hpp"
+#include "morok/passes/CodeRegionKdf.hpp"
 #include "morok/passes/RuntimeSeal.hpp"
 
 #include "llvm/ADT/SmallPtrSet.h"
@@ -53,16 +54,6 @@ using Builder = IRBuilder<NoFolder>;
 // Fixed post-link manifest sentinel. Keep this non-printable: readable product
 // markers in emitted binaries become cheap static-analysis anchors.
 constexpr std::uint64_t kPostlinkMagic = 0xA7D13C5E9000C3B2ULL;
-
-// Unsealed sentinel for the post-link code-window length.  A *non-zero*
-// initializer is mandatory here: a zero-initialized mutable global lands in
-// BSS/NOBITS, which has no file offset for the post-link sealer to patch, so
-// the window length can never be written and native code never enters the diff
-// (issues/6.md).  A non-zero initializer forces the global into a file-backed
-// data section.  The sealer overwrites this with the real native code length;
-// until then the runtime treats the sentinel as "unsealed" and skips the
-// code-byte hash so unsealed dev/test builds still behave correctly.
-constexpr std::uint32_t kUnsealedCodeSize = 0xFFFFFFFFu;
 
 struct Target {
     Instruction *user = nullptr;
@@ -195,36 +186,6 @@ bool eligiblePhiIncoming(PHINode &PN, unsigned Incoming) {
         return false;
     return Term->getNumSuccessors() == 1 || isa<BranchInst>(Term) ||
            isa<SwitchInst>(Term);
-}
-
-std::uint64_t hashStep(std::uint64_t H, std::uint8_t B) {
-    H ^= static_cast<std::uint64_t>(B);
-    H *= 0xff51afd7ed558ccdULL;
-    H ^= H >> 32;
-    H *= 0xc4ceb9fe1a85ec53ULL;
-    H ^= H >> 29;
-    return H;
-}
-
-std::uint64_t hashBytes(ArrayRef<std::uint8_t> Bytes, std::uint64_t Seed) {
-    std::uint64_t H = Seed;
-    for (std::uint8_t B : Bytes)
-        H = hashStep(H, B);
-    return H;
-}
-
-Value *emitHashStep(Builder &B, Value *H, Value *Byte) {
-    auto *I64 = B.getInt64Ty();
-    Value *Wide = B.CreateZExt(Byte, I64, "morok.sc.hash.byte");
-    Value *X = B.CreateXor(H, Wide, "morok.sc.hash.mix");
-    X = B.CreateMul(X, ConstantInt::get(I64, 0xff51afd7ed558ccdULL),
-                    "morok.sc.hash.mix");
-    X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I64, 32)),
-                    "morok.sc.hash.mix");
-    X = B.CreateMul(X, ConstantInt::get(I64, 0xc4ceb9fe1a85ec53ULL),
-                    "morok.sc.hash.mix");
-    return B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I64, 29)),
-                       "morok.sc.hash.mix");
 }
 
 std::vector<std::uint8_t> randomRegion(std::uint32_t Size, ir::IRRandom &Rng) {
@@ -383,7 +344,7 @@ GlobalVariable *createCodeSize(Module &M, StringRef Suffix) {
     auto *I32 = Type::getInt32Ty(M.getContext());
     auto *CodeSize = new GlobalVariable(
         M, I32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
-        ConstantInt::get(I32, kUnsealedCodeSize),
+        ConstantInt::get(I32, code_region_kdf::kUnsealedCodeSize),
         (Twine("morok.sc.code.size.") + Suffix).str());
     CodeSize->setAlignment(Align(4));
     return CodeSize;
@@ -420,15 +381,6 @@ Value *regionPtr(Builder &B, GlobalVariable *Region, Value *Idx) {
     auto *ArrTy = cast<ArrayType>(Region->getValueType());
     return B.CreateInBoundsGEP(ArrTy, Region, {ConstantInt::get(I32, 0), Idx},
                                "morok.sc.region.ptr");
-}
-
-Value *codePtr(Builder &B, Function *Target, Value *Idx) {
-    auto *I64 = B.getInt64Ty();
-    Value *Base = B.CreatePtrToInt(Target, I64, "morok.sc.code.base");
-    Value *Offset = B.CreateZExt(Idx, I64, "morok.sc.code.offset");
-    Value *Addr = B.CreateAdd(Base, Offset, "morok.sc.code.addr");
-    return B.CreateIntToPtr(Addr, PointerType::getUnqual(B.getContext()),
-                            "morok.sc.code.ptr");
 }
 
 Function *createDiffFunction(Module &M, StringRef Suffix,
@@ -470,7 +422,8 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
         LB.CreateLoad(I8, regionPtr(LB, Region, I), "morok.sc.region.byte");
     Byte->setVolatile(true);
     Byte->setAlignment(Align(1));
-    Value *NextH = emitHashStep(LB, H, Byte);
+    Value *NextH = code_region_kdf::emitHashStep(LB, H, Byte,
+                                                 "morok.sc.hash");
     Value *NextI =
         LB.CreateAdd(I, ConstantInt::get(I32, 1), "morok.sc.hash.next");
     I->addIncoming(NextI, Loop);
@@ -480,44 +433,13 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
     LB.CreateCondBr(Done, CodeCheck, Loop);
 
     Builder CB(CodeCheck);
-    auto *CodeSizeLoad =
-        CB.CreateLoad(I32, CodeSize, "morok.sc.code.size.load");
-    CodeSizeLoad->setVolatile(true);
-    CodeSizeLoad->setAlignment(Align(4));
-    // The code-byte hash runs only once the post-link sealer has replaced the
-    // unsealed sentinel with a concrete native window length.  Treat both 0 and
-    // the sentinel as "unsealed" so the data-only diff stays identity (== 0) and
-    // unsealed builds behave correctly; sealed builds fold real code bytes in.
-    Value *NonZero = CB.CreateICmpNE(CodeSizeLoad, ConstantInt::get(I32, 0),
-                                     "morok.sc.code.nz");
-    Value *Sealed =
-        CB.CreateICmpNE(CodeSizeLoad, ConstantInt::get(I32, kUnsealedCodeSize),
-                        "morok.sc.code.sealed");
-    Value *HasCode = CB.CreateAnd(NonZero, Sealed, "morok.sc.code.has");
-    CB.CreateCondBr(HasCode, CodeLoop, Exit);
-
-    Builder KB(CodeLoop);
-    PHINode *CI = KB.CreatePHI(I32, 2, "morok.sc.code.i");
-    PHINode *CH = KB.CreatePHI(I64, 2, "morok.sc.code.hash");
-    CI->addIncoming(ConstantInt::get(I32, 0), CodeCheck);
-    CH->addIncoming(NextH, CodeCheck);
-    auto *CodeByte =
-        KB.CreateLoad(I8, codePtr(KB, Target, CI), "morok.sc.code.byte");
-    CodeByte->setVolatile(true);
-    CodeByte->setAlignment(Align(1));
-    Value *NextCH = emitHashStep(KB, CH, CodeByte);
-    Value *NextCI =
-        KB.CreateAdd(CI, ConstantInt::get(I32, 1), "morok.sc.code.next");
-    CI->addIncoming(NextCI, CodeLoop);
-    CH->addIncoming(NextCH, CodeLoop);
-    Value *CodeDone =
-        KB.CreateICmpEQ(NextCI, CodeSizeLoad, "morok.sc.code.done");
-    KB.CreateCondBr(CodeDone, Exit, CodeLoop);
+    code_region_kdf::SealedCodeHash CodeHash =
+        code_region_kdf::emitSealedCodeHash(CB, CodeCheck, CodeLoop, Exit,
+                                            Target, CodeSize, NextH, NextH,
+                                            "morok.sc", "morok.sc.final.hash");
 
     Builder XB(Exit);
-    PHINode *FinalH = XB.CreatePHI(I64, 2, "morok.sc.final.hash");
-    FinalH->addIncoming(NextH, CodeCheck);
-    FinalH->addIncoming(NextCH, CodeLoop);
+    PHINode *FinalH = CodeHash.final_hash;
     auto *ExpectedLoad = XB.CreateLoad(I64, Expected, "morok.sc.expected.load");
     ExpectedLoad->setVolatile(true);
     ExpectedLoad->setAlignment(Align(8));
@@ -559,7 +481,8 @@ Runtime createRuntime(Function &F, const SelfChecksumParams &Params,
     std::vector<std::uint8_t> Bytes = randomRegion(RegionSize, Rng);
     Runtime R;
     R.expected_hash =
-        hashBytes(ArrayRef<std::uint8_t>(Bytes.data(), Bytes.size()), Seed);
+        code_region_kdf::hashBytes(
+            ArrayRef<std::uint8_t>(Bytes.data(), Bytes.size()), Seed);
     R.seed = Seed;
     R.region = createRegion(M, Suffix, Bytes);
     R.expected = createExpected(M, Suffix, R.expected_hash);

@@ -10789,8 +10789,33 @@ entry:
     CHECK(countInlineAsmConstraints(*Caller, "~{x19}") == 0u);
     CHECK(countGlobals(*M, "morok.ckd.enc") == 2u);
     CHECK(countGlobals(*M, "morok.ckd.cache") == 2u);
+    CHECK(countGlobals(*M, "morok.ckd.code.size") == 2u);
+    CHECK(countGlobals(*M, "morok.postlink.ckd") == 1u);
     CHECK(M->getGlobalVariable("llvm.global_ctors") != nullptr);
     CHECK(countCallsTo(*Init, "morok.ckd.dispatch") == 0u);
+
+    GlobalVariable *Manifest = nullptr;
+    std::vector<GlobalVariable *> EncodedSlots;
+    std::vector<GlobalVariable *> CodeSizes;
+    for (GlobalVariable &GV : M->globals()) {
+        if (GV.getName().starts_with("morok.postlink.ckd"))
+            Manifest = &GV;
+        if (GV.getName().starts_with("morok.ckd.enc"))
+            EncodedSlots.push_back(&GV);
+        if (GV.getName().starts_with("morok.ckd.code.size"))
+            CodeSizes.push_back(&GV);
+    }
+    REQUIRE(Manifest);
+    REQUIRE(Manifest->hasInitializer());
+    const std::uint64_t CkdMagic = manifestMagic(Manifest);
+    CHECK(CkdMagic != 0u);
+    CHECK(CkdMagic != 0x4D4F524F4B434B44ULL);
+    CHECK_FALSE(i64HasPrintableRun(CkdMagic));
+    CHECK(constantReferencesGlobal(Manifest->getInitializer(), Dispatch));
+    for (GlobalVariable *Slot : EncodedSlots)
+        CHECK(constantReferencesGlobal(Manifest->getInitializer(), Slot));
+    for (GlobalVariable *CodeSize : CodeSizes)
+        CHECK(constantReferencesGlobal(Manifest->getInitializer(), CodeSize));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

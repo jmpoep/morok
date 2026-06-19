@@ -26,6 +26,10 @@ MG_HEADER_SIZE = 24
 MG_RECORD_V2_SIZE = 32
 MG_RECORD_V3_SIZE = 56
 MG_UNSEALED_CODE_SIZE = 0xFFFFFFFF
+CKD_MAGIC = 0xC30D5B11A6E48F27
+CKD_HEADER_SIZE = 16
+CKD_RECORD_SIZE = 72
+CKD_MAX_REGION_BYTES = 32
 MASK64 = 0xFFFFFFFFFFFFFFFF
 
 CPU_TYPE_X86_64 = 0x01000007
@@ -95,6 +99,29 @@ class MgManifest:
     region_size: int
     coverage_depth: int
     nodes: list[MgNodeManifest]
+
+
+@dataclass
+class CkdNodeManifest:
+    offset: int
+    index: int
+    encoded: int
+    code_size: int
+    dispatcher: int
+    site: int
+    target: int
+    salt: int
+    mul: int
+    add: int
+    rot: int
+    region_bytes: int
+
+
+@dataclass
+class CkdManifest:
+    offset: int
+    version: int
+    nodes: list[CkdNodeManifest]
 
 
 class Binary:
@@ -426,6 +453,74 @@ class Binary:
                 )
         return found
 
+    def find_ckd_manifests(self, require_patchable: bool = True) -> list[CkdManifest]:
+        needle = struct.pack("<Q", CKD_MAGIC)
+        found: list[CkdManifest] = []
+        start = 0
+        while True:
+            off = self.data.find(needle, start)
+            if off < 0:
+                break
+            start = off + 1
+            if off + CKD_HEADER_SIZE > len(self.data):
+                continue
+            version = self.u32(off + 8)
+            count = self.u32(off + 12)
+            if version != 1 or count == 0 or count > 4096:
+                continue
+            total_size = CKD_HEADER_SIZE + count * CKD_RECORD_SIZE
+            if off + total_size > len(self.data):
+                continue
+
+            nodes: list[CkdNodeManifest] = []
+            for i in range(count):
+                rec = off + CKD_HEADER_SIZE + i * CKD_RECORD_SIZE
+                def manifest_ptr(rel: int) -> int:
+                    raw = self.u64(rec + rel)
+                    return 0 if raw == 0 else self.decode_pointer(raw)
+
+                encoded = manifest_ptr(0)
+                code_size = manifest_ptr(8)
+                dispatcher = manifest_ptr(16)
+                site = manifest_ptr(24)
+                target = manifest_ptr(32)
+                salt = self.u64(rec + 40)
+                mul = self.u64(rec + 48)
+                add = self.u64(rec + 56)
+                rot = self.u32(rec + 64)
+                region_bytes = self.u32(rec + 68)
+                if self.fileoff_for_addr(site) is None:
+                    continue
+                if require_patchable and (
+                    self.fileoff_for_addr(encoded) is None
+                    or self.fileoff_for_addr(code_size) is None
+                    or self.fileoff_for_addr(dispatcher) is None
+                    or self.fileoff_for_addr(target) is None
+                    or region_bytes == 0
+                    or region_bytes > CKD_MAX_REGION_BYTES
+                    or rot > 63
+                ):
+                    continue
+                nodes.append(
+                    CkdNodeManifest(
+                        offset=rec,
+                        index=i,
+                        encoded=encoded,
+                        code_size=code_size,
+                        dispatcher=dispatcher,
+                        site=site,
+                        target=target,
+                        salt=salt,
+                        mul=mul,
+                        add=add,
+                        rot=rot,
+                        region_bytes=region_bytes,
+                    )
+                )
+            if nodes:
+                found.append(CkdManifest(offset=off, version=version, nodes=nodes))
+        return found
+
     def macho_stub_offsets(self, wanted: set[str]) -> list[tuple[str, int, int]]:
         if self.kind != "macho" or not self.symbols or not self.indirect_symbols:
             return []
@@ -480,6 +575,28 @@ def hash_bytes(blob: bytes, seed: int) -> int:
 def rotl64_value(value: int, amount: int) -> int:
     sh = (amount % 63) + 1
     return ((value << sh) | (value >> (64 - sh))) & MASK64
+
+
+def rotl64_ckd(value: int, amount: int) -> int:
+    sh = amount & 63
+    if sh == 0:
+        return value & MASK64
+    return ((value << sh) | (value >> (64 - sh))) & MASK64
+
+
+def ckd_site_hash(blob: bytes, site_delta: int, node: CkdNodeManifest) -> int:
+    h = (node.salt ^ site_delta) & MASK64
+    for i, b in enumerate(blob):
+        salted = (
+            b + node.add + ((0x9E3779B97F4A7C15 * i) & MASK64)
+        ) & MASK64
+        h ^= salted
+        h = (h * (node.mul | 1)) & MASK64
+        h = rotl64_ckd(h, (node.rot + i) & 63)
+        h = (h + site_delta) & MASK64
+        h ^= h >> 29
+        h &= MASK64
+    return h
 
 
 def mg_native_seed(region_hash: int, index: int) -> int:
@@ -579,14 +696,42 @@ def seal(path: Path, window: int) -> int:
             binary.put_u64(node.offset + 48, 0)
             sealed_mg += 1
 
-    if sealed_sc or sealed_mg:
+    sealed_ckd = 0
+    for manifest in binary.find_ckd_manifests():
+        for node in manifest.nodes:
+            encoded_off = binary.fileoff_for_addr(node.encoded)
+            code_size_off = binary.fileoff_for_addr(node.code_size)
+            if encoded_off is None or code_size_off is None:
+                continue
+            if node.region_bytes == 0 or node.region_bytes > window:
+                continue
+            code = binary.read_addr(node.site, node.region_bytes)
+            if code is None:
+                continue
+            site_delta = (node.site - node.dispatcher) & MASK64
+            target_delta = (node.target - node.dispatcher) & MASK64
+            encoded = (target_delta + ckd_site_hash(code, site_delta, node)) & MASK64
+            binary.put_u64(encoded_off, encoded)
+            binary.put_u32(code_size_off, node.region_bytes)
+            # Do not rewrite pointer fields in Mach-O manifests: they
+            # participate in dyld chained-fixup metadata on arm64 and zeroing
+            # them can break later GOT binds on the same page.  Scrub only the
+            # scalar hash material needed to recompute the encoded target.
+            for rel in (40, 48, 56):
+                binary.put_u64(node.offset + rel, 0)
+            binary.put_u32(node.offset + 64, 0)
+            binary.put_u32(node.offset + 68, 0)
+            sealed_ckd += 1
+
+    if sealed_sc or sealed_mg or sealed_ckd:
         binary.write()
         resign_macho(binary, path)
     print(
         f"sealed self-check manifests={sealed_sc} "
-        f"mutual-guard nodes={sealed_mg} binary={path}"
+        f"mutual-guard nodes={sealed_mg} "
+        f"caller-keyed-dispatch sites={sealed_ckd} binary={path}"
     )
-    return 0 if sealed_sc or sealed_mg else 1
+    return 0 if sealed_sc or sealed_mg or sealed_ckd else 1
 
 
 def postlink_oracle_findings(binary: Binary) -> list[str]:
@@ -605,6 +750,19 @@ def postlink_oracle_findings(binary: Binary) -> list[str]:
                     f"mutual-guard manifest at file+0x{manifest.offset:x} "
                     f"node={node.index} "
                     "retains seed/expected_hash"
+                )
+    for manifest in binary.find_ckd_manifests(require_patchable=False):
+        for node in manifest.nodes:
+            if (
+                node.salt != 0
+                or node.mul != 0
+                or node.add != 0
+                or node.rot != 0
+                or node.region_bytes != 0
+            ):
+                findings.append(
+                    f"caller-keyed-dispatch manifest at file+0x{manifest.offset:x} "
+                    f"node={node.index} retains dispatch/hash oracle data"
                 )
     return findings
 
@@ -658,6 +816,21 @@ def patch_mutualguard_code(path: Path) -> int:
         print("no mutual-guard manifests to patch", file=sys.stderr)
         return 1
     rc = patch_code_at(binary, manifests[0].nodes[0].target, "mutual-guard")
+    if rc != 0:
+        return rc
+    binary.write()
+    return 0
+
+
+def patch_ckd_code(path: Path) -> int:
+    binary = Binary(path)
+    manifests = binary.find_ckd_manifests(require_patchable=False)
+    if not manifests or not manifests[0].nodes:
+        print("no caller-keyed-dispatch manifests to patch", file=sys.stderr)
+        return 1
+    rc = patch_code_at(
+        binary, manifests[0].nodes[0].site, "caller-keyed-dispatch"
+    )
     if rc != 0:
         return rc
     binary.write()
@@ -737,6 +910,9 @@ def main(argv: list[str]) -> int:
     p_mg_code = sub.add_parser("patch-mutualguard-code")
     p_mg_code.add_argument("binary", type=Path)
 
+    p_ckd_code = sub.add_parser("patch-ckd-code")
+    p_ckd_code.add_argument("binary", type=Path)
+
     p_timing = sub.add_parser("patch-timing")
     p_timing.add_argument("binary", type=Path)
 
@@ -750,6 +926,8 @@ def main(argv: list[str]) -> int:
         return patch_selfcheck_code(args.binary)
     if args.cmd == "patch-mutualguard-code":
         return patch_mutualguard_code(args.binary)
+    if args.cmd == "patch-ckd-code":
+        return patch_ckd_code(args.binary)
     if args.cmd == "patch-timing":
         return patch_timing(args.binary)
     if args.cmd == "assert-no-postlink-oracles":

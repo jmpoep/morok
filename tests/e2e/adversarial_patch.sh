@@ -143,6 +143,10 @@ case "$PATCH_MODE" in
     "$PYTHON" "$TOOL" patch-mutualguard-code "$PATCHED"
     patch_rc="$?"
     ;;
+  ckd-code)
+    "$PYTHON" "$TOOL" patch-ckd-code "$PATCHED"
+    patch_rc="$?"
+    ;;
   timing)
     "$PYTHON" "$TOOL" patch-timing "$PATCHED"
     patch_rc="$?"

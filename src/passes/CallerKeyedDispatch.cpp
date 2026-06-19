@@ -10,13 +10,15 @@
 // site computes the volatile caller-byte hash and then caches the recovered
 // target locally so hot loops do not replay the hash on every iteration.
 //
-// This is an opt-in anti-live-patch/debugger primitive until a post-link
-// byte/RVA manifest exists: the hash is over final in-memory code bytes at
-// runtime, so debugger breakpoints or inline hooks planted after constructors
-// run perturb the dispatch target.  Pre-start static patching still requires a
-// later post-link expected-hash stage, so presets keep CKD disabled.
+// Each routed site also emits a post-link manifest.  The sealer patches the
+// encoded target against final native bytes and marks the site sealed; sealed
+// binaries therefore cannot self-adapt to pre-start static patches, while
+// unsealed dev/test builds still compute their encoded targets in the
+// constructor.
 
 #include "morok/passes/CallerKeyedDispatch.hpp"
+
+#include "morok/passes/CodeRegionKdf.hpp"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Attributes.h"
@@ -52,6 +54,7 @@ using Builder = IRBuilder<NoFolder>;
 
 constexpr std::uint32_t kMaxCallsPerModule = 4096;
 constexpr std::uint32_t kMaxRegionBytes = 32;
+constexpr std::uint64_t kPostlinkMagic = 0xC30D5B11A6E48F27ULL;
 
 struct ArchLayout {
     StringRef dispatcher_asm;
@@ -68,6 +71,7 @@ struct Site {
     BasicBlock *block = nullptr;
     GlobalVariable *encoded = nullptr;
     GlobalVariable *cache = nullptr;
+    GlobalVariable *code_size = nullptr;
     std::uint64_t salt = 0;
     std::uint64_t mul = 0;
     std::uint64_t add = 0;
@@ -221,6 +225,57 @@ GlobalVariable *makeCacheSlot(Module &M) {
     return GV;
 }
 
+GlobalVariable *makeCodeSizeSlot(Module &M) {
+    auto *I32 = Type::getInt32Ty(M.getContext());
+    auto *GV = new GlobalVariable(
+        M, I32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(I32, code_region_kdf::kUnsealedCodeSize),
+        "morok.ckd.code.size");
+    GV->setAlignment(Align(4));
+    appendToCompilerUsed(M, {GV});
+    return GV;
+}
+
+void emitPostlinkManifest(Module &M, Function *Dispatcher,
+                          ArrayRef<Site> Sites,
+                          std::uint32_t RegionBytes) {
+    if (Sites.empty())
+        return;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+
+    auto *RecordTy = StructType::get(
+        Ctx, {Ptr, Ptr, Ptr, Ptr, Ptr, I64, I64, I64, I32, I32});
+    SmallVector<Constant *, 16> Records;
+    Records.reserve(Sites.size());
+    for (const Site &S : Sites) {
+        Records.push_back(ConstantStruct::get(
+            RecordTy,
+            {S.encoded, S.code_size, Dispatcher,
+             BlockAddress::get(S.caller, S.block), S.callee,
+             ConstantInt::get(I64, S.salt), ConstantInt::get(I64, S.mul),
+             ConstantInt::get(I64, S.add), ConstantInt::get(I32, S.rot),
+             ConstantInt::get(I32, RegionBytes)}));
+    }
+
+    auto *RecordsTy = ArrayType::get(RecordTy, Records.size());
+    auto *ManifestTy =
+        StructType::get(Ctx, {I64, I32, I32, RecordsTy});
+    auto *Manifest = new GlobalVariable(
+        M, ManifestTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
+        ConstantStruct::get(
+            ManifestTy,
+            {ConstantInt::get(I64, kPostlinkMagic), ConstantInt::get(I32, 1),
+             ConstantInt::get(I32, Records.size()),
+             ConstantArray::get(RecordsTy, Records)}),
+        "morok.postlink.ckd");
+    Manifest->setAlignment(Align(8));
+    appendToCompilerUsed(M, {Manifest});
+}
+
 Value *emitCarrierDefine(IRBuilder<> &B, Value *Target,
                          const ArchLayout &Layout) {
     auto *FTy = FunctionType::get(Target->getType(), {Target->getType()},
@@ -248,6 +303,8 @@ void emitInit(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
 
     LLVMContext &Ctx = M.getContext();
     auto *Void = Type::getVoidTy(Ctx);
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
     auto *FTy = FunctionType::get(Void, false);
     auto *Init = Function::Create(FTy, GlobalValue::InternalLinkage,
                                   "morok.ckd.init", &M);
@@ -257,11 +314,27 @@ void emitInit(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
     Builder B(BasicBlock::Create(Ctx, "entry", Init));
     Value *Disp = ptrToI64(B, Dispatcher);
     for (const Site &S : Sites) {
+        LoadInst *CodeSize =
+            B.CreateLoad(I32, S.code_size, /*isVolatile=*/true,
+                         "morok.ckd.code.size.load");
+        CodeSize->setAlignment(Align(4));
+        Value *NonZero = B.CreateICmpNE(CodeSize, ConstantInt::get(I32, 0),
+                                        "morok.ckd.code.nz");
+        Value *Sealed = B.CreateICmpNE(
+            CodeSize,
+            ConstantInt::get(I32, code_region_kdf::kUnsealedCodeSize),
+            "morok.ckd.code.sealed");
+        Value *HasCode = B.CreateAnd(NonZero, Sealed, "morok.ckd.code.has");
+        LoadInst *Existing =
+            B.CreateLoad(I64, S.encoded, /*isVolatile=*/true,
+                         "morok.ckd.enc.sealed");
         Value *Target = ptrToI64(B, S.callee);
         Value *Delta = B.CreateSub(Target, Disp, "morok.ckd.target.delta");
         Value *H = emitSiteHash(B, M, Dispatcher, S.caller, S.block, S,
                                 RegionBytes);
-        Value *Encoded = B.CreateAdd(Delta, H, "morok.ckd.target.enc");
+        Value *Computed = B.CreateAdd(Delta, H, "morok.ckd.target.enc");
+        Value *Encoded =
+            B.CreateSelect(HasCode, Existing, Computed, "morok.ckd.target.enc");
         B.CreateStore(Encoded, S.encoded, /*isVolatile=*/true);
     }
     B.CreateRetVoid();
@@ -397,6 +470,7 @@ bool callerKeyedDispatchModule(Module &M,
         S.block = SiteBlock;
         S.encoded = makeEncodedSlot(M, rng);
         S.cache = makeCacheSlot(M);
+        S.code_size = makeCodeSizeSlot(M);
         S.salt = rng.next();
         S.mul = rng.next() | 1ULL;
         S.add = rng.next();
@@ -406,6 +480,7 @@ bool callerKeyedDispatchModule(Module &M,
     if (Sites.empty())
         return false;
 
+    emitPostlinkManifest(M, Dispatcher, Sites, RegionBytes);
     emitInit(M, Dispatcher, Sites, RegionBytes);
     for (const Site &S : Sites)
         rewriteSite(M, Dispatcher, S, *Layout, RegionBytes);

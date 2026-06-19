@@ -14,6 +14,7 @@
 #include "morok/passes/MutualGuardGraph.hpp"
 
 #include "morok/ir/InstUtil.hpp"
+#include "morok/passes/CodeRegionKdf.hpp"
 
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -45,11 +46,6 @@ using Builder = IRBuilder<NoFolder>;
 // Fixed post-link manifest sentinel. Keep this non-printable: readable product
 // markers in emitted binaries become cheap static-analysis anchors.
 constexpr std::uint64_t kPostlinkMagic = 0x8E21B7C4005AF10DULL;
-
-// File-backed nonzero sentinel for post-link native-code window lengths.  Zero
-// initializers can land in BSS/NOBITS and become unpatchable in the final file;
-// the runtime treats both 0 and this sentinel as "unsealed".
-constexpr std::uint32_t kUnsealedCodeSize = 0xFFFFFFFFu;
 
 struct NodeRuntime {
     GlobalVariable *region = nullptr;
@@ -98,36 +94,6 @@ IntegerType *integerCarrierFor(Type *Ty) {
         return IntTy;
     const unsigned Bits = static_cast<unsigned>(Ty->getPrimitiveSizeInBits());
     return IntegerType::get(Ty->getContext(), Bits);
-}
-
-std::uint64_t hashStep(std::uint64_t H, std::uint8_t B) {
-    H ^= static_cast<std::uint64_t>(B);
-    H *= 0xff51afd7ed558ccdULL;
-    H ^= H >> 32;
-    H *= 0xc4ceb9fe1a85ec53ULL;
-    H ^= H >> 29;
-    return H;
-}
-
-std::uint64_t hashBytes(ArrayRef<std::uint8_t> Bytes, std::uint64_t Seed) {
-    std::uint64_t H = Seed;
-    for (std::uint8_t B : Bytes)
-        H = hashStep(H, B);
-    return H;
-}
-
-Value *emitHashStep(Builder &B, Value *H, Value *Byte) {
-    auto *I64 = B.getInt64Ty();
-    Value *Wide = B.CreateZExt(Byte, I64, "morok.mg.hash.byte");
-    Value *X = B.CreateXor(H, Wide, "morok.mg.hash.mix");
-    X = B.CreateMul(X, ConstantInt::get(I64, 0xff51afd7ed558ccdULL),
-                    "morok.mg.hash.mix");
-    X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I64, 32)),
-                    "morok.mg.hash.mix");
-    X = B.CreateMul(X, ConstantInt::get(I64, 0xc4ceb9fe1a85ec53ULL),
-                    "morok.mg.hash.mix");
-    return B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I64, 29)),
-                       "morok.mg.hash.mix");
 }
 
 Value *rotl64(Builder &B, Value *V, unsigned Amount, const Twine &Name) {
@@ -236,7 +202,7 @@ GlobalVariable *createCodeSize(Module &M, StringRef Suffix,
     auto *I32 = Type::getInt32Ty(M.getContext());
     auto *CodeSize = new GlobalVariable(
         M, I32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
-        ConstantInt::get(I32, kUnsealedCodeSize),
+        ConstantInt::get(I32, code_region_kdf::kUnsealedCodeSize),
         (Twine("morok.mg.code.size.") + Suffix + "." + Twine(Index)).str());
     CodeSize->setAlignment(Align(4));
     return CodeSize;
@@ -260,15 +226,6 @@ Value *regionPtr(Builder &B, GlobalVariable *Region, Value *Idx) {
     auto *ArrTy = cast<ArrayType>(Region->getValueType());
     return B.CreateInBoundsGEP(ArrTy, Region, {ConstantInt::get(I32, 0), Idx},
                                "morok.mg.region.ptr");
-}
-
-Value *codePtr(Builder &B, Function *Target, Value *Idx) {
-    auto *I64 = B.getInt64Ty();
-    Value *Base = B.CreatePtrToInt(Target, I64, "morok.mg.code.base");
-    Value *Offset = B.CreateZExt(Idx, I64, "morok.mg.code.offset");
-    Value *Addr = B.CreateAdd(Base, Offset, "morok.mg.code.addr");
-    return B.CreateIntToPtr(Addr, PointerType::getUnqual(B.getContext()),
-                            "morok.mg.code.ptr");
 }
 
 Value *nativeHashSeed(Builder &B, Value *RegionHash,
@@ -326,7 +283,8 @@ Value *emitCoveredRegionCheck(Module &M, Function *Fn, Function *Target,
                                "morok.mg.region.byte");
     Byte->setVolatile(true);
     Byte->setAlignment(Align(1));
-    Value *NextH = emitHashStep(LB, H, Byte);
+    Value *NextH = code_region_kdf::emitHashStep(LB, H, Byte,
+                                                 "morok.mg.hash");
     Value *NextI =
         LB.CreateAdd(I, ConstantInt::get(I32, 1), "morok.mg.hash.next");
     I->addIncoming(NextI, Loop);
@@ -336,41 +294,15 @@ Value *emitCoveredRegionCheck(Module &M, Function *Fn, Function *Target,
     LB.CreateCondBr(Done, CodeCheck, Loop);
 
     Builder CB(CodeCheck);
-    auto *CodeSizeLoad =
-        CB.CreateLoad(I32, Covered.code_size, "morok.mg.code.size.load");
-    CodeSizeLoad->setVolatile(true);
-    CodeSizeLoad->setAlignment(Align(4));
-    Value *NonZero = CB.CreateICmpNE(CodeSizeLoad, ConstantInt::get(I32, 0),
-                                     "morok.mg.code.nz");
-    Value *Sealed =
-        CB.CreateICmpNE(CodeSizeLoad, ConstantInt::get(I32, kUnsealedCodeSize),
-                        "morok.mg.code.sealed");
-    Value *HasCode = CB.CreateAnd(NonZero, Sealed, "morok.mg.code.has");
     Value *CodeSeed = nativeHashSeed(CB, NextH, RegionIndex);
-    CB.CreateCondBr(HasCode, CodeLoop, Exit);
-
-    Builder KB(CodeLoop);
-    PHINode *CI = KB.CreatePHI(I32, 2, "morok.mg.code.i");
-    PHINode *CH = KB.CreatePHI(I64, 2, "morok.mg.code.hash");
-    CI->addIncoming(ConstantInt::get(I32, 0), CodeCheck);
-    CH->addIncoming(CodeSeed, CodeCheck);
-    auto *CodeByte =
-        KB.CreateLoad(I8, codePtr(KB, Target, CI), "morok.mg.code.byte");
-    CodeByte->setVolatile(true);
-    CodeByte->setAlignment(Align(1));
-    Value *NextCH = emitHashStep(KB, CH, CodeByte);
-    Value *NextCI =
-        KB.CreateAdd(CI, ConstantInt::get(I32, 1), "morok.mg.code.next");
-    CI->addIncoming(NextCI, CodeLoop);
-    CH->addIncoming(NextCH, CodeLoop);
-    Value *CodeDone =
-        KB.CreateICmpEQ(NextCI, CodeSizeLoad, "morok.mg.code.done");
-    KB.CreateCondBr(CodeDone, Exit, CodeLoop);
+    code_region_kdf::SealedCodeHash CodeHash =
+        code_region_kdf::emitSealedCodeHash(
+            CB, CodeCheck, CodeLoop, Exit, Target, Covered.code_size, CodeSeed,
+            ConstantInt::get(I64, 0), "morok.mg", "morok.mg.code.final");
 
     Builder XB(Exit);
-    PHINode *NativeH = XB.CreatePHI(I64, 2, "morok.mg.code.final");
-    NativeH->addIncoming(ConstantInt::get(I64, 0), CodeCheck);
-    NativeH->addIncoming(NextCH, CodeLoop);
+    PHINode *NativeH = CodeHash.final_hash;
+    Value *HasCode = CodeHash.has_code;
     Value *OwnLoaded = volatileExpectedLoad(XB, Covered.expected,
                                             Peer ? "morok.mg.peer.expected.load"
                                                  : "morok.mg.expected.load");
@@ -526,7 +458,7 @@ GraphRuntime createGraph(Function &F, const MutualGuardGraphParams &Params,
         NodeRuntime Node;
         Node.seed = Rng.next();
         std::vector<std::uint8_t> Bytes = randomRegion(RegionSize, Rng);
-        Node.expected_hash = hashBytes(
+        Node.expected_hash = code_region_kdf::hashBytes(
             ArrayRef<std::uint8_t>(Bytes.data(), Bytes.size()), Node.seed);
         Node.region = createRegion(
             M, Suffix, I, ArrayRef<std::uint8_t>(Bytes.data(), Bytes.size()));

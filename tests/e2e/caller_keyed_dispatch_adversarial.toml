@@ -1,0 +1,10 @@
+# Adversarial caller-keyed-dispatch binary-patching e2e config.
+
+[global]
+preset = "none"
+
+[passes.caller_keyed_dispatch]
+enabled = true
+probability = 100
+max_calls = 8
+region_bytes = 16

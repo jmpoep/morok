@@ -22,6 +22,7 @@ add_library(morok_passes STATIC
   ExternalOpaquePredicates.cpp
   ExternalSecretBinding.cpp
   CoherentDecoys.cpp
+  CodeRegionKdf.cpp
   DataFlowIntegrity.cpp
   BogusControlFlow.cpp
   Flattening.cpp

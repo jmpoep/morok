@@ -667,12 +667,10 @@ PassConfig makeHigh() {
     c.microcode_stress.decoy_blocks = 4;
     c.microcode_stress.alias_stores = 1;
 
-    // CKD hashes live call-site bytes and is useful as an opt-in
-    // anti-live-patch/debugger primitive, but without a post-link expected hash
-    // it self-seals pre-start static patches.  Keep it out of presets that imply
-    // final-binary static tamper resistance until the sealer is wired, but keep
-    // the normal tuning so sparse TOML opt-in does not inherit zeroed knobs.
-    c.caller_keyed_dispatch.enabled = false;
+    // CKD now emits post-link manifests so sealed high/max binaries cannot
+    // self-adapt to pre-start static patches; unsealed dev builds still use the
+    // constructor fallback for normal differential testing.
+    c.caller_keyed_dispatch.enabled = true;
     c.caller_keyed_dispatch.probability = 100;
     c.caller_keyed_dispatch.max_calls = 4096;
     c.caller_keyed_dispatch.region_bytes = 16;
@@ -909,9 +907,9 @@ PassConfig makeMax() {
     c.microcode_stress.decoy_blocks = 8;
     c.microcode_stress.alias_stores = 2;
 
-    // See makeHigh(): CKD remains manual opt-in until it has a post-link
-    // immutable expected hash.
-    c.caller_keyed_dispatch.enabled = false;
+    // See makeHigh(): CKD uses post-link manifests for sealed release builds
+    // while preserving constructor fallback behavior for unsealed tests.
+    c.caller_keyed_dispatch.enabled = true;
     c.caller_keyed_dispatch.probability = 100;
     c.caller_keyed_dispatch.max_calls = 4096;
     c.caller_keyed_dispatch.region_bytes = 16;

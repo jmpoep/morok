@@ -347,7 +347,7 @@ TEST_CASE("high preset matches the documented table") {
     CHECK(c.microcode_stress.table_entries == 16u);
     CHECK(c.microcode_stress.decoy_blocks == 4u);
     CHECK(c.microcode_stress.alias_stores == 1u);
-    CHECK(c.caller_keyed_dispatch.enabled == false);
+    CHECK(c.caller_keyed_dispatch.enabled == true);
     CHECK(c.caller_keyed_dispatch.probability == 100u);
     CHECK(c.caller_keyed_dispatch.max_calls == 4096u);
     CHECK(c.caller_keyed_dispatch.region_bytes == 16u);
@@ -408,7 +408,7 @@ TEST_CASE("max preset enables every pass at full intensity") {
     CHECK(c.trace_keying.enabled == true);
     CHECK(c.dispatcherless.enabled == true);
     CHECK(c.microcode_stress.enabled == true);
-    CHECK(c.caller_keyed_dispatch.enabled == false);
+    CHECK(c.caller_keyed_dispatch.enabled == true);
     CHECK(c.vec.enabled == true);
     CHECK(c.csm.enabled == true);
     CHECK(c.flatten.enabled == true);
