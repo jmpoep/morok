@@ -623,7 +623,11 @@ GlobalVariable *createTable(Module &M, Function &F, const TableOpSpec &Op,
         M, TableTy, /*isConstant=*/true, GlobalValue::PrivateLinkage, Init,
         (Twine("morok.dfi.table.") + suffixFor(F)).str());
     Table->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
-    Table->setAlignment(Align(1));
+    // Align the table to its element size: emitLookup() loads each cell with
+    // Align(ElementBits/8), and an i16 table's Align(2) load is a false promise
+    // unless the global is actually 2-byte aligned — otherwise the under-aligned
+    // global is UB (traps on strict-alignment targets, miscompiles elsewhere).
+    Table->setAlignment(Align(ElementBits / 8u));
     return Table;
 }
 

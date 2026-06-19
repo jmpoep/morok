@@ -5505,6 +5505,47 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+// Regression for #33: wide (i9..i16) const-indexed arithmetic uses i16 table
+// cells, and emitLookup() loads them with Align(2).  The table global must be
+// at least 2-byte aligned for that to be a valid promise; the old fixed Align(1)
+// under-aligned the global (UB: a trap on strict-alignment targets, or a
+// codegen miscompile elsewhere).
+TEST_CASE("dataFlowIntegrityFunction aligns i16 tables to their element size") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i16 @dfi_wide(i16 %a) {
+entry:
+  %y = add i16 %a, 1234
+  ret i16 %y
+}
+)ir");
+    Function *F = M->getFunction("dfi_wide");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(3301);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::dataFlowIntegrityFunction(
+        *F, {/*probability=*/100, /*max_tables=*/1, /*region_bytes=*/32}, rng));
+
+    GlobalVariable *Table = nullptr;
+    for (GlobalVariable &GV : M->globals())
+        if (GV.getName().starts_with("morok.dfi.table"))
+            Table = &GV;
+    REQUIRE(Table);
+    auto *ElemTy = cast<IntegerType>(
+        cast<ArrayType>(Table->getValueType())->getElementType());
+    REQUIRE(ElemTy->getBitWidth() == 16u);
+
+    // The table's alignment covers (is not smaller than) every cell load's
+    // promised alignment.
+    const std::uint64_t TableAlign = Table->getAlign().valueOrOne().value();
+    CHECK(TableAlign >= 2u);
+    for (Instruction &I : instructions(*F))
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+            if (LI->getName().starts_with("morok.dfi.encoded"))
+                CHECK(LI->getAlign().value() <= TableAlign);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("dataFlowIntegrityFunction supports narrow comparisons") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
