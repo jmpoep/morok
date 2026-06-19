@@ -11624,6 +11624,31 @@ define i32 @caller() {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("functionCallObfuscateModule rejects Windows PE forwarder exports") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-pc-windows-msvc"
+declare i32 @CreateFileW(ptr, i32, i32, ptr, i32, i32, ptr)
+define i32 @caller() {
+entry:
+  %r = call i32 @CreateFileW(ptr null, i32 0, i32 0, ptr null, i32 3, i32 0, ptr null)
+  ret i32 %r
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(278);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::functionCallObfuscateModule(*M, {/*prob=*/100}, rng));
+
+    Function *Resolve = M->getFunction("morok.win.pe.resolve");
+    REQUIRE(Resolve != nullptr);
+    CHECK(countNamedInstructions(*Resolve, "morok.win.pe.export.size") >= 1u);
+    CHECK(countNamedInstructions(*Resolve, "morok.win.pe.export.nonempty") >=
+          1u);
+    CHECK(countNamedInstructions(*Resolve, "morok.win.pe.forwarder") >= 1u);
+    CHECK(countNamedInstructions(*Resolve, "morok.win.pe.func.safe") >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("functionCallObfuscateModule redirects an external invoke via dlsym") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

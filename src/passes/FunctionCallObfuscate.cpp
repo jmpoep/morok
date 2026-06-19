@@ -371,11 +371,18 @@ Function *windowsPeExportResolver(Module &M) {
     Value *Magic = loadAt(HB, M, I16, NtPtr, 24, "morok.win.pe.opt.magic");
     Value *ExportRva =
         loadAt(HB, M, I32, NtPtr, 24 + 112, "morok.win.pe.export.rva");
+    Value *ExportSize =
+        loadAt(HB, M, I32, NtPtr, 24 + 116, "morok.win.pe.export.size");
     HB.CreateCondBr(
         HB.CreateAnd(
             HB.CreateICmpEQ(Sig, ConstantInt::get(I32, 0x4550)),
             HB.CreateAnd(HB.CreateICmpEQ(Magic, ConstantInt::get(I16, 0x20b)),
-                         HB.CreateICmpNE(ExportRva, ConstantInt::get(I32, 0)),
+                         HB.CreateAnd(HB.CreateICmpNE(ExportRva,
+                                                      ConstantInt::get(I32, 0)),
+                                      HB.CreateICmpNE(
+                                          ExportSize,
+                                          ConstantInt::get(I32, 0)),
+                                      "morok.win.pe.export.nonempty"),
                          "morok.win.pe.export.present"),
             "morok.win.pe.headers.ok"),
         Dir, Ret0);
@@ -440,8 +447,14 @@ Function *windowsPeExportResolver(Module &M) {
                MB.CreateMul(MB.CreateZExt(Ord, IP), ConstantInt::get(IP, 4),
                             "morok.win.pe.func.slot"),
                "morok.win.pe.func.rva");
-    MB.CreateRet(MB.CreateAdd(Base, MB.CreateZExt(FuncRva, IP),
-                              "morok.win.pe.func.addr"));
+    Value *ForwarderOff = MB.CreateSub(FuncRva, ExportRva,
+                                       "morok.win.pe.forwarder.off");
+    Value *IsForwarder =
+        MB.CreateICmpULT(ForwarderOff, ExportSize, "morok.win.pe.forwarder");
+    Value *FuncAddr = MB.CreateAdd(Base, MB.CreateZExt(FuncRva, IP),
+                                   "morok.win.pe.func.addr");
+    MB.CreateRet(MB.CreateSelect(IsForwarder, ConstantInt::get(IP, 0),
+                                 FuncAddr, "morok.win.pe.func.safe"));
 
     IRBuilder<> NB(Next);
     Value *NextIdx =
