@@ -12104,11 +12104,9 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
     IRBuilder<> DB(dlsymBB);
     // The probed symbol is cloaked inline — never a readable "MSHookFunction".
     Value *sym = ir::emitCloakedSymbol(DB, M, "MSHookFunction", rng);
-    // RTLD_DEFAULT == (void*)-2; build it at pointer width so inttoptr does not
-    // zero-extend a 32-bit value into the wrong handle.
-    auto *i64 = Type::getInt64Ty(ctx);
-    Value *rtldDefault =
-        DB.CreateIntToPtr(ConstantInt::getSigned(i64, -2), ptr);
+    // glibc RTLD_DEFAULT is (void *)0.  Darwin's (void *)-2 value never reaches
+    // this Linux-only block.
+    Value *rtldDefault = ConstantPointerNull::get(ptr);
     Value *found = DB.CreateCall(dlsym, {rtldDefault, sym});
     Value *dynHooked =
         DB.CreateICmpNE(found, ConstantPointerNull::get(ptr));

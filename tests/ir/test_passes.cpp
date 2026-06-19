@@ -11435,8 +11435,18 @@ entry:
     Function *Work = M->getFunction("work");
     REQUIRE(Work != nullptr);
     bool hasGuardedDlsymBlock = false;
+    std::size_t dlsymCalls = 0;
+    bool dlsymUsesLinuxRtldDefault = false;
     for (BasicBlock &BB : *Ctor)
         hasGuardedDlsymBlock |= BB.getName() == "morok.antihook.dlsym";
+    for (Instruction &I : instructions(*Ctor)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || CB->getCalledFunction() != M->getFunction("dlsym"))
+            continue;
+        ++dlsymCalls;
+        dlsymUsesLinuxRtldDefault =
+            isa<ConstantPointerNull>(CB->getArgOperand(0));
+    }
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.mac.targets", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.schro.page", true) != nullptr);
@@ -11445,6 +11455,8 @@ entry:
           nullptr);
     CHECK(Dynamic->hasExternalWeakLinkage());
     CHECK(hasGuardedDlsymBlock);
+    CHECK(dlsymCalls == 1u);
+    CHECK(dlsymUsesLinuxRtldDefault);
     CHECK(hasInlineAsmCall(*Clean));
     CHECK(hasInlineAsmCall(*Got));
     CHECK(hasInlineAsmCall(*Maps));
