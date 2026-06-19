@@ -68,12 +68,17 @@ bool liftable(BinaryOperator *bo) {
     // Fast-math flags are copied onto the lifted vector op, so the real lane
     // computes the identical flagged result; any junk lane that violates a
     // flag merely poisons that (unused) lane.
+    //
+    // FDiv/FRem are deliberately excluded: unlike poison in an unused integer
+    // lane, the hardware still *executes* the divide on the junk lanes, whose
+    // denominator can be exactly 0.0 (junkScalar emits 0..255).  That raises
+    // FE_DIVBYZERO/FE_INVALID in the shared fenv and SIGFPE if the protected
+    // program enabled FP traps — a side effect the scalar op never had.  Bounded
+    // finite junk through FAdd/FSub/FMul cannot trap, so those stay eligible.
     switch (bo->getOpcode()) {
     case Instruction::FAdd:
     case Instruction::FSub:
     case Instruction::FMul:
-    case Instruction::FDiv:
-    case Instruction::FRem:
         return true;
     default:
         return false;

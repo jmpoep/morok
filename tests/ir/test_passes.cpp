@@ -4887,6 +4887,55 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+// Regression for #29: lifting a scalar fdiv/frem to a vector op makes the
+// hardware execute the divide over junk lanes whose denominator can be exactly
+// 0.0, raising FE_DIVBYZERO/FE_INVALID (and SIGFPE under enabled FP traps) — a
+// side effect the scalar op never had.  fdiv/frem must stay scalar; FAdd/FMul
+// over bounded finite junk cannot trap and are still lifted.
+TEST_CASE("vectorObfuscateFunction does not lift trapping fdiv/frem") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define float @vecdiv(float %a, float %b) {
+entry:
+  %sum = fadd float %a, %b
+  %q = fdiv float %sum, %b
+  %r = frem float %q, %a
+  ret float %r
+}
+)ir");
+    Function *F = M->getFunction("vecdiv");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(2901);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::vectorObfuscateFunction(
+        *F,
+        {/*probability=*/100, /*width=*/128, /*shuffle=*/true,
+         /*lift_comparisons=*/true},
+        rng));
+
+    bool liftedFAdd = false;
+    bool vectorDivOrRem = false;
+    bool scalarDivOrRem = false;
+    for (Instruction &I : instructions(*F)) {
+        auto *BO = dyn_cast<BinaryOperator>(&I);
+        if (!BO)
+            continue;
+        const unsigned Op = BO->getOpcode();
+        if (Op == Instruction::FAdd && BO->getType()->isVectorTy())
+            liftedFAdd = true;
+        if (Op == Instruction::FDiv || Op == Instruction::FRem) {
+            if (BO->getType()->isVectorTy())
+                vectorDivOrRem = true;
+            else
+                scalarDivOrRem = true;
+        }
+    }
+    CHECK(liftedFAdd);          // pass fired on the safe op
+    CHECK_FALSE(vectorDivOrRem); // fdiv/frem never executed across junk lanes
+    CHECK(scalarDivOrRem);       // they remain as the original scalar ops
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("vectorObfuscateFunction lifts fast-math floating ops and compares") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
