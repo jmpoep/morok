@@ -13171,11 +13171,13 @@ define i32 @main() { ret i32 0 }
     Function *PatchRet = M->getFunction("morok.win.attach.patch.ret");
     Function *PatchRemote = M->getFunction("morok.win.attach.patch.remote");
     Function *Invalid = M->getFunction("morok.win.attach.invalid");
+    Function *Resolve = M->getFunction("morok.win.pe.resolve");
     REQUIRE(Ctor != nullptr);
     REQUIRE(Probe != nullptr);
     REQUIRE(PatchRet != nullptr);
     REQUIRE(PatchRemote != nullptr);
     REQUIRE(Invalid != nullptr);
+    REQUIRE(Resolve != nullptr);
     CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
     CHECK(M->getFunction("DbgUiRemoteBreakin") == nullptr);
     CHECK(M->getFunction("DbgBreakPoint") == nullptr);
@@ -13187,6 +13189,23 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.dbg.breakpoint") >=
           1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.ntprotect") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.attach.kernelbase") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.kernelbase.exitprocess") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.kernel32.exitprocess") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.kernelbase.closehandle") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.kernel32.closehandle") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.attach.exitprocess") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.attach.closehandle") >=
+          1u);
     CHECK(countNamedInstructions(*Probe,
                                  "morok.win.attach.patch.remote.status") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.patch.ret.status") >=
@@ -13200,6 +13219,11 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*PatchRemote,
                                  "morok.win.attach.patch.remote.protect") >=
           1u);
+    CHECK(countNamedInstructions(*Resolve, "morok.win.pe.export.size") >= 1u);
+    CHECK(countNamedInstructions(*Resolve, "morok.win.pe.export.nonempty") >=
+          1u);
+    CHECK(countNamedInstructions(*Resolve, "morok.win.pe.forwarder") >= 1u);
+    CHECK(countNamedInstructions(*Resolve, "morok.win.pe.func.safe") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

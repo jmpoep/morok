@@ -8604,10 +8604,18 @@ Function *windowsPeExportResolver(Module &M) {
                                         "morok.win.pe.datadir.off");
     Value *exportRva = loadAt(HB, M, i32, ntPtr, dataDirOff,
                               "morok.win.pe.export.rva");
+    Value *exportSizeOff =
+        HB.CreateAdd(dataDirOff, ConstantInt::get(ip, 4),
+                     "morok.win.pe.export.size.off");
+    Value *exportSize =
+        loadAt(HB, M, i32, ntPtr, exportSizeOff, "morok.win.pe.export.size");
     Value *headersOk = HB.CreateAnd(
         HB.CreateICmpEQ(sig, ConstantInt::get(i32, 0x4550)),
         HB.CreateAnd(HB.CreateOr(isPe32, isPe64),
-                     HB.CreateICmpNE(exportRva, ConstantInt::get(i32, 0))),
+                     HB.CreateAnd(
+                         HB.CreateICmpNE(exportRva, ConstantInt::get(i32, 0)),
+                         HB.CreateICmpNE(exportSize, ConstantInt::get(i32, 0)),
+                         "morok.win.pe.export.nonempty")),
         "morok.win.pe.headers.ok");
     HB.CreateCondBr(headersOk, loopBB, ret0BB);
 
@@ -8665,8 +8673,14 @@ Function *windowsPeExportResolver(Module &M) {
         MB.CreateMul(MB.CreateZExt(ord, ip), ConstantInt::get(ip, 4),
                      "morok.win.pe.func.slot"),
         "morok.win.pe.func.rva");
-    MB.CreateRet(MB.CreateAdd(base, MB.CreateZExt(funcRva, ip),
-                              "morok.win.pe.func.addr"));
+    Value *forwarderOff =
+        MB.CreateSub(funcRva, exportRva, "morok.win.pe.forwarder.off");
+    Value *isForwarder =
+        MB.CreateICmpULT(forwarderOff, exportSize, "morok.win.pe.forwarder");
+    Value *funcAddr = MB.CreateAdd(base, MB.CreateZExt(funcRva, ip),
+                                   "morok.win.pe.func.addr");
+    MB.CreateRet(MB.CreateSelect(isForwarder, ConstantInt::get(ip, 0),
+                                 funcAddr, "morok.win.pe.func.safe"));
 
     IRBuilder<> NB(nextBB);
     Value *nextIdx =
@@ -11047,6 +11061,10 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
         moduleByHash,
         {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("kernel32.dll"))},
         "morok.win.attach.kernel32");
+    Value *kernelbase = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("kernelbase.dll"))},
+        "morok.win.attach.kernelbase");
     Value *remoteBreakin = RB.CreateCall(
         resolver,
         {ntdll, ConstantInt::get(i64, fnv1aName("DbgUiRemoteBreakin"))},
@@ -11061,11 +11079,29 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
     Value *ntClose = RB.CreateCall(
         resolver, {ntdll, ConstantInt::get(i64, fnv1aName("NtClose"))},
         "morok.win.attach.ntclose");
-    Value *exitProcess = RB.CreateCall(
+    Value *kernelbaseExitProcess = RB.CreateCall(
+        resolver,
+        {kernelbase, ConstantInt::get(i64, fnv1aName("ExitProcess"))},
+        "morok.win.attach.kernelbase.exitprocess");
+    Value *kernel32ExitProcess = RB.CreateCall(
         resolver, {kernel32, ConstantInt::get(i64, fnv1aName("ExitProcess"))},
+        "morok.win.attach.kernel32.exitprocess");
+    Value *exitProcess = RB.CreateSelect(
+        RB.CreateICmpNE(kernelbaseExitProcess, ConstantInt::get(ip, 0),
+                        "morok.win.attach.kernelbase.exitprocess.ready"),
+        kernelbaseExitProcess, kernel32ExitProcess,
         "morok.win.attach.exitprocess");
-    Value *closeHandle = RB.CreateCall(
+    Value *kernelbaseCloseHandle = RB.CreateCall(
+        resolver,
+        {kernelbase, ConstantInt::get(i64, fnv1aName("CloseHandle"))},
+        "morok.win.attach.kernelbase.closehandle");
+    Value *kernel32CloseHandle = RB.CreateCall(
         resolver, {kernel32, ConstantInt::get(i64, fnv1aName("CloseHandle"))},
+        "morok.win.attach.kernel32.closehandle");
+    Value *closeHandle = RB.CreateSelect(
+        RB.CreateICmpNE(kernelbaseCloseHandle, ConstantInt::get(ip, 0),
+                        "morok.win.attach.kernelbase.closehandle.ready"),
+        kernelbaseCloseHandle, kernel32CloseHandle,
         "morok.win.attach.closehandle");
     foldState(RB, State, remoteBreakin, rng.next(),
               "morok.win.attach.remote.breakin.mix");
