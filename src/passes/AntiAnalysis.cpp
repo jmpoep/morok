@@ -5277,8 +5277,27 @@ Function *darwinAntiDumpProbe(Module &M, const Triple &TT) {
     Value *magic = loadAt(B, M, i32, hdr, 0ULL, "morok.antidump.macho.magic.v");
     Value *ncmds = loadAt(B, M, i32, hdr, 16, "morok.antidump.macho.ncmds");
     Value *page = pageBase(B, M, hdrAddr, pageSize, "morok.antidump.macho.page");
+    // The load commands (and the section_64 records this probe poisons) live in
+    // [hdr + sizeof(mach_header_64), + sizeofcmds), which can extend well past
+    // the first page on real binaries with many sections.  Make the whole
+    // page-rounded range writable, not just one page, or the volatile name
+    // stores fault (SIGSEGV) on the still-RX later __TEXT pages.  Clamp
+    // sizeofcmds so a non-Mach-O / garbage header (validated only AFTER this
+    // mprotect) cannot request an absurd length.
+    Value *sizeofcmds =
+        loadAt(B, M, i32, hdr, 20, "morok.antidump.macho.sizeofcmds");
+    Value *cmds = B.CreateZExt(sizeofcmds, ip);
+    Value *cmdsClamped = B.CreateSelect(
+        B.CreateICmpULT(cmds, ConstantInt::get(ip, 0x100000)), cmds,
+        ConstantInt::get(ip, 0x100000), "morok.antidump.macho.cmds.clamped");
+    Value *span = B.CreateAdd(
+        B.CreateAdd(B.CreateSub(hdrAddr, page), ConstantInt::get(ip, 32)),
+        cmdsClamped, "morok.antidump.macho.span");
+    Value *pm1 = B.CreateSub(pageSize, ConstantInt::get(ip, 1));
+    Value *protLen = B.CreateAnd(B.CreateAdd(span, pm1), B.CreateNot(pm1),
+                                 "morok.antidump.macho.protlen");
     Value *rwRc =
-        emitDarwinMprotect(B, M, TT, page, pageSize, ConstantInt::get(ip, 3));
+        emitDarwinMprotect(B, M, TT, page, protLen, ConstantInt::get(ip, 3));
     rwRc->setName("morok.antidump.macho.mprotect.rw");
     Value *valid =
         B.CreateAnd(B.CreateICmpNE(hdr, ConstantPointerNull::get(ptr)),
@@ -5359,7 +5378,7 @@ Function *darwinAntiDumpProbe(Module &M, const Triple &TT) {
     flagsStore->setVolatile(true);
     flagsStore->setAlignment(Align(1));
     Value *rxRc =
-        emitDarwinMprotect(RSB, M, TT, page, pageSize, ConstantInt::get(ip, 5));
+        emitDarwinMprotect(RSB, M, TT, page, protLen, ConstantInt::get(ip, 5));
     rxRc->setName("morok.antidump.macho.mprotect.rx");
     incrementDiff(RSB, diff,
                   RSB.CreateICmpSLT(rxRc, ConstantInt::getSigned(i32, 0)),

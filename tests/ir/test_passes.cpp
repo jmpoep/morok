@@ -12367,6 +12367,13 @@ entry:
     CHECK(countNamedInstructions(*AntiDump,
                                  "morok.antidump.guard.macho.mprotect.none") >=
           1u);
+    // Regression for #68: the writable range must cover the whole load-command
+    // area (mach_header_64 + sizeofcmds), page-rounded, not just the header
+    // page, or poisoning a section name on a later __TEXT page faults (SIGSEGV).
+    CHECK(countNamedInstructions(*AntiDump,
+                                 "morok.antidump.macho.sizeofcmds") >= 1u);
+    CHECK(countNamedInstructions(*AntiDump, "morok.antidump.macho.protlen") >=
+          1u);
     CHECK(countNamedInstructions(*NegativeTiming,
                                  "morok.negative.timing.slow") >= 1u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
