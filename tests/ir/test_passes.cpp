@@ -15851,9 +15851,11 @@ define i32 @main() { ret i32 0 }
     Function *Oracle = M->getFunction("morok.timing.oracle");
     REQUIRE(Oracle != nullptr);
     CHECK(M->getGlobalVariable("morok.timing.state", true) != nullptr);
-    checkSealEnforcement(*M, *Oracle);
+    checkNoSealEnforcement(*Oracle);
     CHECK(M->getFunction("morok.timing") != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
+    CHECK(countNamedInstructions(*Oracle, "morok.timing.bad.distribution") >=
+          1u);
     // The x86 timestamp read lives in a CPUID-gated helper (rdtscp + rdtsc
     // fallback); the probe calls it rather than inlining the asm.
     Function *Tsc = M->getFunction("morok.timing.tsc.read");
@@ -15916,9 +15918,11 @@ define i32 @main() { ret i32 0 }
     Function *Oracle = M->getFunction("morok.timing.oracle");
     REQUIRE(Oracle != nullptr);
     CHECK(M->getGlobalVariable("morok.timing.state", true) != nullptr);
-    checkSealEnforcement(*M, *Oracle);
+    checkNoSealEnforcement(*Oracle);
     CHECK(M->getFunction("mach_absolute_time") != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
+    CHECK(countNamedInstructions(*Oracle, "morok.timing.bad.distribution") >=
+          1u);
     CHECK_FALSE(hasInlineAsmCall(*Oracle));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
@@ -16231,7 +16235,7 @@ entry:
     REQUIRE(Ctor != nullptr);
     REQUIRE(Oracle != nullptr);
     CHECK(M->getGlobalVariable("morok.cachetime.state", true) != nullptr);
-    checkSealEnforcement(*M, *Oracle);
+    checkNoSealEnforcement(*Oracle);
     CHECK(M->getFunction("clock_gettime") != nullptr);
     // The x86 timestamp read is in the CPUID-gated helper the oracle calls.
     {
@@ -16242,6 +16246,8 @@ entry:
     CHECK(countNamedInstructions(*Oracle, "morok.cachetime.byte") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.cachetime.target.idx") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.cachetime.primary.delta") >=
+          1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.cachetime.bad.distribution") >=
           1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
@@ -16295,12 +16301,14 @@ entry:
 
     Function *Oracle = M->getFunction("morok.cachetime.oracle");
     REQUIRE(Oracle != nullptr);
-    checkSealEnforcement(*M, *Oracle);
+    checkNoSealEnforcement(*Oracle);
     CHECK(M->getFunction("mach_absolute_time") != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
     CHECK_FALSE(hasInlineAsmCall(*Oracle));
     CHECK(countNamedInstructions(*Oracle, "morok.cachetime.sample.slow") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.cachetime.byte") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.cachetime.bad.distribution") >=
+          1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -16320,7 +16328,7 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Ctor != nullptr);
     REQUIRE(Oracle != nullptr);
     CHECK(M->getGlobalVariable("morok.microcanary.state", true) != nullptr);
-    checkSealEnforcement(*M, *Oracle);
+    checkNoSealEnforcement(*Oracle);
     CHECK(M->getGlobalVariable("morok.microcanary.line", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.microcanary.evict", true) != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
@@ -16334,6 +16342,8 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Oracle, "morok.microcanary.spec.byte") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.microcanary.measure.byte") >=
           1u);
+    CHECK(countNamedInstructions(*Oracle,
+                                 "morok.microcanary.bad.distribution") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -16350,12 +16360,14 @@ define i32 @main() { ret i32 0 }
 
     Function *Oracle = M->getFunction("morok.microcanary.oracle");
     REQUIRE(Oracle != nullptr);
-    checkSealEnforcement(*M, *Oracle);
+    checkNoSealEnforcement(*Oracle);
     CHECK(M->getFunction("mach_absolute_time") != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
     CHECK_FALSE(hasInlineAsmCall(*Oracle));
     CHECK(countNamedInstructions(*Oracle, "morok.microcanary.sample.slow") >=
           1u);
+    CHECK(countNamedInstructions(*Oracle,
+                                 "morok.microcanary.bad.distribution") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.microcanary.evict.byte") >=
           1u);
     CHECK_FALSE(verifyModule(*M, &errs()));

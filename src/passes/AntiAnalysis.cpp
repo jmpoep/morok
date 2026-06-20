@@ -6584,10 +6584,11 @@ Function *timingOracleProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
     Value *divergentDistribution = B.CreateICmpUGE(
         divergentSamples, ConstantInt::get(i32, 2),
         "morok.timing.divergent.distribution");
-    foldEnforcedFlag(B, State, badDistribution, 0xA331D8B47E1C5905ULL,
-                     "morok.timing.bad.distribution");
-    foldEnforcedFlag(B, State, divergentDistribution, 0x5E74B29D13C8A60BULL,
-                     "morok.timing.divergent.distribution");
+    // Wall-clock spans are scheduler-sensitive; keep these verdicts telemetry.
+    foldFlag(B, State, badDistribution, 0xA331D8B47E1C5905ULL,
+             "morok.timing.bad.distribution");
+    foldFlag(B, State, divergentDistribution, 0x5E74B29D13C8A60BULL,
+             "morok.timing.divergent.distribution");
     B.CreateRetVoid();
     return fn;
 }
@@ -8430,10 +8431,10 @@ Function *cacheTimingProbe(Module &M, GlobalVariable *State,
     Value *divergentDistribution = B.CreateICmpUGE(
         divergentSamples, ConstantInt::get(i32, 2),
         "morok.cachetime.divergent.distribution");
-    foldEnforcedFlag(B, State, badDistribution, 0xB6417D0ECA52893FULL,
-                     "morok.cachetime.bad.distribution");
-    foldEnforcedFlag(B, State, divergentDistribution, 0x59A3E7D14C2068BFULL,
-                     "morok.cachetime.divergent.distribution");
+    foldFlag(B, State, badDistribution, 0xB6417D0ECA52893FULL,
+             "morok.cachetime.bad.distribution");
+    foldFlag(B, State, divergentDistribution, 0x59A3E7D14C2068BFULL,
+             "morok.cachetime.divergent.distribution");
     B.CreateRetVoid();
     return fn;
 }
@@ -8641,10 +8642,10 @@ Function *microarchitecturalCanaryProbe(Module &M, GlobalVariable *State,
     Value *divergentDistribution = B.CreateICmpUGE(
         divergentSamples, ConstantInt::get(i32, 2),
         "morok.microcanary.divergent.distribution");
-    foldEnforcedFlag(B, State, badDistribution, 0xA5B0E176D83429CFULL,
-                     "morok.microcanary.bad.distribution");
-    foldEnforcedFlag(B, State, divergentDistribution, 0x2D78C4B50FA691E3ULL,
-                     "morok.microcanary.divergent.distribution");
+    foldFlag(B, State, badDistribution, 0xA5B0E176D83429CFULL,
+             "morok.microcanary.bad.distribution");
+    foldFlag(B, State, divergentDistribution, 0x2D78C4B50FA691E3ULL,
+             "morok.microcanary.divergent.distribution");
     B.CreateRetVoid();
     return fn;
 }
