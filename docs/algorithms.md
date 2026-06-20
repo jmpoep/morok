@@ -659,9 +659,11 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   before decryption: the fixed-length decrypt loop always runs, then a
   post-decrypt decision either marks the payload ready or copies a private
   `morok.sdb.poison.*` bytecode image into the payload before publishing it as
-  ready.  That poisoned image differs at every byte and trips the VM opcode
-  guard at the first fetched instruction, so tamper takes a data-flow poison
-  path rather than a fixed `llvm.trap` oracle or a cleanly skipped decryptor.
+  ready.  That poison image is generated independently from per-build
+  randomness rather than derived from the protected plaintext, so the static
+  binary does not carry a reversible copy of the inner VM bytecode.  Publishing
+  the full wrong image drives the VM wrong-decode poison path rather than a
+  fixed `llvm.trap` oracle or a cleanly skipped decryptor.
 - With `context_keying=true`, the ensure helper also folds VM call context into
   the stream key: each argument is volatile-stored to a local context slot,
   loaded twice, xored to a runtime zero, and mixed as `morok.sdb.key.context`.
@@ -693,7 +695,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   one invocation therefore names a different encrypted byte after the next seal.
 - The ensure helper derives the stream key from the computed hash, decrypts each
   payload byte with volatile stores, and sets the active flag only after either
-  the post-decrypt gate succeeds or the deterministic poison image has been
+  the post-decrypt gate succeeds or the independent poison image has been
   published.  The seal helper derives the same stream from the expected
   encrypted-payload hash, volatile-xors the plaintext bytes back to ciphertext
   before VM helper return, and clears the active flag.  Later calls therefore

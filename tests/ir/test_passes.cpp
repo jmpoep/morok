@@ -8611,12 +8611,31 @@ entry:
         dyn_cast<ConstantDataArray>(PoisonPayload->getInitializer());
     REQUIRE(PoisonData);
     REQUIRE(PoisonData->getNumElements() == Before.size());
-    bool poisonDiffersEveryByte = true;
-    for (unsigned I = 0; I < PoisonData->getNumElements(); ++I)
-        poisonDiffersEveryByte &=
-            Before[I] !=
+    auto oldPublicPoisonMask = [](unsigned I) {
+        std::uint8_t Mask =
+            static_cast<std::uint8_t>(0xA5u + (I * 0x3Du) + (I >> 1));
+        if ((I % 16u) == 0)
+            Mask ^= 0x80u;
+        if (Mask == 0)
+            Mask = 0x5Au;
+        return Mask;
+    };
+    bool poisonMatchesOriginal = true;
+    bool oldMaskRecoversOriginal = true;
+    unsigned differingBytes = 0;
+    for (unsigned I = 0; I < PoisonData->getNumElements(); ++I) {
+        std::uint8_t PoisonByte =
             static_cast<std::uint8_t>(PoisonData->getElementAsInteger(I));
-    CHECK(poisonDiffersEveryByte);
+        poisonMatchesOriginal &= PoisonByte == Before[I];
+        oldMaskRecoversOriginal &=
+            static_cast<std::uint8_t>(PoisonByte ^ oldPublicPoisonMask(I)) ==
+            Before[I];
+        if (PoisonByte != Before[I])
+            ++differingBytes;
+    }
+    CHECK_FALSE(poisonMatchesOriginal);
+    CHECK_FALSE(oldMaskRecoversOriginal);
+    CHECK(differingBytes >= 1u);
     Function *Ensure = M->getFunction("morok.sdb.ensure.vm_secret");
     REQUIRE(Ensure);
     Function *Seal = M->getFunction("morok.sdb.seal.vm_secret");

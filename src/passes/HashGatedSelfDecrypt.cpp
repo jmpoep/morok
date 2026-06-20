@@ -283,16 +283,19 @@ GlobalVariable *createI32State(Module &M, StringRef Name,
 }
 
 GlobalVariable *createPoisonPayload(Module &M, StringRef Suffix,
-                                    ArrayRef<std::uint8_t> Original) {
-    std::vector<std::uint8_t> Poisoned(Original.begin(), Original.end());
-    for (std::uint32_t I = 0; I < Poisoned.size(); ++I) {
-        std::uint8_t Mask =
-            static_cast<std::uint8_t>(0xA5u + (I * 0x3Du) + (I >> 1));
+                                    std::uint32_t Size, ir::IRRandom &Rng) {
+    std::vector<std::uint8_t> Poisoned;
+    Poisoned.reserve(Size);
+    for (std::uint32_t I = 0; I < Size; ++I) {
+        std::uint64_t X = Rng.next();
+        X ^= X >> 33;
+        X *= 0xff51afd7ed558ccdULL;
+        X ^= X >> 29;
+        X *= 0xc4ceb9fe1a85ec53ULL;
+        X ^= X >> 32;
         if ((I % kVmInstrStride) == 0)
-            Mask ^= 0x80u;
-        if (Mask == 0)
-            Mask = 0x5Au;
-        Poisoned[I] ^= Mask;
+            X ^= Rng.next();
+        Poisoned.push_back(static_cast<std::uint8_t>(X));
     }
 
     LLVMContext &Ctx = M.getContext();
@@ -1155,10 +1158,8 @@ bool wrapPayload(Module &M, Payload &P,
         createI32State(M, "morok.sdb.move.rot." + P.suffix, Move.initial_rot);
     GlobalVariable *MoveEpoch =
         createI64State(M, "morok.sdb.move.epoch." + P.suffix, Move.epoch);
-    GlobalVariable *PoisonPayload =
-        createPoisonPayload(M, P.suffix,
-                            ArrayRef<std::uint8_t>(P.original.data(),
-                                                   P.original.size()));
+    GlobalVariable *PoisonPayload = createPoisonPayload(
+        M, P.suffix, static_cast<std::uint32_t>(P.original.size()), Rng);
     Function *Ensure =
         createEnsure(M, P, Ready, Bound, CurrentHash, CurrentKeyMask,
                      CurrentRot, PoisonPayload, S, Params.context_keying);
