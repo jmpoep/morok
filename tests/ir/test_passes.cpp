@@ -15666,6 +15666,7 @@ define i32 @main() { ret i32 0 }
     Function *Scan = M->getFunction("morok.win.veh.scan.list");
     Function *Audit = M->getFunction("morok.win.veh.audit.list");
     Function *Readable = M->getFunction("morok.win.veh.readable");
+    Function *Executable = M->getFunction("morok.win.veh.executable");
     Function *Contains = M->getFunction("morok.win.ldr.contains");
     Function *ImageSize = M->getFunction("morok.win.pe.image.size");
     Function *Peb = M->getFunction("morok.win.peb");
@@ -15676,6 +15677,7 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Scan != nullptr);
     REQUIRE(Audit != nullptr);
     REQUIRE(Readable != nullptr);
+    REQUIRE(Executable != nullptr);
     REQUIRE(Contains != nullptr);
     REQUIRE(ImageSize != nullptr);
     REQUIRE(Peb != nullptr);
@@ -15700,8 +15702,18 @@ define i32 @main() { ret i32 0 }
           1u);
     CHECK(countNamedInstructions(*Readable, "morok.win.veh.ntqueryvm.status") >=
           1u);
+    CHECK(countNamedInstructions(*Executable,
+                                 "morok.win.veh.exec.ntqueryvm.status") >= 1u);
+    CHECK(countNamedInstructions(*Executable,
+                                 "morok.win.veh.exec.mbi.executable") >= 1u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.head.readable") >= 1u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.decoded.20") >= 1u);
+    CHECK(countNamedInstructions(*Audit,
+                                 "morok.win.veh.handler.20.executable") >= 1u);
+    CHECK(countNamedInstructions(*Audit,
+                                 "morok.win.veh.handler.18.executable") >= 1u);
+    CHECK(countNamedInstructions(*Audit,
+                                 "morok.win.veh.handler.trusted.any") >= 1u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.handler.foreign") >=
           1u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.bad.next") >= 1u);
@@ -15709,6 +15721,7 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.remove.ready") == 0u);
     CHECK(countNamedInstructions(*Contains, "morok.win.ldr.contains.match") >=
           1u);
+    CHECK(functionHasConstantInt(*Contains, 256));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

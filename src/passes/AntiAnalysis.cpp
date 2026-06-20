@@ -9718,7 +9718,8 @@ Function *windowsAddressInLdrModule(Module &M) {
     cursor->addIncoming(first, entry);
     idx->addIncoming(ConstantInt::get(i32, 0), entry);
     LB.CreateCondBr(
-        LB.CreateAnd(LB.CreateICmpULT(idx, ConstantInt::get(i32, 64)),
+        LB.CreateAnd(LB.CreateICmpULT(idx, ConstantInt::get(i32, 256),
+                                      "morok.win.ldr.contains.limit"),
                      LB.CreateICmpNE(cursor, head),
                      "morok.win.ldr.contains.keep.walking"),
         bodyBB, ret0BB);
@@ -9827,6 +9828,77 @@ Function *windowsReadableAddressHelper(Module &M) {
                                   "morok.win.veh.mbi.valid"),
                      QB.CreateNot(blocked), "morok.win.veh.readable.result");
     QB.CreateRet(QB.CreateZExt(readable, i32));
+
+    IRBuilder<> RB(ret0BB);
+    RB.CreateRet(ConstantInt::get(i32, 0));
+    return fn;
+}
+
+Function *windowsExecutableAddressHelper(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.veh.executable"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i32, {ip, ip}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.veh.executable", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *address = fn->getArg(0);
+    address->setName("address");
+    Argument *queryVm = fn->getArg(1);
+    queryVm->setName("query_vm");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *queryBB = BasicBlock::Create(ctx, "query", fn);
+    auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
+
+    IRBuilder<> B(entry);
+    auto *mbiTy = ArrayType::get(i8, 48);
+    AllocaInst *mbi = B.CreateAlloca(mbiTy, nullptr, "morok.win.veh.exec.mbi");
+    AllocaInst *retLen =
+        B.CreateAlloca(ip, nullptr, "morok.win.veh.exec.mbi.retlen");
+    B.CreateStore(ConstantInt::get(ip, 0), retLen)->setVolatile(true);
+    B.CreateCondBr(B.CreateAnd(B.CreateICmpNE(address, ConstantInt::get(ip, 0)),
+                               B.CreateICmpNE(queryVm, ConstantInt::get(ip, 0)),
+                               "morok.win.veh.executable.ready"),
+                   queryBB, ret0BB);
+
+    IRBuilder<> QB(queryBB);
+    auto *queryTy = FunctionType::get(i32, {ptr, ptr, i32, ptr, ip, ptr}, false);
+    Value *status = QB.CreateCall(
+        queryTy,
+        QB.CreateIntToPtr(queryVm, ptr, "morok.win.veh.exec.ntqueryvm.ptr"),
+        {QB.CreateIntToPtr(ConstantInt::getSigned(ip, -1), ptr),
+         QB.CreateIntToPtr(address, ptr, "morok.win.veh.exec.query.address"),
+         ConstantInt::get(i32, 0), mbi, ConstantInt::get(ip, 48), retLen},
+        "morok.win.veh.exec.ntqueryvm.status");
+    Value *state = loadAt(QB, M, i32, mbi, 32, "morok.win.veh.exec.mbi.state");
+    Value *protect =
+        loadAt(QB, M, i32, mbi, 36, "morok.win.veh.exec.mbi.protect");
+    Value *okStatus =
+        QB.CreateICmpSGE(status, ConstantInt::get(i32, 0),
+                         "morok.win.veh.exec.ntqueryvm.ok");
+    Value *committed =
+        QB.CreateICmpEQ(state, ConstantInt::get(i32, 0x1000),
+                        "morok.win.veh.exec.mbi.committed");
+    Value *blocked = QB.CreateICmpNE(
+        QB.CreateAnd(protect, ConstantInt::get(i32, 0x101)),
+        ConstantInt::get(i32, 0), "morok.win.veh.exec.mbi.blocked");
+    Value *executable = QB.CreateICmpNE(
+        QB.CreateAnd(protect, ConstantInt::get(i32, 0xF0)),
+        ConstantInt::get(i32, 0), "morok.win.veh.exec.mbi.executable");
+    Value *trusted =
+        QB.CreateAnd(QB.CreateAnd(okStatus, committed,
+                                  "morok.win.veh.exec.mbi.valid"),
+                     QB.CreateAnd(executable, QB.CreateNot(blocked),
+                                  "morok.win.veh.exec.mbi.allowed"),
+                     "morok.win.veh.executable.result");
+    QB.CreateRet(QB.CreateZExt(trusted, i32));
 
     IRBuilder<> RB(ret0BB);
     RB.CreateRet(ConstantInt::get(i32, 0));
@@ -9966,6 +10038,7 @@ Function *windowsVehAuditListHelper(Module &M) {
 
     Function *contains = windowsAddressInLdrModule(M);
     Function *readable = windowsReadableAddressHelper(M);
+    Function *executable = windowsExecutableAddressHelper(M);
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
     auto *headBB = BasicBlock::Create(ctx, "head", fn);
@@ -10064,16 +10137,26 @@ Function *windowsVehAuditListHelper(Module &M) {
                                     "morok.win.veh.handler.20.inside");
     Value *inside18 = EB.CreateCall(contains, {peb, decoded18},
                                     "morok.win.veh.handler.18.inside");
+    Value *exec20 = EB.CreateCall(executable, {decoded20, queryVm},
+                                  "morok.win.veh.handler.20.executable");
+    Value *exec18 = EB.CreateCall(executable, {decoded18, queryVm},
+                                  "morok.win.veh.handler.18.executable");
     Value *present = EB.CreateOr(
         EB.CreateICmpNE(encoded20, ConstantInt::get(ip, 0)),
         EB.CreateICmpNE(encoded18, ConstantInt::get(ip, 0)),
         "morok.win.veh.handler.present");
-    Value *insideAny = EB.CreateOr(
+    Value *trusted20 = EB.CreateOr(
         EB.CreateICmpNE(inside20, ConstantInt::get(i32, 0)),
+        EB.CreateICmpNE(exec20, ConstantInt::get(i32, 0)),
+        "morok.win.veh.handler.20.trusted");
+    Value *trusted18 = EB.CreateOr(
         EB.CreateICmpNE(inside18, ConstantInt::get(i32, 0)),
-        "morok.win.veh.handler.inside.any");
+        EB.CreateICmpNE(exec18, ConstantInt::get(i32, 0)),
+        "morok.win.veh.handler.18.trusted");
+    Value *trustedAny = EB.CreateOr(trusted20, trusted18,
+                                    "morok.win.veh.handler.trusted.any");
     Value *foreign =
-        EB.CreateAnd(present, EB.CreateNot(insideAny),
+        EB.CreateAnd(present, EB.CreateNot(trustedAny),
                      "morok.win.veh.handler.foreign");
     Value *oldBad = EB.CreateLoad(i32, bad, "morok.win.veh.bad.old");
     cast<LoadInst>(oldBad)->setVolatile(true);
