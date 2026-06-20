@@ -8611,7 +8611,12 @@ entry:
         dyn_cast<ConstantDataArray>(PoisonPayload->getInitializer());
     REQUIRE(PoisonData);
     REQUIRE(PoisonData->getNumElements() == Before.size());
-    auto oldPublicPoisonMask = [](unsigned I) {
+    std::vector<std::uint8_t> Poison;
+    for (unsigned I = 0; I < PoisonData->getNumElements(); ++I)
+        Poison.push_back(
+            static_cast<std::uint8_t>(PoisonData->getElementAsInteger(I)));
+    CHECK(Poison != Before);
+    auto publicPoisonMask = [](unsigned I) {
         std::uint8_t Mask =
             static_cast<std::uint8_t>(0xA5u + (I * 0x3Du) + (I >> 1));
         if ((I % 16u) == 0)
@@ -8620,22 +8625,17 @@ entry:
             Mask = 0x5Au;
         return Mask;
     };
-    bool poisonMatchesOriginal = true;
-    bool oldMaskRecoversOriginal = true;
-    unsigned differingBytes = 0;
-    for (unsigned I = 0; I < PoisonData->getNumElements(); ++I) {
-        std::uint8_t PoisonByte =
-            static_cast<std::uint8_t>(PoisonData->getElementAsInteger(I));
-        poisonMatchesOriginal &= PoisonByte == Before[I];
-        oldMaskRecoversOriginal &=
-            static_cast<std::uint8_t>(PoisonByte ^ oldPublicPoisonMask(I)) ==
+    bool publicMaskRecoversPlaintext = true;
+    bool opcodeBoundariesCarryPoison = true;
+    for (unsigned I = 0; I < Poison.size(); ++I) {
+        publicMaskRecoversPlaintext &=
+            static_cast<std::uint8_t>(Poison[I] ^ publicPoisonMask(I)) ==
             Before[I];
-        if (PoisonByte != Before[I])
-            ++differingBytes;
+        if ((I % 16u) == 0)
+            opcodeBoundariesCarryPoison &= (Poison[I] & 0x80u) != 0;
     }
-    CHECK_FALSE(poisonMatchesOriginal);
-    CHECK_FALSE(oldMaskRecoversOriginal);
-    CHECK(differingBytes >= 1u);
+    CHECK_FALSE(publicMaskRecoversPlaintext);
+    CHECK(opcodeBoundariesCarryPoison);
     Function *Ensure = M->getFunction("morok.sdb.ensure.vm_secret");
     REQUIRE(Ensure);
     Function *Seal = M->getFunction("morok.sdb.seal.vm_secret");

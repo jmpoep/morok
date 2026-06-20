@@ -286,16 +286,28 @@ GlobalVariable *createPoisonPayload(Module &M, StringRef Suffix,
                                     std::uint32_t Size, ir::IRRandom &Rng) {
     std::vector<std::uint8_t> Poisoned;
     Poisoned.reserve(Size);
+    std::uint64_t Mixer = Rng.next() | 1ULL;
+    std::uint64_t Lane = Rng.next();
     for (std::uint32_t I = 0; I < Size; ++I) {
-        std::uint64_t X = Rng.next();
-        X ^= X >> 33;
-        X *= 0xff51afd7ed558ccdULL;
-        X ^= X >> 29;
-        X *= 0xc4ceb9fe1a85ec53ULL;
-        X ^= X >> 32;
+        if ((I & 7u) == 0) {
+            Lane = Rng.next() ^
+                   (Mixer + (static_cast<std::uint64_t>(I) + 1) *
+                                0x9e3779b97f4a7c15ULL);
+            Lane ^= Lane >> 30;
+            Lane *= 0xbf58476d1ce4e5b9ULL;
+            Lane ^= Lane >> 27;
+            Lane *= 0x94d049bb133111ebULL;
+            Lane ^= Lane >> 31;
+        }
+        std::uint8_t Byte =
+            static_cast<std::uint8_t>(Lane >> ((I & 7u) * 8u));
+        Byte ^= static_cast<std::uint8_t>(
+            (Mixer >> (((I + 3u) & 7u) * 8u)) + (I * 0x6Du) + (I >> 2));
         if ((I % kVmInstrStride) == 0)
-            X ^= Rng.next();
-        Poisoned.push_back(static_cast<std::uint8_t>(X));
+            Byte |= 0x80u;
+        if (Byte == 0)
+            Byte = 0xA5u;
+        Poisoned.push_back(Byte);
     }
 
     LLVMContext &Ctx = M.getContext();
