@@ -3481,7 +3481,6 @@ Function *linuxGotPltProbe(Module &M, const Triple &TT) {
     auto *relPrepBB = BasicBlock::Create(ctx, "rel.prep", fn);
     auto *relLoopBB = BasicBlock::Create(ctx, "rel.loop", fn);
     auto *relBodyBB = BasicBlock::Create(ctx, "rel.body", fn);
-    auto *relLazyBindBB = BasicBlock::Create(ctx, "rel.lazy.bind", fn);
     auto *relValidateBB = BasicBlock::Create(ctx, "rel.validate", fn);
     auto *protectBB = BasicBlock::Create(ctx, "rel.protect", fn);
     auto *relNextBB = BasicBlock::Create(ctx, "rel.next", fn);
@@ -3782,10 +3781,8 @@ Function *linuxGotPltProbe(Module &M, const Triple &TT) {
         "morok.antihook.got.relro.slot");
     Value *lazyWritable = RBB.CreateNot(slotInAnyRelro,
                                         "morok.antihook.got.lazy.writable");
-    Value *lazyOk = RBB.CreateAnd(
-        RBB.CreateAnd(lazyShape, hasExpected,
-                      "morok.antihook.got.lazy.expected"),
-        lazyWritable, "morok.antihook.got.lazy.ok");
+    Value *lazyOk = RBB.CreateAnd(lazyShape, lazyWritable,
+                                  "morok.antihook.got.lazy.ok");
     Value *localRxOk = RBB.CreateAnd(
         RBB.CreateNot(externalSym, "morok.antihook.got.sym.local"),
         RBB.CreateICmpNE(rxOk, ConstantInt::get(Type::getInt32Ty(ctx), 0)),
@@ -3794,22 +3791,7 @@ Function *linuxGotPltProbe(Module &M, const Triple &TT) {
         expectedOk, RBB.CreateOr(localRxOk, lazyOk,
                                  "morok.antihook.got.local.or.lazy"),
         "morok.antihook.got.target.ok");
-    RBB.CreateCondBr(lazyOk, relLazyBindBB, relValidateBB);
-
-    IRBuilder<> LBB(relLazyBindBB);
-    auto *BindStore = LBB.CreateStore(expectedPtr, slotPtr);
-    BindStore->setVolatile(true);
-    BindStore->setAlignment(Align(8));
-    auto *BoundPtr =
-        LBB.CreateLoad(ptr, slotPtr, "morok.antihook.got.lazy.bound");
-    BoundPtr->setVolatile(true);
-    BoundPtr->setAlignment(Align(8));
-    incrementDiff(
-        LBB, diff,
-        LBB.CreateICmpNE(BoundPtr, expectedPtr,
-                         "morok.antihook.got.lazy.bind.fail"),
-        "morok.antihook.got.lazy.bind");
-    LBB.CreateBr(relValidateBB);
+    RBB.CreateBr(relValidateBB);
 
     IRBuilder<> RVB(relValidateBB);
     incrementDiff(

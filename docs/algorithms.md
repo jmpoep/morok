@@ -1376,10 +1376,13 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   main executable's direct `DT_NEEDED` libraries.  Locally-defined PLT entries
   may additionally resolve inside the main executable's executable `PT_LOAD`
   segments, but undefined external imports do not accept arbitrary in-image
-  stubs or `LD_PRELOAD` interposers.  When the binary advertises `BIND_NOW` and
-  the slot lies in `PT_GNU_RELRO`, the checker re-applies read-only protection
-  to the slot page with an inline x86_64 `mprotect` syscall path; bad targets or
-  failed reprotection are folded into delayed anti-hook state.
+  stubs or `LD_PRELOAD` interposers.  A still-unresolved lazy PLT slot is
+  tolerated only when it points at its own in-image PLT jump stub; the checker
+  does not write a guessed `dlsym` result into the live GOT.  When the binary
+  advertises `BIND_NOW` and the slot lies in `PT_GNU_RELRO`, the checker
+  re-applies read-only protection to the slot page with an inline x86_64
+  `mprotect` syscall path; bad targets or failed reprotection are folded into
+  delayed anti-hook state.
   On macOS, AntiHooking walks the main Mach-O load commands, scans
   `S_NON_LAZY_SYMBOL_POINTERS` and `S_LAZY_SYMBOL_POINTERS` sections such as
   `__got` and `__la_symbol_ptr`, volatile-loads each non-null pointer, and
