@@ -167,7 +167,9 @@ Use the top-level script unless you are intentionally narrowing the loop:
 ./run_tests.sh            # incremental configure/build + entire ctest suite
 ./run_tests.sh --clean    # remove build/ and configure from scratch
 ./run_tests.sh -R passes  # ctest name regex
-./run_tests.sh -L ir      # labels include core/config/ir/e2e/security/adversarial/programs/max/unit/aggregate
+./run_tests.sh -L ir      # label filter; labels include core/config/ir/e2e,
+                          # security/adversarial/programs/max/linux/threading,
+                          # and core/config/ir/unit/aggregate
 ```
 
 The full gate covers:
@@ -240,16 +242,24 @@ clang -O2 -fpass-plugin="$PLUGIN" -mllvm -morok prog.c -o prog
 Environment switches recognized by the plugin:
 
 ```text
-MOROK_ENABLE=1     opt into clang auto-injection without -mllvm -morok
-MOROK_CONFIG=path  config file fallback when -morok-config is absent
-MOROK_PRESET=high  preset fallback when no config file is loaded
-MOROK_SEED=1234    seed fallback when -morok-seed is absent or zero
+MOROK_ENABLE=1                         opt into clang auto-injection without -mllvm -morok
+MOROK_CONFIG=path                      config file fallback when -morok-config is absent
+MOROK_PRESET=high                      preset fallback when no config file is loaded
+MOROK_SEED=1234                        seed fallback when -morok-seed is absent or zero
+MOROK_CKD_SEAL_REQUIRED=1              require a post-link CKD seal instead of startup self-seal fallback
+MOROK_FAIL_CLOSED_ON_UNSEALED=1        poison seal-dependent paths if retained manifests are still unsealed
 ```
 
 When `-morok-config` or `MOROK_CONFIG` loads successfully, that file supplies
 the preset base through `[global].preset`; `-morok-preset` is only used when no
 config file is loaded. `-morok-seed` and `MOROK_SEED` override the config seed
 for reproducible builds.
+
+The command-line equivalents for the strict release switches are
+`-mllvm -morok-ckd-seal-required` and
+`-mllvm -morok-fail-closed-on-unsealed`. Only enable them for builds where the
+binary will be post-link sealed before first run; an unsealed strict build is
+supposed to fail closed rather than silently self-recover.
 
 For `clang -fpass-plugin`, Morok also registers extension-point callbacks:
 
@@ -328,7 +338,17 @@ limit; the self-check random-data `region_bytes` setting does not cap code
 coverage. It then runs `tools/morok-audit.py` over the final output directory to
 reject unsealed manifests, placeholder manifest state, private-key sidecars,
 embedded development paths, plaintext high-value release markers, and plaintext
-magic/sentinel markers before anything is shipped. Manual sealing is:
+magic/sentinel markers before anything is shipped.
+
+When macOS sealing is enabled, `cross_build.sh` also passes the strict seal
+flags (`-morok-ckd-seal-required` and
+`-morok-fail-closed-on-unsealed`) before the post-link seal/re-sign step. Linux
+outputs are still sealed and audited by default, but the helper leaves those
+strict plugin flags off for the Linux compile path; add them only in a pipeline
+that has proven its Linux sealing step is mandatory and runs before the binary
+can execute.
+
+Manual sealing is:
 
 ```sh
 python3 tests/e2e/adversarial_binary.py seal path/to/binary --window 262144
