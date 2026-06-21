@@ -294,6 +294,11 @@ max_calls = 4096
 region_bytes = 32
 seal_required = true
 
+[passes.returnless_dispatch]
+enabled = true
+probability = 100
+max_sites = 4096
+
 [passes.nanomites]
 enabled = true
 probability = 100

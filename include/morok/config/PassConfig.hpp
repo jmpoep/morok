@@ -324,6 +324,12 @@ struct CallerKeyedDispatchConfig {
     Opt<bool> seal_required;
 };
 
+struct ReturnlessDispatchConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> probability;
+    Opt<std::uint32_t> max_sites;
+};
+
 struct NanomiteConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
@@ -429,6 +435,7 @@ struct PassConfig {
     DispatcherlessConfig dispatcherless;
     MicrocodeStressConfig microcode_stress;
     CallerKeyedDispatchConfig caller_keyed_dispatch;
+    ReturnlessDispatchConfig returnless_dispatch;
     NanomiteConfig nanomites;
     StrEncConfig str_enc;
     ConstEncConfig const_enc;

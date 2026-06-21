@@ -268,6 +268,12 @@ PassConfig makeLow() {
     c.caller_keyed_dispatch.max_calls = 4096;
     c.caller_keyed_dispatch.region_bytes = 16;
 
+    // Off in every preset for now: opt-in via [passes.returnless_dispatch] while
+    // the tail-branch return rewrite is validated per platform (increment 1).
+    c.returnless_dispatch.enabled = false;
+    c.returnless_dispatch.probability = 100;
+    c.returnless_dispatch.max_sites = 64;
+
     c.vec.enabled = false;
     c.csm.enabled = false;
     c.csm.generator = CsmGenerator::Logistic;

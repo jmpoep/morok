@@ -45,6 +45,7 @@
 #include "morok/passes/PerBuildPolymorphism.hpp"
 #include "morok/passes/PhiTangling.hpp"
 #include "morok/passes/PointerLaundering.hpp"
+#include "morok/passes/ReturnlessDispatch.hpp"
 #include "morok/passes/SealedBlob.hpp"
 #include "morok/passes/SelfChecksumConstants.hpp"
 #include "morok/passes/ShamirShare.hpp"
@@ -1248,6 +1249,22 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
 
     if (InitialModuleGrowthOk)
         changed |= passes::misleadingMetadataModule(M, rng);
+
+    // Returnless dispatch runs after every instruction-inserting transform so
+    // nothing can later break the musttail/tail-call adjacency it relies on.
+    // It rewrites tail-position returns (`%r = call g(args) ; ret %r`) into
+    // indirect tail branches: eligible functions leave through a computed
+    // `br x16` / `jmp *rax` instead of a `ret`, with the callee target read from
+    // a volatile slot.  Default-off; opt-in while validated per platform.
+    if (InitialModuleGrowthOk &&
+        config_.passes.returnless_dispatch.enabled.value_or(false) &&
+        moduleGrowthOk(measureUserModule(M))) {
+        passes::ReturnlessParams p;
+        p.probability =
+            config_.passes.returnless_dispatch.probability.value_or(100);
+        p.max_sites = config_.passes.returnless_dispatch.max_sites.value_or(64);
+        changed |= passes::returnlessDispatchModule(M, p, rng);
+    }
 
     // Final symbol hygiene: every generated `morok.*` helper still carries its
     // descriptive internal-linkage name (`morok.gf8mul`, `morok.strdec`, …),

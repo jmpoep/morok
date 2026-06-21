@@ -46,6 +46,7 @@
 #include "morok/passes/PerBuildPolymorphism.hpp"
 #include "morok/passes/PhiTangling.hpp"
 #include "morok/passes/PointerLaundering.hpp"
+#include "morok/passes/ReturnlessDispatch.hpp"
 #include "morok/passes/RuntimeSeal.hpp"
 #include "morok/passes/SealedBlob.hpp"
 #include "morok/passes/SelfChecksumConstants.hpp"
@@ -596,6 +597,85 @@ std::size_t countInlineAsmBodies(Function &F, StringRef needle) {
                 if (Asm->getAsmString().contains(needle))
                     ++n;
     return n;
+}
+
+TEST_CASE("returnlessDispatch turns tail-position returns into indirect tails") {
+    LLVMContext ctx;
+    const char *ir = R"ir(
+define internal i32 @callee(i32 %x) {
+  ret i32 %x
+}
+
+define internal void @vcallee() {
+  ret void
+}
+
+define internal i32 @fwd(i32 %a) {
+entry:
+  %r = call i32 @callee(i32 %a)
+  ret i32 %r
+}
+
+define internal i32 @tailpos(i32 %a) {
+entry:
+  %r = call i32 @callee(i32 42)
+  ret i32 %r
+}
+
+define internal void @voidtail() {
+entry:
+  call void @vcallee()
+  ret void
+}
+
+define internal i32 @nontail(i32 %a) {
+entry:
+  %r = call i32 @callee(i32 %a)
+  %s = add i32 %r, 1
+  ret i32 %s
+}
+)ir";
+    auto M = parse(ctx, ir);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x12345);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::ReturnlessParams params;
+    const bool changed =
+        morok::passes::returnlessDispatchModule(*M, params, rng);
+
+    CHECK(changed);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+
+    auto firstCall = [](Function *F) -> CallInst * {
+        for (Instruction &I : instructions(*F))
+            if (auto *CI = dyn_cast<CallInst>(&I))
+                return CI;
+        return nullptr;
+    };
+
+    // Perfect-forwarding return becomes a guaranteed-no-`ret` indirect musttail.
+    CallInst *fwd = firstCall(M->getFunction("fwd"));
+    REQUIRE(fwd != nullptr);
+    CHECK(fwd->getCalledFunction() == nullptr);
+    CHECK(fwd->isMustTailCall());
+
+    // Non-forwarding and void tail-position returns become indirect `tail`.
+    CallInst *tp = firstCall(M->getFunction("tailpos"));
+    REQUIRE(tp != nullptr);
+    CHECK(tp->getCalledFunction() == nullptr);
+    CHECK(tp->getTailCallKind() == CallInst::TCK_Tail);
+
+    // void()->void() is also perfect forwarding, so it qualifies for musttail.
+    CallInst *vt = firstCall(M->getFunction("voidtail"));
+    REQUIRE(vt != nullptr);
+    CHECK(vt->getCalledFunction() == nullptr);
+    CHECK(vt->isMustTailCall());
+
+    // A return of a computed value keeps its real ABI return, untouched.
+    CallInst *nt = firstCall(M->getFunction("nontail"));
+    REQUIRE(nt != nullptr);
+    CHECK(nt->getCalledFunction() != nullptr);
+    CHECK(nt->getTailCallKind() == CallInst::TCK_None);
 }
 
 TEST_CASE("PlatformRuntime emits direct Linux syscalls without libc import") {

@@ -35,6 +35,7 @@ add_library(morok_passes STATIC
   MqGate.cpp
   ChaosStateMachine.cpp
   CallerKeyedDispatch.cpp
+  ReturnlessDispatch.cpp
   OptimizerAmplification.cpp
   PerBuildPolymorphism.cpp
   ArithmeticTables.cpp

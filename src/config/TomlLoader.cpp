@@ -373,6 +373,13 @@ void parseCallerKeyedDispatch(const toml::table &t,
     c.seal_required = readBool(t["seal_required"]);
 }
 
+void parseReturnlessDispatch(const toml::table &t,
+                            ReturnlessDispatchConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.probability = readU32(t["probability"]);
+    c.max_sites = readU32(t["max_sites"]);
+}
+
 void parseNanomites(const toml::table &t, NanomiteConfig &c) {
     c.enabled = readBool(t["enabled"]);
     c.probability = readU32(t["probability"]);
@@ -518,6 +525,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseMicrocodeStress(*t, pc.microcode_stress);
     if (auto *t = p["caller_keyed_dispatch"].as_table())
         parseCallerKeyedDispatch(*t, pc.caller_keyed_dispatch);
+    if (auto *t = p["returnless_dispatch"].as_table())
+        parseReturnlessDispatch(*t, pc.returnless_dispatch);
     if (auto *t = p["nanomites"].as_table())
         parseNanomites(*t, pc.nanomites);
     if (auto *t = p["string_encryption"].as_table())

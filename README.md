@@ -612,6 +612,7 @@ and private-linkage cleanup for generated `morok.*` helpers, are scheduler-only.
 | Sealed blobs | `morok-sealedblob` | `sealed_blob` | Encrypts explicit `.morok.sealed` byte-array globals and rewrites supported reads through per-blob lazy accessors keyed by RuntimeSeal/external-proof material, with optional runtime-keyed magic-prefix diagnostics. |
 | Function-call obfuscation | `morok-fco` | `function_call_obfuscate` | Hides external calls behind per-site import indirection. Linux/macOS 64-bit paths use manual export-by-hash resolvers where supported; unsupported targets use per-site cloaked dynamic lookup. |
 | Caller-keyed dispatch | `morok-ckd` | `caller_keyed_dispatch` | Collapses surviving direct user calls through a shared dispatch hub keyed by caller context and post-link sealed integrity bytes. |
+| Returnless dispatch | `morok-returnless` | `returnless_dispatch` | Rewrites tail-position returns (`return f(...)`) into indirect tail branches: the function leaves through a computed `br x16` / `jmp *rax` read from a hidden slot instead of a `ret`, and the callee target is no longer a direct edge. Perfect-forwarding sites use `musttail` (guaranteed no `ret`); others use a `tail` hint. Only genuine tail-position returns qualify — returns of computed values keep a normal ABI return, and escaping/EH/`setjmp`/varargs/`sret`/`byval` sites are skipped. Off by default; opt-in while validated per platform. |
 | Function wrapper | `morok-funcwrap` | `function_wrapper` | Wraps calls after per-function transforms so callers see proxy edges. |
 | VTable integrity | `morok-vtable` | `vtable_integrity` | Guards Itanium C++ virtual dispatches by expected vptr, slot, target, and cookie hash. |
 | Decoy strings | `morok-decoystr` | `decoy_strings` | Distributes retained plaintext honeypot diagnostics and fake logging infrastructure. |
@@ -774,6 +775,7 @@ that extra layer per rewritten literal.
 | `string_encryption` | `enabled`, `probability`, `skip_content`, `force_content` |
 | `function_call_obfuscate` | `enabled` |
 | `caller_keyed_dispatch` | `enabled`, `probability`, `max_calls`, `region_bytes`, `seal_required` |
+| `returnless_dispatch` | `enabled`, `probability`, `max_sites` |
 | `function_wrapper` | `enabled`, `probability`, `times` |
 | `vtable_integrity` | `enabled` |
 | `decoy_strings` | `enabled` |
