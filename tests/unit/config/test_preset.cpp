@@ -394,6 +394,7 @@ TEST_CASE("high preset matches the documented table") {
     CHECK(c.platform_runtime.per_build_stubs == true);
     CHECK(c.platform_runtime.minimize_imports == true);
     CHECK(c.platform_runtime.import_table_audit == false);
+    CHECK(c.platform_runtime.static_link_expected == false);
 }
 
 TEST_CASE("max preset enables every pass at full intensity") {
@@ -473,6 +474,7 @@ TEST_CASE("max preset enables every pass at full intensity") {
     CHECK(c.platform_runtime.per_build_stubs == true);
     CHECK(c.platform_runtime.minimize_imports == true);
     CHECK(c.platform_runtime.import_table_audit == true);
+    CHECK(c.platform_runtime.static_link_expected == false);
     CHECK(c.windows_unhook.enabled == true);
     CHECK(c.windows_veh_audit.enabled == true);
     CHECK(c.windows_process_mitigations.enabled == true);

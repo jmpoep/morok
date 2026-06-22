@@ -299,6 +299,7 @@ PassConfig makeLow() {
     c.platform_runtime.per_build_stubs = false;
     c.platform_runtime.minimize_imports = false;
     c.platform_runtime.import_table_audit = false;
+    c.platform_runtime.static_link_expected = false;
     c.timing_oracles.enabled = false;
     c.scheduler_step_oracles.enabled = false;
     c.trap_oracles.enabled = false;
@@ -553,6 +554,7 @@ PassConfig makeMid() {
     c.platform_runtime.per_build_stubs = false;
     c.platform_runtime.minimize_imports = false;
     c.platform_runtime.import_table_audit = false;
+    c.platform_runtime.static_link_expected = false;
     c.timing_oracles.enabled = false;
     c.scheduler_step_oracles.enabled = false;
     c.trap_oracles.enabled = false;
@@ -821,6 +823,7 @@ PassConfig makeHigh() {
     c.platform_runtime.per_build_stubs = true;
     c.platform_runtime.minimize_imports = true;
     c.platform_runtime.import_table_audit = false;
+    c.platform_runtime.static_link_expected = false;
     c.timing_oracles.enabled = false;
     c.scheduler_step_oracles.enabled = false;
     c.trap_oracles.enabled = false;
@@ -1104,6 +1107,7 @@ PassConfig makeMax() {
     c.platform_runtime.per_build_stubs = true;
     c.platform_runtime.minimize_imports = true;
     c.platform_runtime.import_table_audit = true;
+    c.platform_runtime.static_link_expected = false;
     c.windows_unhook.enabled = true;
     c.windows_veh_audit.enabled = true;
     c.windows_process_mitigations.enabled = true;

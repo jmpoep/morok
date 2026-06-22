@@ -426,6 +426,8 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.platform_runtime.minimize_imports);
     mergeOpt(dst.platform_runtime.import_table_audit,
              src.platform_runtime.import_table_audit);
+    mergeOpt(dst.platform_runtime.static_link_expected,
+             src.platform_runtime.static_link_expected);
     mergeOpt(dst.windows_unhook.enabled, src.windows_unhook.enabled);
     mergeOpt(dst.windows_veh_audit.enabled, src.windows_veh_audit.enabled);
     mergeOpt(dst.windows_process_mitigations.enabled,

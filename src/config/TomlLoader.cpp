@@ -453,6 +453,7 @@ void parsePlatformRuntime(const toml::table &t, PlatformRuntimeConfig &c) {
     c.per_build_stubs = readBool(t["per_build_stubs"]);
     c.minimize_imports = readBool(t["minimize_imports"]);
     c.import_table_audit = readBool(t["import_table_audit"]);
+    c.static_link_expected = readBool(t["static_link_expected"]);
 }
 
 void parseFuncWrap(const toml::table &t, PassConfig::FuncWrapConfig &c) {

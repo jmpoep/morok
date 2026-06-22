@@ -419,6 +419,10 @@ struct PlatformRuntimeConfig {
     Opt<bool> per_build_stubs;
     Opt<bool> minimize_imports;
     Opt<bool> import_table_audit;
+    // Static-link release builds can opt into Linux AT_BASE enforcement.  The
+    // verdict is not zero-on-clean for ordinary dynamic binaries, so presets
+    // must keep this false unless the build system knows it is linking -static.
+    Opt<bool> static_link_expected;
 };
 
 /// The full set of per-pass options.

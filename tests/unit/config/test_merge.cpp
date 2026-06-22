@@ -264,6 +264,7 @@ TEST_CASE("merge handles every pass family") {
     src.platform_runtime.per_build_stubs = true;
     src.platform_runtime.minimize_imports = true;
     src.platform_runtime.import_table_audit = true;
+    src.platform_runtime.static_link_expected = true;
     src.windows_unhook.enabled = true;
     src.windows_veh_audit.enabled = true;
     src.windows_process_mitigations.enabled = true;
@@ -475,6 +476,7 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.platform_runtime.per_build_stubs == true);
     CHECK(dst.platform_runtime.minimize_imports == true);
     CHECK(dst.platform_runtime.import_table_audit == true);
+    CHECK(dst.platform_runtime.static_link_expected == true);
     CHECK(dst.windows_unhook.enabled == true);
     CHECK(dst.windows_veh_audit.enabled == true);
     CHECK(dst.windows_process_mitigations.enabled == true);

@@ -57,7 +57,8 @@ bool antiDebuggingModule(llvm::Module &M);
 /// Inject a startup inline-hook prologue check.  The probed symbol name is
 /// cloaked inline (never a readable string), keyed off `rng`.  Returns true if
 /// code was added.
-bool antiHookingModule(llvm::Module &M, morok::ir::IRRandom &rng);
+bool antiHookingModule(llvm::Module &M, morok::ir::IRRandom &rng,
+                       bool staticLinkExpected = false);
 
 /// Scramble Objective-C metadata; a no-op (returns false) on modules without
 /// it.

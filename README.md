@@ -337,9 +337,13 @@ sealing:      enabled
 ```
 
 For static Linux outputs, `cross_build.sh` derives a temporary TOML config that
-forces `[passes.function_call_obfuscate].enabled = false`. A fully static binary
+forces `[passes.function_call_obfuscate].enabled = false` and sets
+`[passes.platform_runtime].static_link_expected = true`. A fully static binary
 has no dynamic loader, so dynamic import lookup has no useful hiding surface and
-can crash if left enabled.
+can crash if left enabled. The static-link flag also enables the Linux `AT_BASE`
+tripwire, which folds a dynamic-loader mapping into the runtime seal only for
+builds that are expected to be `-static`; ordinary dynamic outputs must leave it
+off.
 
 Post-link sealing is mandatory for shippable binaries that rely on
 `self_checksum_constants`, `mutual_guard_graph`, or `caller_keyed_dispatch`
@@ -845,9 +849,10 @@ or `MOROK_DISTRIBUTION_SIGNED=1`.
 
 `platform_runtime` accepts `enabled`, `direct_syscalls` (`auto`, `always`,
 `never`), `windows_mode` (`documented_api`, `hashed_import`, `direct_syscall`),
-`per_build_stubs`, `minimize_imports`, and `import_table_audit`. The runtime is
-an internal emitter layer; these fields document and preset the platform policy
-used by anti-analysis producers rather than adding a standalone `-passes` entry.
+`per_build_stubs`, `minimize_imports`, `import_table_audit`, and
+`static_link_expected`. The runtime is an internal emitter layer; these fields
+document and preset the platform policy used by anti-analysis producers rather
+than adding a standalone `-passes` entry.
 
 ## Platform Notes
 
@@ -1003,7 +1008,7 @@ self-check data region.
 | CMake cannot find `llvm/Plugins/PassPlugin.h` | Host LLVM is upstream or wrong fork/API | Point `LLVM_DIR` at the matching custom LLVM install. |
 | Plugin load reports API/version mismatch | `clang`/`opt` and Morok were built against different LLVM plugin ABIs | Rebuild Morok with the same LLVM used by the host driver. |
 | `-mllvm -morok` is unknown on Windows | Windows plugin cl::opts are not parsed by host clang the same way | Use `MOROK_ENABLE=1` plus `MOROK_CONFIG`, `MOROK_PRESET`, and `MOROK_SEED`. |
-| Static Linux binary crashes around import indirection | FCO was left enabled in a static link | Use `cross_build.sh` or force `[passes.function_call_obfuscate].enabled = false`. |
+| Static Linux binary crashes around import indirection | FCO was left enabled in a static link | Use `cross_build.sh` or force `[passes.function_call_obfuscate].enabled = false` and `[passes.platform_runtime].static_link_expected = true`. |
 | Self-checksum does not detect a native patch | Post-link manifests were not sealed | Seal after final link/strip and run `tools/morok-audit.py --release --require-sealed-manifest`. |
 | E2E max fails off Apple | Some max-level runtime/backend paths are still Apple-first | Use `tests/e2e/portable.toml` and consult the comments in that file. |
 | A huge input stops getting later transforms | Scheduler growth budgets are firing | Narrow with policy/annotations or increase the specific pass budget after adding tests. |

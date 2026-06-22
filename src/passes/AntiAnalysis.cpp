@@ -5122,6 +5122,216 @@ void emitRetDiff(IRBuilder<> &B, AllocaInst *Diff) {
     B.CreateRet(load);
 }
 
+bool linuxArm32Arch(const Triple &TT) {
+    switch (TT.getArch()) {
+    case Triple::arm:
+    case Triple::armeb:
+    case Triple::thumb:
+    case Triple::thumbeb:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool linuxStaticAuxvSyscalls(const Triple &TT, std::uint32_t &OpenAt,
+                             std::uint32_t &Read, std::uint32_t &Close) {
+    if (!TT.isOSLinux())
+        return false;
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        OpenAt = 257;
+        Read = 0;
+        Close = 3;
+        return true;
+    case Triple::aarch64:
+        OpenAt = 56;
+        Read = 63;
+        Close = 57;
+        return true;
+    default:
+        if (linuxArm32Arch(TT)) {
+            OpenAt = 322;
+            Read = 3;
+            Close = 6;
+            return true;
+        }
+        return false;
+    }
+}
+
+Value *staticSyscallArg(IRBuilder<> &B, Module &M, Value *Arg) {
+    auto *ip = intPtrTy(M);
+    if (Arg->getType()->isPointerTy())
+        return B.CreatePtrToInt(Arg, ip);
+    if (auto *it = dyn_cast<IntegerType>(Arg->getType()))
+        return it == ip ? Arg : B.CreateZExtOrTrunc(Arg, ip);
+    return ConstantInt::get(ip, 0);
+}
+
+Value *emitLinuxStaticRawSyscall(IRBuilder<> &B, Module &M, const Triple &TT,
+                                 std::uint32_t Number,
+                                 std::initializer_list<Value *> Args,
+                                 const Twine &Name) {
+    auto *ip = intPtrTy(M);
+    std::array<Value *, 6> sysArgs = {
+        ConstantInt::get(ip, 0), ConstantInt::get(ip, 0),
+        ConstantInt::get(ip, 0), ConstantInt::get(ip, 0),
+        ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)};
+    std::size_t idx = 0;
+    for (Value *arg : Args) {
+        if (idx >= sysArgs.size())
+            break;
+        sysArgs[idx++] = staticSyscallArg(B, M, arg);
+    }
+
+    std::vector<Type *> params(7, ip);
+    auto *asmTy = FunctionType::get(ip, params, false);
+    if (TT.getArch() == Triple::x86_64) {
+        InlineAsm *syscall = InlineAsm::get(
+            asmTy, "syscall",
+            "={rax},{rax},{rdi},{rsi},{rdx},{r10},{r8},{r9},~{rcx},~{r11},"
+            "~{memory},~{dirflag},~{fpsr},~{flags}",
+            /*hasSideEffects=*/true);
+        return B.CreateCall(asmTy, syscall,
+                            {ConstantInt::get(ip, Number), sysArgs[0],
+                             sysArgs[1], sysArgs[2], sysArgs[3], sysArgs[4],
+                             sysArgs[5]},
+                            Name);
+    }
+    if (TT.getArch() == Triple::aarch64) {
+        InlineAsm *svc = InlineAsm::get(
+            asmTy, "svc #0",
+            "={x0},{x8},0,{x1},{x2},{x3},{x4},{x5},~{memory},~{cc}",
+            /*hasSideEffects=*/true);
+        return B.CreateCall(asmTy, svc,
+                            {ConstantInt::get(ip, Number), sysArgs[0],
+                             sysArgs[1], sysArgs[2], sysArgs[3], sysArgs[4],
+                             sysArgs[5]},
+                            Name);
+    }
+    if (linuxArm32Arch(TT)) {
+        InlineAsm *svc = InlineAsm::get(
+            asmTy, "svc #0",
+            "={r0},{r7},0,{r1},{r2},{r3},{r4},{r5},~{memory},~{cc}",
+            /*hasSideEffects=*/true);
+        return B.CreateCall(asmTy, svc,
+                            {ConstantInt::get(ip, Number), sysArgs[0],
+                             sysArgs[1], sysArgs[2], sysArgs[3], sysArgs[4],
+                             sysArgs[5]},
+                            Name);
+    }
+    return ConstantInt::getSigned(ip, -38);
+}
+
+Function *linuxStaticAtBaseProbe(Module &M, ir::IRRandom &rng,
+                                 const Triple &TT) {
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    if (!linuxStaticAuxvSyscalls(TT, openatNr, readNr, closeNr))
+        return nullptr;
+    const unsigned ptrBits = intPtrTy(M)->getBitWidth();
+    if (linuxArm32Arch(TT) && ptrBits != 32)
+        return nullptr;
+    if (ptrBits != 32 && ptrBits != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.static.atbase"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    constexpr std::uint64_t kAuxvBytes = 1024;
+    const std::uint64_t wordBytes = ptrBits / 8u;
+    const std::uint64_t entryBytes = wordBytes * 2u;
+
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.static.atbase", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *readBB = BasicBlock::Create(ctx, "read", fn);
+    auto *scanBB = BasicBlock::Create(ctx, "scan", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    auto *bufTy = ArrayType::get(i8, kAuxvBytes);
+    AllocaInst *buf =
+        B.CreateAlloca(bufTy, nullptr, "morok.antihook.static.auxv.buf");
+    AllocaInst *diff =
+        B.CreateAlloca(i64, nullptr, "morok.antihook.static.atbase.diff");
+    B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
+    Value *bufPtr = B.CreateInBoundsGEP(
+        bufTy, buf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antihook.static.auxv.ptr");
+    Value *path = ir::emitCloakedSymbol(B, M, "/proc/self/auxv", rng);
+    Value *fd = emitLinuxStaticRawSyscall(
+        B, M, TT, openatNr,
+        {constSignedIp(M, -100), path, ConstantInt::get(ip, 0),
+         ConstantInt::get(ip, 0)},
+        "morok.antihook.static.auxv.open");
+    B.CreateCondBr(B.CreateICmpSLT(fd, ConstantInt::getSigned(ip, 0)),
+                   retBB, readBB);
+
+    IRBuilder<> RB(readBB);
+    Value *nread = emitLinuxStaticRawSyscall(
+        RB, M, TT, readNr, {fd, bufPtr, ConstantInt::get(ip, kAuxvBytes)},
+        "morok.antihook.static.auxv.read");
+    emitLinuxStaticRawSyscall(RB, M, TT, closeNr, {fd},
+                              "morok.antihook.static.auxv.close");
+    RB.CreateCondBr(
+        RB.CreateICmpSGE(nread, ConstantInt::get(ip, entryBytes)),
+        scanBB, retBB);
+
+    IRBuilder<> SB(scanBB);
+    auto *off = SB.CreatePHI(ip, 2, "morok.antihook.static.auxv.off");
+    off->addIncoming(ConstantInt::get(ip, 0), readBB);
+    Value *end = SB.CreateAdd(off, ConstantInt::get(ip, entryBytes),
+                              "morok.antihook.static.auxv.end");
+    Value *inRead =
+        SB.CreateICmpSLE(end, nread, "morok.antihook.static.auxv.in.read");
+    Value *inBuf =
+        SB.CreateICmpULE(end, ConstantInt::get(ip, kAuxvBytes),
+                         "morok.antihook.static.auxv.in.buf");
+    SB.CreateCondBr(SB.CreateAnd(inRead, inBuf), bodyBB, retBB);
+
+    IRBuilder<> BB(bodyBB);
+    Value *tag =
+        loadAt(BB, M, ip, bufPtr, off, "morok.antihook.static.atbase.tag");
+    Value *val = loadAt(
+        BB, M, ip, bufPtr,
+        BB.CreateAdd(off, ConstantInt::get(ip, wordBytes),
+                     "morok.antihook.static.atbase.value.off"),
+        "morok.antihook.static.atbase.value");
+    Value *isAtBase =
+        BB.CreateICmpEQ(tag, ConstantInt::get(ip, 7),
+                        "morok.antihook.static.atbase.tag.hit");
+    Value *hasBase =
+        BB.CreateICmpNE(val, ConstantInt::get(ip, 0),
+                        "morok.antihook.static.atbase.value.hit");
+    Value *tripped =
+        BB.CreateAnd(isAtBase, hasBase, "morok.antihook.static.atbase.trip");
+    incrementDiff(BB, diff, tripped, "morok.antihook.static.atbase");
+    BB.CreateCondBr(BB.CreateICmpEQ(tag, ConstantInt::get(ip, 0)), retBB,
+                    nextBB);
+
+    IRBuilder<> NB(nextBB);
+    Value *next = NB.CreateAdd(off, ConstantInt::get(ip, entryBytes),
+                               "morok.antihook.static.auxv.next");
+    NB.CreateBr(scanBB);
+    off->addIncoming(next, nextBB);
+
+    IRBuilder<> RetB(retBB);
+    emitRetDiff(RetB, diff);
+    return fn;
+}
+
 void emitByteDiffLoop(IRBuilder<> &B, Module &M, Function *Fn, Value *MemAddr,
                       Value *CleanPtr, Value *Len, AllocaInst *Diff,
                       const Triple &TT, BasicBlock *Done) {
@@ -26234,7 +26444,8 @@ bool microarchitecturalCanaryModule(Module &M, ir::IRRandom &rng) {
     return true;
 }
 
-bool antiHookingModule(Module &M, ir::IRRandom &rng) {
+bool antiHookingModule(Module &M, ir::IRRandom &rng,
+                       bool staticLinkExpected) {
     const Triple tt(M.getTargetTriple());
     LLVMContext &ctx = M.getContext();
     auto *ptr = PointerType::getUnqual(ctx);
@@ -26292,6 +26503,21 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
                   "morok.antihook.fixup");
         foldFlag(B, state, changed, 0xD1C9A03F76542BE8ULL,
                  "morok.antihook.fixup.changed");
+    }
+    if (staticLinkExpected) {
+        if (Function *atBase = linuxStaticAtBaseProbe(M, rng, tt)) {
+            Value *diff =
+                B.CreateCall(atBase, {}, "morok.antihook.static.atbase.diff");
+            Value *changed =
+                B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0),
+                               "morok.corroborate.static.atbase.changed");
+            addHardGateSignal(B, gate, changed, 3, 0x4B83D719E65A20CFULL,
+                              "morok.gate.static.atbase");
+            foldState(B, state, diff, 0x93C2E47B518D6A0FULL,
+                      "morok.antihook.static.atbase");
+            foldEnforcedFlag(B, state, changed, 0xAF6721C9D40B853EULL,
+                             "morok.antihook.static.atbase.changed");
+        }
     }
     // Census must observe the original protections before W^X remediation can
     // normalize suspicious RWX pages into clean-looking RX mappings.

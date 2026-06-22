@@ -663,7 +663,9 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
 
     // Anti-analysis module passes run earliest.
     if (config_.passes.anti_hook.enabled.value_or(false))
-        changed |= passes::antiHookingModule(M, rng);
+        changed |= passes::antiHookingModule(
+            M, rng,
+            config_.passes.platform_runtime.static_link_expected.value_or(false));
     if (config_.passes.anti_class_dump.enabled.value_or(false))
         changed |= passes::antiClassDumpModule(M);
     if (config_.passes.windows_pe_foundation.enabled.value_or(false))

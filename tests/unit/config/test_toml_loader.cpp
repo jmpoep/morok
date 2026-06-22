@@ -424,6 +424,7 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     per_build_stubs = true
     minimize_imports = true
     import_table_audit = true
+    static_link_expected = true
     [passes.windows_unhook]
     enabled = true
     [passes.windows_veh_audit]
@@ -654,6 +655,7 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.platform_runtime.per_build_stubs == true);
     CHECK(r.config.passes.platform_runtime.minimize_imports == true);
     CHECK(r.config.passes.platform_runtime.import_table_audit == true);
+    CHECK(r.config.passes.platform_runtime.static_link_expected == true);
     CHECK(r.config.passes.windows_unhook.enabled == true);
     CHECK(r.config.passes.windows_veh_audit.enabled == true);
     CHECK(r.config.passes.windows_process_mitigations.enabled == true);

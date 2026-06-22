@@ -184,12 +184,45 @@ derive_static_config() {
   {
     if [ -n "$src" ]; then
       awk '
-        /^[[:space:]]*\[passes\.function_call_obfuscate\][[:space:]]*$/ { skip=1; next }
-        /^[[:space:]]*\[/ { skip=0 }
+        function inject_platform_runtime() {
+          if (in_platform_runtime && !injected_static_flag) {
+            print "static_link_expected = true"
+            injected_static_flag = 1
+          }
+        }
+        /^[[:space:]]*\[passes\.function_call_obfuscate\][[:space:]]*$/ {
+          inject_platform_runtime()
+          skip=1
+          in_platform_runtime=0
+          next
+        }
+        /^[[:space:]]*\[/ {
+          inject_platform_runtime()
+          skip=0
+          in_platform_runtime=0
+        }
+        /^[[:space:]]*\[passes\.platform_runtime\][[:space:]]*$/ {
+          skip=0
+          in_platform_runtime=1
+          saw_platform_runtime=1
+          injected_static_flag=0
+          print
+          next
+        }
+        in_platform_runtime && /^[[:space:]]*static_link_expected[[:space:]]*=/ { next }
         !skip { print }
+        END {
+          inject_platform_runtime()
+          if (!saw_platform_runtime) {
+            print ""
+            print "[passes.platform_runtime]"
+            print "static_link_expected = true"
+          }
+        }
       ' "$src"
     else
       printf '[global]\npreset = "%s"\n' "$preset"
+      printf '\n[passes.platform_runtime]\nstatic_link_expected = true\n'
     fi
     printf '\n[passes.function_call_obfuscate]\nenabled = false\n'
   } >"$out"

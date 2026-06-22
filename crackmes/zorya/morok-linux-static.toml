@@ -5,5 +5,8 @@
 [global]
 preset = "max"
 
+[passes.platform_runtime]
+static_link_expected = true
+
 [passes.function_call_obfuscate]
 enabled = false

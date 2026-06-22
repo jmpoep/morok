@@ -17310,6 +17310,7 @@ entry:
     CHECK_FALSE(functionHasConstantInt(*Maps, 8181u));
     CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
                                  "morok.antihook.prologue.x86.hit") >= 1u);
+    CHECK(M->getFunction("morok.antihook.static.atbase") == nullptr);
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/exe"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/maps"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/environ"));
@@ -17334,6 +17335,106 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "ASAN_OPTIONS"));
     CHECK_FALSE(hasReadableByteString(*M, "MSHookFunction"));
     CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("antiHookingModule emits static-link AT_BASE tripwire only when "
+          "requested") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @work(i32 %x) {
+entry:
+  %y = add i32 %x, 7
+  ret i32 %y
+}
+define i32 @main() {
+entry:
+  %v = call i32 @work(i32 11)
+  ret i32 %v
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(183001);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::antiHookingModule(
+        *M, rng, /*staticLinkExpected=*/true));
+
+    Function *Probe = M->getFunction("morok.antihook.static.atbase");
+    REQUIRE(Probe != nullptr);
+    Function *Ctor = M->getFunction("morok.antihook");
+    REQUIRE(Ctor != nullptr);
+    CHECK(countCallsTo(*Ctor, "morok.antihook.static.atbase") == 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.antihook.static.auxv.open") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.antihook.static.auxv.read") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.antihook.static.atbase.tag") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.antihook.static.atbase.value") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.antihook.static.atbase.trip") >= 1u);
+    CHECK(hasInlineAsmCall(*Probe));
+    CHECK(countCallsTo(*Probe, "getauxval") == 0u);
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/self/auxv"));
+
+    Instruction *Changed =
+        findNamedInstruction(*Ctor, "morok.corroborate.static.atbase.changed");
+    REQUIRE(Changed != nullptr);
+    CHECK(valueFeedsNamedInstruction(Changed,
+                                     "morok.seal.fold.anti_debug"));
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.static.atbase.hard") >=
+          1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("antiHookingModule emits static-link AT_BASE tripwire on Linux arm") {
+    {
+        LLVMContext ctx;
+        auto M = parse(ctx, R"ir(
+target triple = "aarch64-unknown-linux-gnu"
+define i32 @main() {
+entry:
+  ret i32 0
+}
+)ir");
+        auto engine = morok::core::Xoshiro256pp::fromSeed(183002);
+        morok::ir::IRRandom rng(engine);
+
+        CHECK(morok::passes::antiHookingModule(
+            *M, rng, /*staticLinkExpected=*/true));
+        Function *Probe = M->getFunction("morok.antihook.static.atbase");
+        REQUIRE(Probe != nullptr);
+        CHECK(hasInlineAsmCall(*Probe));
+        CHECK(countNamedInstructions(*Probe,
+                                     "morok.antihook.static.atbase.trip") >=
+              1u);
+        CHECK_FALSE(verifyModule(*M, &errs()));
+    }
+    {
+        LLVMContext ctx;
+        auto M = parse(ctx, R"ir(
+target triple = "armv7-unknown-linux-gnueabihf"
+define i32 @main() {
+entry:
+  ret i32 0
+}
+)ir");
+        M->setDataLayout(
+            "e-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64");
+        auto engine = morok::core::Xoshiro256pp::fromSeed(183003);
+        morok::ir::IRRandom rng(engine);
+
+        CHECK(morok::passes::antiHookingModule(
+            *M, rng, /*staticLinkExpected=*/true));
+        Function *Probe = M->getFunction("morok.antihook.static.atbase");
+        REQUIRE(Probe != nullptr);
+        CHECK(hasInlineAsmCall(*Probe));
+        CHECK(countNamedInstructions(*Probe,
+                                     "morok.antihook.static.atbase.trip") >=
+              1u);
+        CHECK_FALSE(verifyModule(*M, &errs()));
+    }
 }
 
 TEST_CASE("antiHookingModule emits Linux aarch64 mprotect SMC probe") {
