@@ -579,6 +579,66 @@ Function *firstFunctionByPrefix(Module &M, StringRef prefix) {
     return nullptr;
 }
 
+void checkWindowsTlsCallbacks(Module &M, StringRef Stem, StringRef CtorName,
+                              CallingConv::ID ExpectedConv = CallingConv::C) {
+    std::string Prefix = (Twine("morok.win.tls.") + Stem).str();
+    std::size_t Slots = 0;
+    for (GlobalVariable &GV : M.globals())
+        if (GV.getName().starts_with(Prefix + ".") &&
+            GV.getSection().starts_with(".CRT$XL"))
+            ++Slots;
+    CHECK(Slots == 4u);
+    CHECK(countFunctions(M, Prefix + ".cb.") == 4u);
+
+    Function *Ctor = M.getFunction(CtorName);
+    REQUIRE(Ctor != nullptr);
+    GlobalVariable *CompilerUsed = M.getGlobalVariable("llvm.compiler.used");
+    REQUIRE(CompilerUsed != nullptr);
+    REQUIRE(CompilerUsed->hasInitializer());
+
+    for (unsigned I = 0; I < 4; ++I) {
+        std::string Suffix = std::to_string(I);
+        std::string SlotName = Prefix + "." + Suffix;
+        std::string CbName = Prefix + ".cb." + Suffix;
+        std::string KeyName = Prefix + ".key." + Suffix;
+        std::string Section = ".CRT$XL";
+        Section.push_back(static_cast<char>('B' + I));
+
+        GlobalVariable *Slot = M.getGlobalVariable(SlotName, true);
+        Function *Cb = M.getFunction(CbName);
+        GlobalVariable *Key = M.getGlobalVariable(KeyName, true);
+        REQUIRE(Slot != nullptr);
+        REQUIRE(Cb != nullptr);
+        REQUIRE(Key != nullptr);
+        CHECK(Slot->isConstant());
+        CHECK(Slot->getSection() == Section);
+        CHECK(Slot->hasInitializer());
+        CHECK(constantReferencesGlobal(Slot->getInitializer(), Cb));
+        CHECK(Cb->arg_size() == 3u);
+        CHECK(Cb->getCallingConv() == ExpectedConv);
+        CHECK(countNamedInstructions(*Cb, Prefix + ".key.load") >= 1u);
+        CHECK(countNamedInstructions(*Cb, Prefix + ".target.decoded") >= 1u);
+        CHECK(countNamedInstructions(*Cb, Prefix + ".callee") >= 1u);
+        CHECK(constantReferencesGlobal(CompilerUsed->getInitializer(), Slot));
+        CHECK(constantReferencesGlobal(CompilerUsed->getInitializer(), Cb));
+        CHECK(constantReferencesGlobal(CompilerUsed->getInitializer(), Key));
+
+        bool HasIndirectCtorCall = false;
+        bool HasDirectCtorCall = false;
+        for (Instruction &Inst : instructions(*Cb)) {
+            auto *CB = dyn_cast<CallBase>(&Inst);
+            if (!CB)
+                continue;
+            Function *Callee = CB->getCalledFunction();
+            HasDirectCtorCall |= Callee == Ctor;
+            HasIndirectCtorCall |=
+                !Callee && CB->getFunctionType() == Ctor->getFunctionType();
+        }
+        CHECK_FALSE(HasDirectCtorCall);
+        CHECK(HasIndirectCtorCall);
+    }
+}
+
 Function *firstFunctionByPrefixAndArity(Module &M, StringRef prefix,
                                         unsigned arity) {
     for (Function &F : M)
@@ -18004,6 +18064,7 @@ entry:
     REQUIRE(VehHandler != nullptr);
     REQUIRE(VehTrip != nullptr);
     REQUIRE(VehHead != nullptr);
+    checkWindowsTlsCallbacks(*M, "antidbg", "morok.antidbg");
     CHECK(WinText->arg_size() == 1u);
     CHECK(WinDr->arg_size() == 1u);
     CHECK(M->getGlobalVariable("morok.antidbg.state", true) != nullptr);
@@ -18175,6 +18236,8 @@ entry:
     REQUIRE(Peb != nullptr);
     REQUIRE(PeText != nullptr);
     REQUIRE(CleanText != nullptr);
+    checkWindowsTlsCallbacks(*M, "antidbg", "morok.antidbg",
+                             CallingConv::X86_StdCall);
     CHECK(M->getFunction("morok.antidbg.win.dr") == nullptr);
     CHECK(M->getFunction("CreateFileW") == nullptr);
     CHECK(M->getFunction("CreateFileMappingW") == nullptr);
@@ -18613,6 +18676,7 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Teb != nullptr);
     REQUIRE(Ldr != nullptr);
     REQUIRE(Resolve != nullptr);
+    checkWindowsTlsCallbacks(*M, "pebheap", "morok.win.pebheap");
     CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
     checkSealEnforcement(*M, *Probe);
     CHECK(hasInlineAsmCall(*Peb));
@@ -18722,6 +18786,7 @@ define i32 @main() { ret i32 0 }
     REQUIRE(WideHash != nullptr);
     REQUIRE(SysScan != nullptr);
     REQUIRE(Direct5 != nullptr);
+    checkWindowsTlsCallbacks(*M, "dbgobj", "morok.win.dbgobj");
     CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
     checkSealEnforcement(*M, *Probe);
     CHECK(M->getFunction("NtQueryInformationProcess") == nullptr);
@@ -18827,6 +18892,7 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Peb != nullptr);
     REQUIRE(Resolve != nullptr);
     REQUIRE(Ldr != nullptr);
+    checkWindowsTlsCallbacks(*M, "thide", "morok.win.thide");
     CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
     checkSealEnforcement(*M, *Probe);
     CHECK(M->getFunction("NtGetNextThread") == nullptr);
@@ -19936,6 +20002,7 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Peb != nullptr);
     REQUIRE(Ldr != nullptr);
     REQUIRE(Resolve != nullptr);
+    checkWindowsTlsCallbacks(*M, "trap", "morok.trap");
     CHECK(M->getGlobalVariable("morok.trap.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.trap.hits", true) != nullptr);
     CHECK(countCallsTo(*Ctor, "morok.trap.win.tf") >= 1u);
@@ -19987,6 +20054,8 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Ctor != nullptr);
     REQUIRE(Probe != nullptr);
     REQUIRE(Handler != nullptr);
+    checkWindowsTlsCallbacks(*M, "trap", "morok.trap",
+                             CallingConv::X86_StdCall);
     CHECK(Handler->getCallingConv() == CallingConv::X86_StdCall);
     CHECK(countCallsTo(*Ctor, "morok.trap.win.tf") >= 1u);
     CHECK(hasInlineAsmCall(*Probe));

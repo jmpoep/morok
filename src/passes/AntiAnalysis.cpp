@@ -134,6 +134,116 @@ IntegerType *intPtrTy(Module &M) {
     return IntegerType::get(M.getContext(), bits);
 }
 
+bool registerWindowsTlsCallbacks(Module &M, Function *Target, StringRef Stem,
+                                 ir::IRRandom &rng, unsigned Count = 4) {
+    const Triple TT(M.getTargetTriple());
+    const bool x86 = TT.getArch() == Triple::x86;
+    const bool x64 = TT.getArch() == Triple::x86_64;
+    if (!Target || !TT.isOSWindows() || (!x86 && !x64))
+        return false;
+    if (Count < 3)
+        Count = 3;
+    if (Count > 8)
+        Count = 8;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *cbTy = FunctionType::get(Type::getVoidTy(ctx), {ptr, i32, ptr}, false);
+    std::string prefix = (Twine("morok.win.tls.") + Stem).str();
+    if (M.getGlobalVariable(prefix + ".0", /*AllowInternal=*/true))
+        return false;
+
+    SmallVector<GlobalValue *, 24> retained;
+    for (unsigned i = 0; i < Count; ++i) {
+        std::string cbName = (Twine(prefix) + ".cb." + Twine(i)).str();
+        Function *cb = Function::Create(cbTy, GlobalValue::InternalLinkage,
+                                        cbName, &M);
+        cb->addFnAttr(Attribute::NoInline);
+        cb->setDSOLocal(true);
+        if (x86)
+            cb->setCallingConv(CallingConv::X86_StdCall);
+        auto argIt = cb->arg_begin();
+        (&*argIt++)->setName("image_base");
+        (&*argIt++)->setName("reason");
+        (&*argIt++)->setName("reserved");
+
+        auto *entry = BasicBlock::Create(ctx, "entry", cb);
+        IRBuilder<> B(entry);
+        std::uint64_t key = rng.next() | 1ULL;
+        auto *keyGv = new GlobalVariable(
+            M, ip, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+            ConstantInt::get(ip, key),
+            (Twine(prefix) + ".key." + Twine(i)).str());
+        keyGv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+        keyGv->setAlignment(Align(ip->getBitWidth() / 8));
+        Value *loadedKey =
+            B.CreateLoad(ip, keyGv, (Twine(prefix) + ".key.load").str());
+        cast<LoadInst>(loadedKey)->setVolatile(true);
+        std::uint64_t salt = rng.next() | 1ULL;
+        Value *targetIp =
+            B.CreatePtrToInt(Target, ip, (Twine(prefix) + ".target.ip").str());
+        Value *encoded = nullptr;
+        Value *decoded = nullptr;
+        switch ((rng.next() ^ i) & 3ULL) {
+        case 0:
+            encoded = B.CreateXor(targetIp, ConstantInt::get(ip, key),
+                                  (Twine(prefix) + ".target.encoded").str());
+            decoded = B.CreateXor(encoded, loadedKey,
+                                  (Twine(prefix) + ".target.decoded").str());
+            break;
+        case 1:
+            encoded = B.CreateXor(
+                B.CreateAdd(targetIp, ConstantInt::get(ip, key)),
+                ConstantInt::get(ip, salt),
+                (Twine(prefix) + ".target.encoded").str());
+            decoded = B.CreateSub(
+                B.CreateXor(encoded, ConstantInt::get(ip, salt)),
+                loadedKey, (Twine(prefix) + ".target.decoded").str());
+            break;
+        case 2:
+            encoded = B.CreateSub(
+                B.CreateXor(targetIp, ConstantInt::get(ip, salt)),
+                ConstantInt::get(ip, key),
+                (Twine(prefix) + ".target.encoded").str());
+            decoded = B.CreateXor(
+                B.CreateAdd(encoded, loadedKey),
+                ConstantInt::get(ip, salt),
+                (Twine(prefix) + ".target.decoded").str());
+            break;
+        default:
+            encoded = B.CreateXor(
+                B.CreateAdd(targetIp, ConstantInt::get(ip, salt)),
+                ConstantInt::get(ip, key),
+                (Twine(prefix) + ".target.encoded").str());
+            decoded = B.CreateSub(
+                B.CreateXor(encoded, loadedKey),
+                ConstantInt::get(ip, salt),
+                (Twine(prefix) + ".target.decoded").str());
+            break;
+        }
+        Value *callee =
+            B.CreateIntToPtr(decoded, ptr, (Twine(prefix) + ".callee").str());
+        B.CreateCall(Target->getFunctionType(), callee, {});
+        B.CreateRetVoid();
+
+        auto *slot = new GlobalVariable(
+            M, ptr, /*isConstant=*/true, GlobalValue::InternalLinkage, cb,
+            (Twine(prefix) + "." + Twine(i)).str());
+        std::string section = ".CRT$XL";
+        section.push_back(static_cast<char>('B' + i));
+        slot->setSection(section);
+        slot->setAlignment(Align(ip->getBitWidth() / 8));
+        slot->setDSOLocal(true);
+        retained.push_back(slot);
+        retained.push_back(cb);
+        retained.push_back(keyGv);
+    }
+    appendToCompilerUsed(M, retained);
+    return true;
+}
+
 GlobalVariable *antiDebugState(Module &M, ir::IRRandom &rng) {
     if (auto *existing =
             M.getGlobalVariable("morok.antidbg.state", /*AllowInternal=*/true))
@@ -23313,6 +23423,7 @@ bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
     Function *probe = antiDebugProbe(M, state, rng, tt);
     insertAntiDebugCallsiteProbes(M, probe, rng);
     appendToGlobalCtors(M, ctor, 0);
+    registerWindowsTlsCallbacks(M, ctor, "antidbg", rng);
     if (startLiveWatchers)
         emitAntiDebugWatchdogStart(M, probe, state, rng, tt);
     return true;
@@ -23377,6 +23488,7 @@ bool trapOracleModule(Module &M, ir::IRRandom &rng) {
         B.CreateCall(probe);
         B.CreateRetVoid();
         appendToGlobalCtors(M, ctor, 0);
+        registerWindowsTlsCallbacks(M, ctor, "trap", rng);
         return true;
     }
 
@@ -23871,6 +23983,7 @@ bool windowsPebHeapDebugModule(Module &M, ir::IRRandom &rng) {
     B.CreateCall(probe);
     B.CreateRetVoid();
     appendToGlobalCtors(M, ctor, 0);
+    registerWindowsTlsCallbacks(M, ctor, "pebheap", rng);
     return true;
 }
 
@@ -23887,6 +24000,7 @@ bool windowsDebugObjectModule(Module &M, ir::IRRandom &rng) {
     B.CreateCall(probe);
     B.CreateRetVoid();
     appendToGlobalCtors(M, ctor, 0);
+    registerWindowsTlsCallbacks(M, ctor, "dbgobj", rng);
     return true;
 }
 
@@ -23903,6 +24017,7 @@ bool windowsThreadHideModule(Module &M, ir::IRRandom &rng) {
     B.CreateCall(probe);
     B.CreateRetVoid();
     appendToGlobalCtors(M, ctor, 0);
+    registerWindowsTlsCallbacks(M, ctor, "thide", rng);
     return true;
 }
 
