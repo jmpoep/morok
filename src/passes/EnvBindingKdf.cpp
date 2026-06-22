@@ -437,6 +437,21 @@ bool defineLinuxCollector(Module &M, Function *Feed, Function *Finish,
                           ir::IRRandom &Rng) {
     if (M.getFunction(kCtorName))
         return false;
+    // #239: Feed/Finish are fetched in the caller via raw M.getFunction lookups
+    // that bypass defineFeed/defineFinish's getApiFunction signature validation.
+    // A hostile input module can predeclare morok.envbind.feed / .finish with
+    // incompatible prototypes; emitting calls against those types asserts in
+    // assert builds and yields verifier-rejected IR in release builds — a plugin
+    // DoS. Only proceed when both helpers have exactly the expected prototypes.
+    auto *I64 = Type::getInt64Ty(M.getContext());
+    auto *Ptr = PointerType::getUnqual(M.getContext());
+    auto *FeedTy = FunctionType::get(Type::getVoidTy(M.getContext()),
+                                     {I64, Ptr, I64}, /*isVarArg=*/false);
+    auto *FinishTy = FunctionType::get(Type::getVoidTy(M.getContext()), {I64},
+                                       /*isVarArg=*/false);
+    if (!Feed || !Finish || Feed->getFunctionType() != FeedTy ||
+        Finish->getFunctionType() != FinishTy)
+        return false;
     auto *Fn = Function::Create(
         FunctionType::get(Type::getVoidTy(M.getContext()), false),
         GlobalValue::InternalLinkage, kCtorName, &M);
@@ -462,7 +477,7 @@ bool defineLinuxCollector(Module &M, Function *Feed, Function *Finish,
                                 .str());
         ++Index;
     }
-    B.CreateCall(Finish->getFunctionType(), Finish,
+    B.CreateCall(FinishTy, Finish,
                  {ConstantInt::get(B.getInt64Ty(), Rng.next())});
     B.CreateRetVoid();
     appendToGlobalCtors(M, Fn, 0);
@@ -472,6 +487,18 @@ bool defineLinuxCollector(Module &M, Function *Feed, Function *Finish,
 bool defineFinishOnlyCollector(Module &M, Function *Finish, ir::IRRandom &Rng) {
     if (!Finish || M.getFunction(kCtorName))
         return false;
+    // #239: this fallback is reached via a raw M.getFunction(kFinishName) that
+    // bypasses defineFinish's getApiFunction signature validation. A hostile
+    // input module can predeclare morok.envbind.finish with an incompatible
+    // prototype (different arity / non-i64 params / varargs); emitting a call
+    // with a single hardcoded i64 against that type asserts in assert builds and
+    // produces verifier-rejected IR in release builds — a plugin DoS. Validate
+    // the prototype is exactly the expected void(i64) before emitting the call.
+    auto *ExpectedTy = FunctionType::get(Type::getVoidTy(M.getContext()),
+                                         {Type::getInt64Ty(M.getContext())},
+                                         /*isVarArg=*/false);
+    if (Finish->getFunctionType() != ExpectedTy)
+        return false;
     auto *Fn = Function::Create(
         FunctionType::get(Type::getVoidTy(M.getContext()), false),
         GlobalValue::InternalLinkage, kCtorName, &M);
@@ -479,7 +506,7 @@ bool defineFinishOnlyCollector(Module &M, Function *Finish, ir::IRRandom &Rng) {
     Fn->addFnAttr(Attribute::NoUnwind);
     BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", Fn);
     IRBuilder<> B(Entry);
-    B.CreateCall(Finish->getFunctionType(), Finish,
+    B.CreateCall(ExpectedTy, Finish,
                  {ConstantInt::get(B.getInt64Ty(), Rng.next())});
     B.CreateRetVoid();
     appendToGlobalCtors(M, Fn, 0);

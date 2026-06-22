@@ -10455,6 +10455,47 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("envBindingKdfModule rejects a hostile-typed finish helper instead of "
+          "crashing the collectors (#239)") {
+    LLVMContext ctx;
+    // Hostile input module predeclares morok.envbind.finish with an
+    // incompatible prototype (two i64 params instead of the expected void(i64)).
+    // defineFinish bails (getApiFunction rejects the type mismatch) and leaves
+    // this hostile symbol in place; the Linux collector and the finish-only
+    // fallback both re-fetch it via a raw getFunction. They must validate the
+    // prototype and refuse to emit a call rather than asserting (assert builds)
+    // or producing verifier-rejected IR (release builds) — a plugin DoS.
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define void @morok.envbind.finish(i64 %a, i64 %b) {
+entry:
+  ret void
+}
+define i32 @main() {
+entry:
+  ret i32 0
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(239239);
+    morok::ir::IRRandom rng(engine);
+
+    morok::passes::EnvBindingKdfParams params;
+    params.bind_to_runtime_seal = true;  // exercises the finish-only fallback
+    // Default mode ("auto") on x86_64-linux also exercises the Linux collector
+    // path; both must reject the hostile finish without crashing.
+    morok::passes::envBindingKdfModule(*M, params, rng);
+
+    // No collector ctor may be emitted against the hostile prototype, and the
+    // hostile finish must NOT be the target of any 1-arg call (the rejected
+    // collectors emit nothing).
+    Function *Collect = M->getFunction("morok.envbind.collect");
+    CHECK(Collect == nullptr);
+    Function *HostileFinish = M->getFunction("morok.envbind.finish");
+    REQUIRE(HostileFinish != nullptr);
+    CHECK(HostileFinish->getFunctionType()->getNumParams() == 2u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("envBindingKdfModule finish-only fallback dirties missing identity") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
