@@ -41,7 +41,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace llvm;
@@ -53,6 +56,46 @@ namespace {
 constexpr std::uint32_t kMaxCallsPerModule = 256;
 constexpr std::uint64_t kFnvOffset = 0xCBF29CE484222325ULL;
 constexpr std::uint64_t kFnvPrime = 0x100000001B3ULL;
+
+// Per-build keyed name hash.  The textbook FNV-1a constants above are a
+// fingerprint: an analyst recognises them, hashes the libc namespace, and maps
+// every resolver hash back to its API.  We instead salt the offset basis and
+// swap in a per-build random *odd* multiplier (odd keeps the multiply a
+// bijection mod 2^64, so no two distinct accumulators ever collapse).  The
+// same key must drive both the compile-time hashName() that bakes each target
+// constant and the runtime resolver IR that re-hashes export-table names, so it
+// is stored once per module and read back at every site through hashKeyFor() —
+// a single source of truth that cannot silently diverge (a mismatch would
+// resolve to NULL and jump to address 0).  Keyed by Module* and mutex-guarded
+// because ThinLTO processes backend modules on separate threads.
+struct HashKey {
+    std::uint64_t offset;
+    std::uint64_t prime;
+};
+
+std::mutex &hashKeyMutex() {
+    static std::mutex M;
+    return M;
+}
+std::unordered_map<const Module *, HashKey> &hashKeyTable() {
+    static std::unordered_map<const Module *, HashKey> T;
+    return T;
+}
+void setHashKey(const Module &M, HashKey K) {
+    std::lock_guard<std::mutex> Lock(hashKeyMutex());
+    hashKeyTable()[&M] = K;
+}
+void clearHashKey(const Module &M) {
+    std::lock_guard<std::mutex> Lock(hashKeyMutex());
+    hashKeyTable().erase(&M);
+}
+HashKey hashKeyFor(const Module &M) {
+    std::lock_guard<std::mutex> Lock(hashKeyMutex());
+    auto It = hashKeyTable().find(&M);
+    if (It == hashKeyTable().end())
+        return {kFnvOffset, kFnvPrime};
+    return It->second;
+}
 
 struct ExceptionRuntime {
     GlobalVariable *hash = nullptr;
@@ -93,36 +136,37 @@ Value *rotl64(IRBuilder<> &B, Value *V, unsigned Amount) {
                       "morok.fco.ptr.rot");
 }
 
-std::uint64_t hashName(StringRef Name) {
-    std::uint64_t H = kFnvOffset;
+std::uint64_t hashName(StringRef Name, const Module &M) {
+    const HashKey HK = hashKeyFor(M);
+    std::uint64_t H = HK.offset;
     for (unsigned char C : Name.bytes()) {
         H ^= C;
-        H *= kFnvPrime;
+        H *= HK.prime;
     }
-    return H ? H : kFnvPrime;
+    return H ? H : HK.prime;
 }
 
-std::vector<std::uint64_t> darwinAliasHashes(StringRef Name) {
+std::vector<std::uint64_t> darwinAliasHashes(StringRef Name, const Module &M) {
     if (Name == "strlen")
-        return {hashName("_platform_strlen")};
+        return {hashName("_platform_strlen", M)};
     if (Name == "strcpy")
-        return {hashName("_platform_strcpy")};
+        return {hashName("_platform_strcpy", M)};
     if (Name == "strcmp")
-        return {hashName("_platform_strcmp")};
+        return {hashName("_platform_strcmp", M)};
     if (Name == "strncmp")
-        return {hashName("_platform_strncmp")};
+        return {hashName("_platform_strncmp", M)};
     if (Name == "strchr")
-        return {hashName("_platform_strchr")};
+        return {hashName("_platform_strchr", M)};
     if (Name == "strnlen")
-        return {hashName("_platform_strnlen")};
+        return {hashName("_platform_strnlen", M)};
     if (Name == "memset")
-        return {hashName("_platform_memset")};
+        return {hashName("_platform_memset", M)};
     if (Name == "memcpy" || Name == "memmove")
-        return {hashName("_platform_memmove")};
+        return {hashName("_platform_memmove", M)};
     if (Name == "memcmp")
-        return {hashName("_platform_memcmp")};
+        return {hashName("_platform_memcmp", M)};
     if (Name == "memchr")
-        return {hashName("_platform_memchr")};
+        return {hashName("_platform_memchr", M)};
     return {};
 }
 
@@ -299,6 +343,7 @@ Function *windowsPeHashName(Module &M) {
     Fn->setDSOLocal(true);
     Argument *Name = Fn->getArg(0);
     Name->setName("name");
+    const HashKey HK = hashKeyFor(M);
 
     auto *Entry = BasicBlock::Create(Ctx, "entry", Fn);
     auto *Loop = BasicBlock::Create(Ctx, "loop", Fn);
@@ -313,7 +358,7 @@ Function *windowsPeHashName(Module &M) {
     auto *Idx = LB.CreatePHI(IP, 2, "morok.win.pe.hash.idx");
     auto *Acc = LB.CreatePHI(I64, 2, "morok.win.pe.hash.acc");
     Idx->addIncoming(ConstantInt::get(IP, 0), Entry);
-    Acc->addIncoming(ConstantInt::get(I64, kFnvOffset), Entry);
+    Acc->addIncoming(ConstantInt::get(I64, HK.offset), Entry);
     LB.CreateCondBr(LB.CreateICmpULT(Idx, ConstantInt::get(IP, 256)), Body,
                     Ret);
 
@@ -327,7 +372,7 @@ Function *windowsPeHashName(Module &M) {
     Value *Wide = NB.CreateZExt(Ch, I64, "morok.win.pe.hash.wide");
     Value *NextAcc =
         NB.CreateMul(NB.CreateXor(Acc, Wide, "morok.win.pe.hash.xor"),
-                     ConstantInt::get(I64, kFnvPrime),
+                     ConstantInt::get(I64, HK.prime),
                      "morok.win.pe.hash.next");
     Value *NextIdx =
         NB.CreateAdd(Idx, ConstantInt::get(IP, 1),
@@ -620,6 +665,7 @@ Value *runtimeHashName(IRBuilder<> &B, Module &M, Function *Fn, Value *Name) {
     LLVMContext &Ctx = M.getContext();
     auto *I8 = Type::getInt8Ty(Ctx);
     auto *I64 = Type::getInt64Ty(Ctx);
+    const HashKey HK = hashKeyFor(M);
 
     BasicBlock *Entry = B.GetInsertBlock();
     BasicBlock *Loop = BasicBlock::Create(Ctx, "morok.fco.ex.hash.loop", Fn);
@@ -631,7 +677,7 @@ Value *runtimeHashName(IRBuilder<> &B, Module &M, Function *Fn, Value *Name) {
     auto *Idx = LB.CreatePHI(I64, 2, "morok.fco.ex.hash.idx");
     auto *Acc = LB.CreatePHI(I64, 2, "morok.fco.ex.hash.acc");
     Idx->addIncoming(ConstantInt::get(I64, 0), Entry);
-    Acc->addIncoming(ConstantInt::get(I64, kFnvOffset), Entry);
+    Acc->addIncoming(ConstantInt::get(I64, HK.offset), Entry);
     Value *CharPtr = LB.CreateInBoundsGEP(I8, Name, Idx,
                                           "morok.fco.ex.hash.ptr");
     Value *Ch = LB.CreateLoad(I8, CharPtr, "morok.fco.ex.hash.byte");
@@ -642,7 +688,7 @@ Value *runtimeHashName(IRBuilder<> &B, Module &M, Function *Fn, Value *Name) {
     IRBuilder<> HB(Body);
     Value *Wide = HB.CreateZExt(Ch, I64, "morok.fco.ex.hash.zext");
     Value *Next = HB.CreateMul(HB.CreateXor(Acc, Wide, "morok.fco.ex.hash.xor"),
-                              ConstantInt::get(I64, kFnvPrime),
+                              ConstantInt::get(I64, HK.prime),
                               "morok.fco.ex.hash.next");
     Value *NextIdx =
         HB.CreateAdd(Idx, ConstantInt::get(I64, 1), "morok.fco.ex.hash.idx2");
@@ -1380,8 +1426,9 @@ Function *machoTrieHashResolver(Module &M) {
     auto *Ptr = PointerType::getUnqual(Ctx);
     Function *ReadUleb = machoReadUleb(M);
 
-    constexpr std::uint64_t FnvOffset = 14695981039346656037ull;
-    constexpr std::uint64_t FnvPrime = 1099511628211ull;
+    const HashKey HK = hashKeyFor(M);
+    const std::uint64_t FnvOffset = HK.offset;
+    const std::uint64_t FnvPrime = HK.prime;
     constexpr std::uint64_t StackCap = 4096;
     constexpr std::uint64_t StepCap = 262144;
 
@@ -2394,6 +2441,43 @@ bool functionCallObfuscateModule(Module &M, const FcoParams &params,
     const Triple tt(M.getTargetTriple());
     const int rtldDefaultVal = tt.isOSDarwin() ? -2 : 0; // RTLD_DEFAULT
 
+    // Derive the per-build keyed hash before any resolver IR is emitted, so the
+    // runtime hashers (created just below) and the compile-time hashName() in
+    // the loop share one key.  Reroll the salt/multiplier until every obfuscated
+    // import hashes to a distinct nonzero value, so the runtime resolver can
+    // never alias two APIs to the same slot.
+    {
+        std::vector<StringRef> wantNames;
+        wantNames.reserve(targets.size());
+        for (CallBase *cb : targets) {
+            StringRef n = cb->getCalledFunction()->getName();
+            if (n.consume_front(StringRef("\x01", 1)) && tt.isOSDarwin())
+                n.consume_front("_");
+            wantNames.push_back(n);
+        }
+        HashKey hk{kFnvOffset, kFnvPrime};
+        for (unsigned attempt = 0; attempt < 64; ++attempt) {
+            hk = HashKey{kFnvOffset ^ rng.next(), rng.next() | 1ull};
+            std::unordered_set<std::uint64_t> seen;
+            bool ok = true;
+            for (StringRef n : wantNames) {
+                std::uint64_t H = hk.offset;
+                for (unsigned char c : n.bytes()) {
+                    H ^= c;
+                    H *= hk.prime;
+                }
+                H = H ? H : hk.prime;
+                if (!seen.insert(H).second) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok)
+                break;
+        }
+        setHashKey(M, hk);
+    }
+
     const bool manualResolver = useManualHashResolver(M, tt);
     FunctionCallee resolver;
     if (manualResolver) {
@@ -2420,10 +2504,10 @@ bool functionCallObfuscateModule(Module &M, const FcoParams &params,
         StringRef dlName = callee->getName();
         if (dlName.consume_front(StringRef("\x01", 1)) && tt.isOSDarwin())
             dlName.consume_front("_");
-        const std::uint64_t symHash = hashName(dlName);
+        const std::uint64_t symHash = hashName(dlName, M);
         std::vector<std::uint64_t> resolverHashes{symHash};
         if (manualResolver && tt.isOSDarwin()) {
-            std::vector<std::uint64_t> Aliases = darwinAliasHashes(dlName);
+            std::vector<std::uint64_t> Aliases = darwinAliasHashes(dlName, M);
             resolverHashes.insert(resolverHashes.end(), Aliases.begin(),
                                   Aliases.end());
         }
@@ -2488,6 +2572,7 @@ bool functionCallObfuscateModule(Module &M, const FcoParams &params,
         cb->eraseFromParent();
         changed = true;
     }
+    clearHashKey(M);
     return changed;
 }
 

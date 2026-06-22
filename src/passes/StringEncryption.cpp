@@ -16,6 +16,7 @@
 #include "morok/passes/StringEncryption.hpp"
 
 #include "morok/ir/SymbolCloak.hpp"
+#include "morok/passes/CodeRegionKdf.hpp"
 
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -256,13 +257,13 @@ bool collectStackUseSites(Value *V, const GlobalVariable *GV,
 
 // Emit, unrolled, the decryption of `n` bytes read from `src[i]` and written to
 // `dst[i]` (both base pointers to `arrTy` == [n x i8]) at B's insertion point.
-void emitDecryptUnrolled(IRBuilder<> &B, const Cipher &c, GlobalVariable *seed,
+void emitDecryptUnrolled(IRBuilder<> &B, const Cipher &c, Function *seedFn,
                          Value *src, Value *dst, ArrayType *arrTy,
                          std::uint64_t n) {
     auto *i8 = Type::getInt8Ty(B.getContext());
     auto *i64 = Type::getInt64Ty(B.getContext());
-    LoadInst *seedLoad = B.CreateLoad(i64, seed, /*isVolatile=*/true);
-    emitStaticAnalysisBarrier(B, *seed->getParent());
+    Value *seedLoad = B.CreateCall(seedFn, {}, "morok.str.seed.v");
+    emitStaticAnalysisBarrier(B, *seedFn->getParent());
     Value *seedMix =
         B.CreateAdd(seedLoad,
                     emitVolatileStableZero(B, c.key ^ c.mul,
@@ -288,7 +289,7 @@ void emitDecryptUnrolled(IRBuilder<> &B, const Cipher &c, GlobalVariable *seed,
 }
 
 Function *createStackDecryptHelper(Module &M, const Cipher &C,
-                                   GlobalVariable *Seed,
+                                   Function *SeedFn,
                                    GlobalVariable *CipherText, ArrayType *ArrTy,
                                    std::uint64_t Len) {
     LLVMContext &Ctx = M.getContext();
@@ -307,7 +308,7 @@ Function *createStackDecryptHelper(Module &M, const Cipher &C,
 
     if (Len <= kUnrollThreshold) {
         IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Fn));
-        emitDecryptUnrolled(B, C, Seed, CipherText, DstArg, ArrTy, Len);
+        emitDecryptUnrolled(B, C, SeedFn, CipherText, DstArg, ArrTy, Len);
         B.CreateRetVoid();
         return Fn;
     }
@@ -317,8 +318,7 @@ Function *createStackDecryptHelper(Module &M, const Cipher &C,
     BasicBlock *Done = BasicBlock::Create(Ctx, "morok.str.stack.done", Fn);
 
     IRBuilder<> EB(Entry);
-    LoadInst *SeedLoad =
-        EB.CreateLoad(I64, Seed, /*isVolatile=*/true, "morok.str.stack.k");
+    Value *SeedLoad = EB.CreateCall(SeedFn, {}, "morok.str.stack.k");
     emitStaticAnalysisBarrier(EB, M);
     Value *SeedMix =
         EB.CreateAdd(SeedLoad,
@@ -360,12 +360,12 @@ Function *createStackDecryptHelper(Module &M, const Cipher &C,
 }
 
 Value *emitStackString(Instruction *InsertBefore, const Cipher &C,
-                       GlobalVariable *Seed, GlobalVariable *CipherText,
+                       Function *SeedFn, GlobalVariable *CipherText,
                        ArrayType *ArrTy, std::uint64_t Len) {
     Function *F = InsertBefore->getFunction();
     Module &M = *F->getParent();
     Function *Helper =
-        createStackDecryptHelper(M, C, Seed, CipherText, ArrTy, Len);
+        createStackDecryptHelper(M, C, SeedFn, CipherText, ArrTy, Len);
     auto *I64 = Type::getInt64Ty(M.getContext());
     // Hoist the buffer to the entry block (a static alloca) so it is allocated
     // once per call activation, not once per loop iteration: a per-use alloca in
@@ -413,7 +413,7 @@ GlobalVariable *createGuard(Module &M) {
 }
 
 bool materializeStackUses(GlobalVariable *GV, const Cipher &C,
-                          GlobalVariable *Seed, ArrayType *ArrTy,
+                          Function *SeedFn, ArrayType *ArrTy,
                           std::uint64_t Len) {
     // Large strings would put a large buffer on the frame at each use; leave
     // those to the in-place global decryptor.
@@ -433,10 +433,109 @@ bool materializeStackUses(GlobalVariable *GV, const Cipher &C,
     for (UseSite Site : Sites) {
         Value *&Stack = PerInst[Site.inst];
         if (!Stack)
-            Stack = emitStackString(Site.inst, C, Seed, GV, ArrTy, Len);
+            Stack = emitStackString(Site.inst, C, SeedFn, GV, ArrTy, Len);
         Site.inst->setOperand(Site.operand, Stack);
     }
+
+    // Shrink the at-rest plaintext window (#1).  collectStackUseSites accepted
+    // this global only because every use is a non-capturing call argument, so
+    // each per-instruction buffer is provably dead the moment its call returns;
+    // zero it right afterwards with a volatile memset (volatile so DSE cannot
+    // drop it as a dead store).  The cleartext is then live only across the
+    // single consuming call instead of persisting in the frame until the
+    // function returns — narrowing the byte-granular memory-scan window the
+    // field report used to recover decrypted strings.  A using instruction that
+    // is a terminator (invoke) has no in-block successor to anchor the scrub and
+    // is simply left unscrubbed.
+    for (const auto &KV : PerInst) {
+        Instruction *Use = KV.first;
+        Value *Buf = KV.second;
+        if (Instruction *Next = Use->getNextNode()) {
+            IRBuilder<> SB(Next);
+            SB.CreateMemSet(Buf, SB.getInt8(0),
+                            ConstantInt::get(SB.getInt64Ty(), Len),
+                            MaybeAlign(1), /*isVolatile=*/true);
+        }
+    }
     return true;
+}
+
+// Tier-B keystream seed.  The per-string keys used to be keyed on a literal
+// module-seed constant sitting in .data — an analyst reads that one word and
+// decrypts the entire pool statically (exactly the recovered `G` constant in
+// the field report).  Instead we derive the seed at runtime by hashing a fixed
+// pseudo-random const blob: the hash is recomputed in-register on every call
+// and never stored, so no seed word exists in the file or in live memory, and
+// recovery now requires executing or re-implementing the hash over the blob.
+// The byte loads are volatile and the function is optnone/noinline so the
+// optimizer cannot fold the call back into the very constant we are hiding (if
+// it did, the literal seed would reappear in .text).  seedVal is the
+// compile-time hash the runtime reproduces, used to encrypt the pool.
+struct SeedProvider {
+    Function *fn = nullptr;
+    std::uint64_t value = 0;
+};
+
+SeedProvider createSeedProvider(Module &M, ir::IRRandom &rng) {
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+
+    // Irregular length so the blob does not read as a dedicated 8/16-byte key.
+    const unsigned blobLen = 48 + rng.range(48); // 48..95 bytes
+    std::vector<std::uint8_t> blob(blobLen);
+    for (unsigned i = 0; i < blobLen; ++i)
+        blob[i] = static_cast<std::uint8_t>(rng.next());
+    const std::uint64_t kdfSeed = rng.next();
+    const std::uint64_t seedVal = code_region_kdf::hashBytes(blob, kdfSeed);
+
+    Constant *blobInit =
+        ConstantDataArray::get(ctx, ArrayRef<std::uint8_t>(blob));
+    auto *blobGV = new GlobalVariable(M, blobInit->getType(),
+                                      /*isConstant=*/true,
+                                      GlobalValue::PrivateLinkage, blobInit,
+                                      "morok.str.kdf.blob");
+    blobGV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    auto *arrTy = cast<ArrayType>(blobGV->getValueType());
+
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::InternalLinkage, "morok.str.seed",
+                                &M);
+    fn->setDSOLocal(true);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->addFnAttr(Attribute::OptimizeNone);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loop = BasicBlock::Create(ctx, "loop", fn);
+    auto *exit = BasicBlock::Create(ctx, "exit", fn);
+
+    IRBuilder<> EB(entry);
+    EB.CreateBr(loop);
+
+    IRBuilder<> LB(loop);
+    PHINode *iv = LB.CreatePHI(i64, 2, "morok.str.seed.i");
+    PHINode *h = LB.CreatePHI(i64, 2, "morok.str.seed.h");
+    iv->addIncoming(ConstantInt::get(i64, 0), entry);
+    h->addIncoming(ConstantInt::get(i64, kdfSeed), entry);
+    Value *bp = LB.CreateInBoundsGEP(arrTy, blobGV,
+                                     {ConstantInt::get(i64, 0), iv},
+                                     "morok.str.seed.bp");
+    LoadInst *byte = LB.CreateLoad(i8, bp, "morok.str.seed.byte");
+    byte->setVolatile(true);
+    byte->setAlignment(Align(1));
+    Value *nh = code_region_kdf::emitHashStep(LB, h, byte, "morok.str.seed");
+    Value *ni =
+        LB.CreateAdd(iv, ConstantInt::get(i64, 1), "morok.str.seed.next");
+    iv->addIncoming(ni, loop);
+    h->addIncoming(nh, loop);
+    Value *done = LB.CreateICmpEQ(ni, ConstantInt::get(i64, blobLen),
+                                  "morok.str.seed.done");
+    LB.CreateCondBr(done, exit, loop);
+
+    IRBuilder<> XB(exit);
+    XB.CreateRet(nh);
+
+    return {fn, seedVal};
 }
 
 } // namespace
@@ -498,11 +597,14 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
     if (targets.empty())
         return false;
 
-    // One runtime-opaque module seed underlies every per-string key; reading it
-    // with a volatile load keeps the optimizer from folding ciphertext to text.
-    GlobalVariable *seed = ir::cloakSeed(M, rng);
-    const std::uint64_t seedVal =
-        cast<ConstantInt>(seed->getInitializer())->getZExtValue();
+    // One runtime-opaque module seed underlies every per-string key.  It is
+    // produced by a seed function that hashes a fixed const blob at runtime
+    // (see createSeedProvider), so no literal seed constant sits in the file for
+    // a static "read the word, decrypt the pool" recovery; seedVal is the
+    // compile-time hash the runtime reproduces.
+    const SeedProvider seedProv = createSeedProvider(M, rng);
+    Function *seedFn = seedProv.fn;
+    const std::uint64_t seedVal = seedProv.value;
 
     bool changed = false;
     for (GlobalVariable *gv : targets) {
@@ -584,7 +686,7 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
         auto *arrTy = cast<ArrayType>(target->getValueType());
 
         if (stackCandidate &&
-            materializeStackUses(target, c, seed, arrTy, storedLen)) {
+            materializeStackUses(target, c, seedFn, arrTy, storedLen)) {
             changed = true;
             continue;
         }
@@ -632,12 +734,12 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
 
         IRBuilder<> B(decBB);
         if (storedLen <= kUnrollThreshold) {
-            emitDecryptUnrolled(B, c, seed, target, target, arrTy, storedLen);
+            emitDecryptUnrolled(B, c, seedFn, target, target, arrTy, storedLen);
         } else {
             auto *loop = BasicBlock::Create(ctx, "morok.str.loop", decFn);
             auto *loopExit =
                 BasicBlock::Create(ctx, "morok.str.loopexit", decFn);
-            LoadInst *seedLoad = B.CreateLoad(i64, seed, /*isVolatile=*/true);
+            Value *seedLoad = B.CreateCall(seedFn, {}, "morok.str.loop.seed");
             emitStaticAnalysisBarrier(B, M);
             Value *seedMix = B.CreateAdd(
                 seedLoad,
