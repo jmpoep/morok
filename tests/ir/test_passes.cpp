@@ -18955,7 +18955,10 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Probe, "morok.win.ldr.vad.audit.result") >=
           1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.ldr.vad.bad.total") >= 1u);
-    CHECK(countNamedInstructions(*Probe, "morok.win.ldr.vad.bad.any") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.ldr.vad.image.bad.any") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.ldr.vad.private.bad.any") >=
+          1u);
     CHECK(countNamedInstructions(*Scan, "morok.win.veh.scan.riprel") >= 1u);
     CHECK(countNamedInstructions(*Scan, "morok.win.veh.scan.candidate.ok") >=
           1u);
@@ -18994,10 +18997,22 @@ define i32 @main() { ret i32 0 }
         findNamedInstruction(*Probe, "morok.win.ldr.audit.bad.any");
     REQUIRE(LdrBad != nullptr);
     CHECK(valueFeedsNamedInstruction(LdrBad, "morok.seal.fold.anti_debug"));
-    Instruction *VadBad =
-        findNamedInstruction(*Probe, "morok.win.ldr.vad.bad.any");
-    REQUIRE(VadBad != nullptr);
-    CHECK(valueFeedsNamedInstruction(VadBad, "morok.seal.fold.anti_debug"));
+    // #224: the phantom MEM_IMAGE count (zero-on-clean per #198) is enforced
+    // into the consumed anti-debug seal...
+    Instruction *VadImageBad =
+        findNamedInstruction(*Probe, "morok.win.ldr.vad.image.bad.any");
+    REQUIRE(VadImageBad != nullptr);
+    CHECK(valueFeedsNamedInstruction(VadImageBad,
+                                     "morok.seal.fold.anti_debug"));
+    // ...but the private-executable (W^X/RWX JIT) count is NOT zero-on-clean
+    // (managed/JIT runtimes map private execute pages before init), so it must
+    // stay telemetry and must NOT reach the seal, else clean hosts corrupt
+    // their key schedule.
+    Instruction *VadPrivateBad =
+        findNamedInstruction(*Probe, "morok.win.ldr.vad.private.bad.any");
+    REQUIRE(VadPrivateBad != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(VadPrivateBad,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.remove.status") == 0u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.remove.ready") == 0u);
     CHECK(countNamedInstructions(*Contains, "morok.win.ldr.contains.match") >=

@@ -20474,9 +20474,17 @@ Function *windowsVehAuditProbe(Module &M, GlobalVariable *State,
     Value *ldrBadAny =
         AB.CreateICmpNE(ldrBadTotal, ConstantInt::get(i32, 0),
                         "morok.win.ldr.audit.bad.any");
-    Value *vadBadAny =
-        AB.CreateICmpNE(vadBadTotal, ConstantInt::get(i32, 0),
-                        "morok.win.ldr.vad.bad.any");
+    // Phantom MEM_IMAGE regions (an image VAD with no backing LDR entry) are
+    // zero-on-clean per #198, so the image count stays in the enforced seal.
+    Value *vadImageBadAny =
+        AB.CreateICmpNE(vadImageTotal, ConstantInt::get(i32, 0),
+                        "morok.win.ldr.vad.image.bad.any");
+    // Private executable memory (W^X/RWX JIT) is NOT zero-on-clean: managed/JIT
+    // runtimes (.NET/CLR, V8, JVM, browsers, AV shims) legitimately map private
+    // execute pages before init, so the private-exec count is telemetry only.
+    Value *vadPrivateBadAny =
+        AB.CreateICmpNE(vadPrivateTotal, ConstantInt::get(i32, 0),
+                        "morok.win.ldr.vad.private.bad.any");
     foldState(AB, State, addCandidate, rng.next(),
               "morok.win.veh.list.from.add.mix");
     foldState(AB, State, removeCandidate, rng.next(),
@@ -20503,8 +20511,13 @@ Function *windowsVehAuditProbe(Module &M, GlobalVariable *State,
               "morok.win.ldr.vad.bad.total.mix");
     foldEnforcedFlag(AB, State, ldrBadAny, 0x5CE10A64BF923D71ULL,
                      "morok.win.ldr.audit.changed");
-    foldEnforcedFlag(AB, State, vadBadAny, 0xC9E2305AF41B876DULL,
+    // Only the phantom-image signal is enforced into the consumed seal; the
+    // private-exec count is demoted to telemetry to preserve zero-on-clean on
+    // JIT/W^X hosts (#224), mirroring the foreign-VEH handling below.
+    foldEnforcedFlag(AB, State, vadImageBadAny, 0xC9E2305AF41B876DULL,
                      "morok.win.ldr.vad.changed");
+    foldFlag(AB, State, vadPrivateBadAny, 0x4F8B12D7A36C90E5ULL,
+             "morok.win.ldr.vad.private");
     // Foreign VEH classification is not zero-on-clean: legitimate runtimes can
     // register non-image/JIT handlers, so keep it out of the enforced seal.
     foldFlag(AB, State,
