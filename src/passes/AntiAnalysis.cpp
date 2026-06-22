@@ -16266,6 +16266,47 @@ Function *windowsDirectSyscall5Thunk(Module &M) {
     return fn;
 }
 
+Function *windowsDirectSyscall11Thunk(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.sys.direct11"))
+        return existing;
+    const Triple TT(M.getTargetTriple());
+    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64)
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    std::vector<Type *> params;
+    params.reserve(12);
+    params.push_back(i32);
+    for (unsigned I = 0; I < 11; ++I)
+        params.push_back(ip);
+    auto *fnTy = FunctionType::get(ip, params, false);
+    auto *fn = Function::Create(fnTy, GlobalValue::PrivateLinkage,
+                                "morok.win.sys.direct11", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    InlineAsm *IA = InlineAsm::get(
+        fnTy,
+        "subq $$0x60, %rsp\n"
+        "movq $6, 0x28(%rsp)\nmovq $7, 0x30(%rsp)\n"
+        "movq $8, 0x38(%rsp)\nmovq $9, 0x40(%rsp)\n"
+        "movq $10, 0x48(%rsp)\nmovq $11, 0x50(%rsp)\n"
+        "movq $12, 0x58(%rsp)\nmovq %rcx, %r10\n"
+        "syscall\naddq $$0x60, %rsp",
+        "={rax},{eax},{rcx},{rdx},{r8},{r9},r,r,r,r,r,r,r,~{r10},~{r11},"
+        "~{memory},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    SmallVector<Value *, 12> args;
+    for (Argument &A : fn->args())
+        args.push_back(&A);
+    B.CreateRet(B.CreateCall(fnTy, IA, args, "morok.win.sys.direct11.ret"));
+    return fn;
+}
+
 Function *windowsIndirectSyscallThunk(Module &M) {
     if (Function *existing = M.getFunction("morok.win.sys.indirect"))
         return existing;
@@ -17803,6 +17844,456 @@ Function *windowsThreadHideProbe(Module &M, GlobalVariable *State,
     return fn;
 }
 
+GlobalVariable *windowsAttachWatchIpGlobal(Module &M, StringRef Name) {
+    if (auto *existing = M.getGlobalVariable(Name, /*AllowInternal=*/true))
+        return existing;
+    auto *ip = intPtrTy(M);
+    auto *gv = new GlobalVariable(M, ip, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(ip, 0), Name);
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(8));
+    return gv;
+}
+
+GlobalVariable *windowsAttachWatchI32Global(Module &M, StringRef Name) {
+    if (auto *existing = M.getGlobalVariable(Name, /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i32, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i32, 0), Name);
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(4));
+    return gv;
+}
+
+GlobalVariable *windowsAttachWatchTarget(Module &M) {
+    return windowsAttachWatchIpGlobal(M, "morok.win.attach.watch.target");
+}
+
+GlobalVariable *windowsAttachWatchGetNextSsn(Module &M) {
+    return windowsAttachWatchI32Global(M,
+                                       "morok.win.attach.watch.getnext.ssn");
+}
+
+GlobalVariable *windowsAttachWatchQuerySsn(Module &M) {
+    return windowsAttachWatchI32Global(M, "morok.win.attach.watch.query.ssn");
+}
+
+GlobalVariable *windowsAttachWatchCloseSsn(Module &M) {
+    return windowsAttachWatchI32Global(M, "morok.win.attach.watch.close.ssn");
+}
+
+GlobalVariable *windowsAttachWatchDelaySsn(Module &M) {
+    return windowsAttachWatchI32Global(M, "morok.win.attach.watch.delay.ssn");
+}
+
+GlobalVariable *windowsAttachWatchSetInfoSsn(Module &M) {
+    return windowsAttachWatchI32Global(M, "morok.win.attach.watch.setinfo.ssn");
+}
+
+GlobalVariable *windowsAttachWatchHits(Module &M) {
+    return windowsAttachWatchI32Global(M, "morok.win.attach.watch.hits");
+}
+
+static Value *emitWindowsDirect11(IRBuilder<> &B, Function *Direct11,
+                                  std::initializer_list<Value *> Args,
+                                  const Twine &Name) {
+    SmallVector<Value *, 12> callArgs;
+    callArgs.append(Args.begin(), Args.end());
+    auto *ip = intPtrTy(*Direct11->getParent());
+    while (callArgs.size() < 12)
+        callArgs.push_back(ConstantInt::get(ip, 0));
+    return B.CreateCall(Direct11->getFunctionType(), Direct11, callArgs, Name);
+}
+
+Function *windowsRemoteBreakinWatchThread(Module &M, GlobalVariable *State) {
+    if (Function *existing = M.getFunction("morok.win.attach.watch.thread"))
+        return existing;
+
+    Function *direct11 = windowsDirectSyscall11Thunk(M);
+    if (!direct11)
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    constexpr std::uint32_t kThreadQueryInformation = 0x40;
+    constexpr std::uint32_t kThreadHideFromDebugger = 0x11;
+    constexpr std::uint32_t kThreadQuerySetWin32StartAddress = 9;
+    constexpr std::uint32_t kMaxThreadsPerPoll = 64;
+
+    auto *fn = Function::Create(FunctionType::get(i32, {ptr}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.attach.watch.thread", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    fn->getArg(0)->setName("ctx");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *hideGateBB = BasicBlock::Create(ctx, "hide.gate", fn);
+    auto *hideBB = BasicBlock::Create(ctx, "hide", fn);
+    auto *pollLoopBB = BasicBlock::Create(ctx, "poll.loop", fn);
+    auto *enumLoopBB = BasicBlock::Create(ctx, "enum.loop", fn);
+    auto *closePrevGateBB = BasicBlock::Create(ctx, "close.prev.gate", fn);
+    auto *closePrevBB = BasicBlock::Create(ctx, "close.prev", fn);
+    auto *probeBB = BasicBlock::Create(ctx, "probe", fn);
+    auto *hitBB = BasicBlock::Create(ctx, "hit", fn);
+    auto *enumNextBB = BasicBlock::Create(ctx, "enum.next", fn);
+    auto *closeLastGateBB = BasicBlock::Create(ctx, "close.last.gate", fn);
+    auto *closeLastBB = BasicBlock::Create(ctx, "close.last", fn);
+    auto *delayBB = BasicBlock::Create(ctx, "delay", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *nextThread =
+        B.CreateAlloca(ip, nullptr, "morok.win.attach.watch.next.slot");
+    AllocaInst *startAddress =
+        B.CreateAlloca(ip, nullptr, "morok.win.attach.watch.start.slot");
+    AllocaInst *retLen =
+        B.CreateAlloca(i32, nullptr, "morok.win.attach.watch.retlen");
+    AllocaInst *delayInterval =
+        B.CreateAlloca(i64, nullptr, "morok.win.attach.watch.delay.interval");
+    B.CreateStore(ConstantInt::get(ip, 0), nextThread)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), startAddress)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
+    B.CreateStore(ConstantInt::getSigned(i64, -500000), delayInterval)
+        ->setVolatile(true);
+    Value *target =
+        B.CreateLoad(ip, windowsAttachWatchTarget(M),
+                     "morok.win.attach.watch.target.v");
+    cast<LoadInst>(target)->setVolatile(true);
+    Value *getNextSsn =
+        B.CreateLoad(i32, windowsAttachWatchGetNextSsn(M),
+                     "morok.win.attach.watch.getnext.ssn.v");
+    cast<LoadInst>(getNextSsn)->setVolatile(true);
+    Value *querySsn =
+        B.CreateLoad(i32, windowsAttachWatchQuerySsn(M),
+                     "morok.win.attach.watch.query.ssn.v");
+    cast<LoadInst>(querySsn)->setVolatile(true);
+    Value *closeSsn =
+        B.CreateLoad(i32, windowsAttachWatchCloseSsn(M),
+                     "morok.win.attach.watch.close.ssn.v");
+    cast<LoadInst>(closeSsn)->setVolatile(true);
+    Value *delaySsn =
+        B.CreateLoad(i32, windowsAttachWatchDelaySsn(M),
+                     "morok.win.attach.watch.delay.ssn.v");
+    cast<LoadInst>(delaySsn)->setVolatile(true);
+    Value *setInfoSsn =
+        B.CreateLoad(i32, windowsAttachWatchSetInfoSsn(M),
+                     "morok.win.attach.watch.setinfo.ssn.v");
+    cast<LoadInst>(setInfoSsn)->setVolatile(true);
+    Value *ready = B.CreateAnd(
+        B.CreateAnd(B.CreateICmpNE(target, ConstantInt::get(ip, 0)),
+                    B.CreateICmpNE(getNextSsn, ConstantInt::get(i32, 0)),
+                    "morok.win.attach.watch.target.getnext.ready"),
+        B.CreateAnd(B.CreateICmpNE(querySsn, ConstantInt::get(i32, 0)),
+                    B.CreateAnd(B.CreateICmpNE(closeSsn,
+                                               ConstantInt::get(i32, 0)),
+                                B.CreateICmpNE(delaySsn,
+                                               ConstantInt::get(i32, 0)),
+                                "morok.win.attach.watch.close.delay.ready"),
+                    "morok.win.attach.watch.query.ready"),
+        "morok.win.attach.watch.ready");
+    B.CreateCondBr(ready, hideGateBB, retBB);
+
+    IRBuilder<> HGB(hideGateBB);
+    HGB.CreateCondBr(HGB.CreateICmpNE(setInfoSsn, ConstantInt::get(i32, 0),
+                                      "morok.win.attach.watch.setinfo.ready"),
+                     hideBB, pollLoopBB);
+
+    IRBuilder<> HB(hideBB);
+    Value *hideStatus = emitWindowsDirect11(
+        HB, direct11,
+        {setInfoSsn, ConstantInt::getSigned(ip, -2),
+         ConstantInt::get(ip, kThreadHideFromDebugger),
+         ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.win.attach.watch.hide.status");
+    foldState(HB, State, hideStatus, 0x9A4C31E27BD8056FULL,
+              "morok.win.attach.watch.hide.status.mix");
+    HB.CreateBr(pollLoopBB);
+
+    IRBuilder<> PL(pollLoopBB);
+    auto *pollIdx = PL.CreatePHI(i32, 2, "morok.win.attach.watch.poll.idx");
+    pollIdx->addIncoming(ConstantInt::get(i32, 0), hideGateBB);
+    pollIdx->addIncoming(ConstantInt::get(i32, 0), hideBB);
+    PL.CreateBr(enumLoopBB);
+
+    IRBuilder<> EL(enumLoopBB);
+    auto *current = EL.CreatePHI(ip, 2, "morok.win.attach.watch.current");
+    auto *threadIdx = EL.CreatePHI(i32, 2, "morok.win.attach.watch.thread.idx");
+    current->addIncoming(ConstantInt::get(ip, 0), pollLoopBB);
+    threadIdx->addIncoming(ConstantInt::get(i32, 0), pollLoopBB);
+    EL.CreateStore(ConstantInt::get(ip, 0), nextThread)->setVolatile(true);
+    Value *getStatus = emitWindowsDirect11(
+        EL, direct11,
+        {getNextSsn, ConstantInt::getSigned(ip, -1), current,
+         ConstantInt::get(ip, kThreadQueryInformation), ConstantInt::get(ip, 0),
+         ConstantInt::get(ip, 0),
+         EL.CreatePtrToInt(nextThread, ip,
+                           "morok.win.attach.watch.next.slot.ip")},
+        "morok.win.attach.watch.getnext.status");
+    Value *getStatus32 =
+        EL.CreateTrunc(getStatus, i32, "morok.win.attach.watch.getnext.i32");
+    Value *nextHandle =
+        EL.CreateLoad(ip, nextThread, "morok.win.attach.watch.next.handle");
+    cast<LoadInst>(nextHandle)->setVolatile(true);
+    Value *gotThread = EL.CreateAnd(
+        EL.CreateAnd(EL.CreateICmpSGE(getStatus32, ConstantInt::get(i32, 0)),
+                     EL.CreateICmpNE(nextHandle, ConstantInt::get(ip, 0)),
+                     "morok.win.attach.watch.next.valid"),
+        EL.CreateICmpULT(threadIdx, ConstantInt::get(i32, kMaxThreadsPerPoll),
+                         "morok.win.attach.watch.thread.limit"),
+        "morok.win.attach.watch.got.thread");
+    EL.CreateCondBr(gotThread, closePrevGateBB, closeLastGateBB);
+
+    IRBuilder<> CPG(closePrevGateBB);
+    CPG.CreateCondBr(CPG.CreateICmpNE(current, ConstantInt::get(ip, 0),
+                                      "morok.win.attach.watch.close.prev.needed"),
+                     closePrevBB, probeBB);
+
+    IRBuilder<> CP(closePrevBB);
+    Value *closePrevStatus = emitWindowsDirect11(
+        CP, direct11, {closeSsn, current},
+        "morok.win.attach.watch.close.prev.status");
+    foldState(CP, State, closePrevStatus, 0x6F31C4A92D50B78EULL,
+              "morok.win.attach.watch.close.prev.mix");
+    CP.CreateBr(probeBB);
+
+    IRBuilder<> PB(probeBB);
+    PB.CreateStore(ConstantInt::get(ip, 0), startAddress)->setVolatile(true);
+    PB.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
+    Value *queryStatus = emitWindowsDirect11(
+        PB, direct11,
+        {querySsn, nextHandle,
+         ConstantInt::get(ip, kThreadQuerySetWin32StartAddress),
+         PB.CreatePtrToInt(startAddress, ip,
+                           "morok.win.attach.watch.start.slot.ip"),
+         ConstantInt::get(ip, 8),
+         PB.CreatePtrToInt(retLen, ip, "morok.win.attach.watch.retlen.ip")},
+        "morok.win.attach.watch.query.status");
+    Value *queryStatus32 =
+        PB.CreateTrunc(queryStatus, i32, "morok.win.attach.watch.query.i32");
+    Value *start =
+        PB.CreateLoad(ip, startAddress, "morok.win.attach.watch.start");
+    cast<LoadInst>(start)->setVolatile(true);
+    Value *queryOk = PB.CreateICmpSGE(queryStatus32, ConstantInt::get(i32, 0),
+                                      "morok.win.attach.watch.query.ok");
+    Value *breakinHit = PB.CreateAnd(
+        queryOk, PB.CreateICmpEQ(start, target,
+                                 "morok.win.attach.watch.start.match"),
+        "morok.win.attach.watch.breakin.thread");
+    foldFlag(PB, State, breakinHit, 0xB57A21C6D9043E8FULL,
+             "morok.win.attach.watch.breakin.thread",
+             /*ScoreSoftSignal=*/true);
+    PB.CreateCondBr(breakinHit, hitBB, enumNextBB);
+
+    IRBuilder<> HitB(hitBB);
+    HitB.CreateAtomicRMW(AtomicRMWInst::Add, windowsAttachWatchHits(M),
+                         ConstantInt::get(i32, 1), Align(4),
+                         AtomicOrdering::Monotonic);
+    HitB.CreateBr(enumNextBB);
+
+    IRBuilder<> EN(enumNextBB);
+    Value *nextIdx =
+        EN.CreateAdd(threadIdx, ConstantInt::get(i32, 1),
+                     "morok.win.attach.watch.thread.next.idx");
+    EN.CreateBr(enumLoopBB);
+    current->addIncoming(nextHandle, enumNextBB);
+    threadIdx->addIncoming(nextIdx, enumNextBB);
+
+    IRBuilder<> CLG(closeLastGateBB);
+    CLG.CreateCondBr(CLG.CreateICmpNE(current, ConstantInt::get(ip, 0),
+                                      "morok.win.attach.watch.close.last.needed"),
+                     closeLastBB, delayBB);
+
+    IRBuilder<> CL(closeLastBB);
+    Value *closeLastStatus = emitWindowsDirect11(
+        CL, direct11, {closeSsn, current},
+        "morok.win.attach.watch.close.last.status");
+    foldState(CL, State, closeLastStatus, 0xA1E74D308BC6529FULL,
+              "morok.win.attach.watch.close.last.mix");
+    CL.CreateBr(delayBB);
+
+    IRBuilder<> DB(delayBB);
+    Value *delayStatus = emitWindowsDirect11(
+        DB, direct11,
+        {delaySsn, ConstantInt::get(ip, 0),
+         DB.CreatePtrToInt(delayInterval, ip,
+                           "morok.win.attach.watch.delay.interval.ip")},
+        "morok.win.attach.watch.delay.status");
+    foldState(DB, State, delayStatus, 0x437C98E21A6D50BFULL,
+              "morok.win.attach.watch.delay.status.mix");
+    Value *nextPoll =
+        DB.CreateAdd(pollIdx, ConstantInt::get(i32, 1),
+                     "morok.win.attach.watch.poll.next");
+    DB.CreateBr(pollLoopBB);
+    pollIdx->addIncoming(nextPoll, delayBB);
+
+    IRBuilder<> RB(retBB);
+    RB.CreateRet(ConstantInt::get(i32, 0));
+    return fn;
+}
+
+void emitWindowsRemoteBreakinWatcherStart(
+    IRBuilder<> &B, Module &M, GlobalVariable *State, ir::IRRandom &rng,
+    Function *Scanner, Function *Direct11, Function *Watcher,
+    Value *RemoteBreakin, Value *NtGetNextThread,
+    Value *NtQueryInformationThread, Value *NtClose, Value *NtSetInformationThread,
+    Value *NtDelayExecution, Value *NtCreateThreadEx) {
+    if (!Scanner || !Direct11 || !Watcher)
+        return;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    Function *parent = B.GetInsertBlock()->getParent();
+
+    Value *getNextPack = B.CreateCall(
+        Scanner->getFunctionType(), Scanner,
+        {B.CreateIntToPtr(NtGetNextThread, ptr,
+                          "morok.win.attach.watch.getnext.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.win.attach.watch.getnext.pack");
+    Value *queryPack = B.CreateCall(
+        Scanner->getFunctionType(), Scanner,
+        {B.CreateIntToPtr(NtQueryInformationThread, ptr,
+                          "morok.win.attach.watch.query.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.win.attach.watch.query.pack");
+    Value *closePack = B.CreateCall(
+        Scanner->getFunctionType(), Scanner,
+        {B.CreateIntToPtr(NtClose, ptr, "morok.win.attach.watch.close.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.win.attach.watch.close.pack");
+    Value *setInfoPack = B.CreateCall(
+        Scanner->getFunctionType(), Scanner,
+        {B.CreateIntToPtr(NtSetInformationThread, ptr,
+                          "morok.win.attach.watch.setinfo.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.win.attach.watch.setinfo.pack");
+    Value *delayPack = B.CreateCall(
+        Scanner->getFunctionType(), Scanner,
+        {B.CreateIntToPtr(NtDelayExecution, ptr,
+                          "morok.win.attach.watch.delay.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.win.attach.watch.delay.pack");
+    Value *createPack = B.CreateCall(
+        Scanner->getFunctionType(), Scanner,
+        {B.CreateIntToPtr(NtCreateThreadEx, ptr,
+                          "morok.win.attach.watch.create.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.win.attach.watch.create.pack");
+
+    Value *getNextSsn =
+        B.CreateTrunc(getNextPack, i32, "morok.win.attach.watch.getnext.ssn");
+    Value *querySsn =
+        B.CreateTrunc(queryPack, i32, "morok.win.attach.watch.query.ssn");
+    Value *closeSsn =
+        B.CreateTrunc(closePack, i32, "morok.win.attach.watch.close.ssn");
+    Value *setInfoSsn =
+        B.CreateTrunc(setInfoPack, i32, "morok.win.attach.watch.setinfo.ssn");
+    Value *delaySsn =
+        B.CreateTrunc(delayPack, i32, "morok.win.attach.watch.delay.ssn");
+    Value *createSsn =
+        B.CreateTrunc(createPack, i32, "morok.win.attach.watch.create.ssn");
+
+    B.CreateStore(RemoteBreakin, windowsAttachWatchTarget(M))->setVolatile(true);
+    B.CreateStore(getNextSsn, windowsAttachWatchGetNextSsn(M))
+        ->setVolatile(true);
+    B.CreateStore(querySsn, windowsAttachWatchQuerySsn(M))->setVolatile(true);
+    B.CreateStore(closeSsn, windowsAttachWatchCloseSsn(M))->setVolatile(true);
+    B.CreateStore(setInfoSsn, windowsAttachWatchSetInfoSsn(M))
+        ->setVolatile(true);
+    B.CreateStore(delaySsn, windowsAttachWatchDelaySsn(M))->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), windowsAttachWatchHits(M))
+        ->setVolatile(true);
+
+    foldState(B, State, getNextPack, rng.next(),
+              "morok.win.attach.watch.getnext.pack.mix");
+    foldState(B, State, queryPack, rng.next(),
+              "morok.win.attach.watch.query.pack.mix");
+    foldState(B, State, closePack, rng.next(),
+              "morok.win.attach.watch.close.pack.mix");
+    foldState(B, State, setInfoPack, rng.next(),
+              "morok.win.attach.watch.setinfo.pack.mix");
+    foldState(B, State, delayPack, rng.next(),
+              "morok.win.attach.watch.delay.pack.mix");
+    foldState(B, State, createPack, rng.next(),
+              "morok.win.attach.watch.create.pack.mix");
+
+    AllocaInst *threadHandle =
+        B.CreateAlloca(ip, nullptr, "morok.win.attach.watch.handle");
+    B.CreateStore(ConstantInt::get(ip, 0), threadHandle)->setVolatile(true);
+    Value *ready = B.CreateAnd(
+        B.CreateAnd(B.CreateICmpNE(RemoteBreakin, ConstantInt::get(ip, 0)),
+                    B.CreateICmpNE(createSsn, ConstantInt::get(i32, 0)),
+                    "morok.win.attach.watch.remote.create.ready"),
+        B.CreateAnd(B.CreateICmpNE(getNextSsn, ConstantInt::get(i32, 0)),
+                    B.CreateAnd(B.CreateICmpNE(querySsn,
+                                               ConstantInt::get(i32, 0)),
+                                B.CreateAnd(B.CreateICmpNE(closeSsn,
+                                                           ConstantInt::get(i32, 0)),
+                                            B.CreateICmpNE(delaySsn,
+                                                           ConstantInt::get(i32, 0)),
+                                            "morok.win.attach.watch.close.delay.ssn.ready"),
+                                "morok.win.attach.watch.query.ssn.ready"),
+                    "morok.win.attach.watch.poll.ssn.ready"),
+        "morok.win.attach.watch.launch.ready");
+
+    auto *launchBB =
+        BasicBlock::Create(ctx, "watch.launch", parent);
+    auto *closeGateBB =
+        BasicBlock::Create(ctx, "watch.close.gate", parent);
+    auto *closeBB = BasicBlock::Create(ctx, "watch.close", parent);
+    auto *doneBB = BasicBlock::Create(ctx, "watch.done", parent);
+    B.CreateCondBr(ready, launchBB, doneBB);
+
+    IRBuilder<> LB(launchBB);
+    Value *createStatus = emitWindowsDirect11(
+        LB, Direct11,
+        {createSsn,
+         LB.CreatePtrToInt(threadHandle, ip,
+                           "morok.win.attach.watch.handle.ip"),
+         ConstantInt::get(ip, 0x001FFFFFULL), ConstantInt::get(ip, 0),
+         ConstantInt::getSigned(ip, -1),
+         LB.CreatePtrToInt(Watcher, ip, "morok.win.attach.watch.thread.ip"),
+         ConstantInt::get(ip, 0), ConstantInt::get(ip, 0x4),
+         ConstantInt::get(ip, 0), ConstantInt::get(ip, 0),
+         ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.win.attach.watch.create.status");
+    Value *createStatus32 =
+        LB.CreateTrunc(createStatus, i32, "morok.win.attach.watch.create.i32");
+    foldState(LB, State, createStatus, rng.next(),
+              "morok.win.attach.watch.create.status.mix");
+    LB.CreateCondBr(
+        LB.CreateICmpSGE(createStatus32, ConstantInt::get(i32, 0),
+                         "morok.win.attach.watch.create.ok"),
+        closeGateBB, doneBB);
+
+    IRBuilder<> CGB(closeGateBB);
+    Value *watchHandle =
+        CGB.CreateLoad(ip, threadHandle, "morok.win.attach.watch.handle.v");
+    cast<LoadInst>(watchHandle)->setVolatile(true);
+    CGB.CreateCondBr(CGB.CreateICmpNE(watchHandle, ConstantInt::get(ip, 0),
+                                      "morok.win.attach.watch.handle.present"),
+                     closeBB, doneBB);
+
+    IRBuilder<> CB(closeBB);
+    Value *closeStatus = emitWindowsDirect11(
+        CB, Direct11, {closeSsn, watchHandle},
+        "morok.win.attach.watch.handle.close.status");
+    foldState(CB, State, closeStatus, rng.next(),
+              "morok.win.attach.watch.handle.close.mix");
+    CB.CreateBr(doneBB);
+
+    B.SetInsertPoint(doneBB);
+}
+
 Function *windowsPatchRetHelper(Module &M) {
     if (Function *existing = M.getFunction("morok.win.attach.patch.ret"))
         return existing;
@@ -18389,13 +18880,16 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
     Function *patchRet = windowsPatchRetHelper(M);
     Function *patchRemote = windowsPatchRemoteBreakinHelper(M);
     Function *invalidProbe = windowsInvalidHandleProbeHelper(M);
+    Function *scanner = windowsSyscallStubScanner(M);
+    Function *direct11 = windowsDirectSyscall11Thunk(M);
+    Function *watcher = windowsRemoteBreakinWatchThread(M, State);
     GlobalVariable *invalidExceptionSeen =
         windowsInvalidHandleExceptionSeen(M);
     Function *uefFilter = windowsUnhandledExceptionFilter(M);
     GlobalVariable *uefReached = windowsUefReachedFlag(M);
     if (!pebReader || !moduleByHash || !resolver || !patchRet ||
-        !patchRemote || !invalidProbe || !invalidExceptionSeen || !uefFilter ||
-        !uefReached)
+        !patchRemote || !invalidProbe || !scanner || !direct11 || !watcher ||
+        !invalidExceptionSeen || !uefFilter || !uefReached)
         return nullptr;
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
@@ -18439,6 +18933,28 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
     Value *ntClose = RB.CreateCall(
         resolver, {ntdll, ConstantInt::get(i64, fnv1aName("NtClose"))},
         "morok.win.attach.ntclose");
+    Value *ntGetNextThread = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtGetNextThread"))},
+        "morok.win.attach.watch.ntgetnextthread");
+    Value *ntQueryInformationThread = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64,
+                                 fnv1aName("NtQueryInformationThread"))},
+        "morok.win.attach.watch.ntqueryinformationthread");
+    Value *ntSetInformationThread = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64,
+                                 fnv1aName("NtSetInformationThread"))},
+        "morok.win.attach.watch.ntsetinformationthread");
+    Value *ntDelayExecution = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtDelayExecution"))},
+        "morok.win.attach.watch.ntdelayexecution");
+    Value *ntCreateThreadEx = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtCreateThreadEx"))},
+        "morok.win.attach.watch.ntcreatethreadex");
     Value *rtlAddVeh = RB.CreateCall(
         resolver,
         {ntdll, ConstantInt::get(i64,
@@ -18502,6 +19018,16 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
               "morok.win.attach.remote.breakin.mix");
     foldState(RB, State, dbgBreak, rng.next(),
               "morok.win.attach.dbg.breakpoint.mix");
+    foldState(RB, State, ntGetNextThread, rng.next(),
+              "morok.win.attach.watch.ntgetnextthread.mix");
+    foldState(RB, State, ntQueryInformationThread, rng.next(),
+              "morok.win.attach.watch.ntqueryinformationthread.mix");
+    foldState(RB, State, ntSetInformationThread, rng.next(),
+              "morok.win.attach.watch.ntsetinformationthread.mix");
+    foldState(RB, State, ntDelayExecution, rng.next(),
+              "morok.win.attach.watch.ntdelayexecution.mix");
+    foldState(RB, State, ntCreateThreadEx, rng.next(),
+              "morok.win.attach.watch.ntcreatethreadex.mix");
     foldState(RB, State, rtlAddVeh, rng.next(),
               "morok.win.attach.invalid.rtladd.mix");
     foldState(RB, State, rtlRemoveVeh, rng.next(),
@@ -18556,6 +19082,10 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
         "morok.win.attach.patch.failed");
     foldEnforcedFlag(RB, State, patchFailed, 0xE57B1490C6A32D8FULL,
                      "morok.win.attach.patch.failed");
+    emitWindowsRemoteBreakinWatcherStart(
+        RB, M, State, rng, scanner, direct11, watcher, remoteBreakin,
+        ntGetNextThread, ntQueryInformationThread, ntClose,
+        ntSetInformationThread, ntDelayExecution, ntCreateThreadEx);
     RB.CreateStore(ConstantInt::get(i32, 0), uefReached)->setVolatile(true);
     RB.CreateBr(uefGateBB);
 

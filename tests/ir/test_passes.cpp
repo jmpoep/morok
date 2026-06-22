@@ -18837,6 +18837,8 @@ define i32 @main() { ret i32 0 }
     Function *InvalidVeh =
         M->getFunction("morok.win.attach.invalid.exception.handler");
     Function *Uef = M->getFunction("morok.win.attach.uef.filter");
+    Function *Watcher = M->getFunction("morok.win.attach.watch.thread");
+    Function *Direct11 = M->getFunction("morok.win.sys.direct11");
     Function *Resolve = M->getFunction("morok.win.pe.resolve");
     REQUIRE(Ctor != nullptr);
     REQUIRE(Probe != nullptr);
@@ -18845,6 +18847,8 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Invalid != nullptr);
     REQUIRE(InvalidVeh != nullptr);
     REQUIRE(Uef != nullptr);
+    REQUIRE(Watcher != nullptr);
+    REQUIRE(Direct11 != nullptr);
     REQUIRE(Resolve != nullptr);
     CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.win.attach.invalid.exception.seen",
@@ -18855,21 +18859,69 @@ define i32 @main() { ret i32 0 }
                                true) != nullptr);
     CHECK(M->getGlobalVariable("morok.win.attach.uef.reached", true) !=
           nullptr);
+    CHECK(M->getGlobalVariable("morok.win.attach.watch.target", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.win.attach.watch.getnext.ssn", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.win.attach.watch.query.ssn", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.win.attach.watch.close.ssn", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.win.attach.watch.delay.ssn", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.win.attach.watch.setinfo.ssn", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.win.attach.watch.hits", true) !=
+          nullptr);
     checkSealEnforcement(*M, *Probe);
     CHECK(M->getFunction("DbgUiRemoteBreakin") == nullptr);
     CHECK(M->getFunction("DbgBreakPoint") == nullptr);
     CHECK(M->getFunction("ExitProcess") == nullptr);
     CHECK(M->getFunction("CloseHandle") == nullptr);
     CHECK(M->getFunction("NtClose") == nullptr);
+    CHECK(M->getFunction("NtCreateThreadEx") == nullptr);
+    CHECK(M->getFunction("NtDelayExecution") == nullptr);
+    CHECK(M->getFunction("NtGetNextThread") == nullptr);
+    CHECK(M->getFunction("NtQueryInformationThread") == nullptr);
+    CHECK(M->getFunction("NtSetInformationThread") == nullptr);
     CHECK(M->getFunction("RtlAddVectoredExceptionHandler") == nullptr);
     CHECK(M->getFunction("RtlRemoveVectoredExceptionHandler") == nullptr);
     CHECK(M->getFunction("SetUnhandledExceptionFilter") == nullptr);
     CHECK(M->getFunction("RaiseException") == nullptr);
+    CHECK(hasInlineAsmCall(*Direct11));
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.remote.breakin") >=
           1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.dbg.breakpoint") >=
           1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.ntprotect") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.watch.ntcreatethreadex") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.watch.ntgetnextthread") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.watch.ntqueryinformationthread") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.watch.ntsetinformationthread") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.watch.ntdelayexecution") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.watch.getnext.pack") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.watch.query.pack") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.watch.close.pack") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.watch.setinfo.pack") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.watch.delay.pack") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.watch.create.pack") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.watch.launch.ready") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.watch.create.status") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.watch.handle.close.status") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.kernelbase") >= 1u);
     CHECK(countNamedInstructions(
               *Probe, "morok.win.attach.kernelbase.exitprocess") >= 1u);
@@ -18917,6 +18969,23 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Uef, "morok.win.attach.uef.code.match") >=
           1u);
     CHECK(functionHasConstantInt(*Uef, 0xE0424D4Fu));
+    CHECK(countNamedInstructions(*Watcher,
+                                 "morok.win.attach.watch.hide.status") >= 1u);
+    CHECK(countNamedInstructions(*Watcher,
+                                 "morok.win.attach.watch.getnext.status") >= 1u);
+    CHECK(countNamedInstructions(*Watcher,
+                                 "morok.win.attach.watch.query.status") >= 1u);
+    CHECK(countNamedInstructions(*Watcher,
+                                 "morok.win.attach.watch.start.match") >= 1u);
+    CHECK(countNamedInstructions(
+              *Watcher, "morok.win.attach.watch.breakin.thread") >= 1u);
+    CHECK(countNamedInstructions(*Watcher,
+                                 "morok.win.attach.watch.delay.status") >= 1u);
+    Instruction *BreakinThread =
+        findNamedInstruction(*Watcher, "morok.win.attach.watch.breakin.thread");
+    REQUIRE(BreakinThread != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(BreakinThread,
+                                           "morok.seal.fold.anti_debug"));
     bool uefHasContinueSearch = false;
     for (Instruction &I : instructions(*Uef))
         if (auto *Ret = dyn_cast<ReturnInst>(&I))
