@@ -574,6 +574,30 @@ std::vector<unsigned> ctorPrioritiesFor(Module &M, StringRef functionPrefix) {
     return priorities;
 }
 
+std::vector<unsigned> ctorPrioritiesForTarget(Module &M, Function &TargetFn) {
+    std::vector<unsigned> priorities;
+    GlobalVariable *ctors = M.getGlobalVariable("llvm.global_ctors");
+    if (!ctors || !ctors->hasInitializer())
+        return priorities;
+    auto *array = dyn_cast<ConstantArray>(ctors->getInitializer());
+    if (!array)
+        return priorities;
+
+    for (Use &elem : array->operands()) {
+        auto *entry = dyn_cast<ConstantStruct>(elem.get());
+        if (!entry || entry->getNumOperands() < 2)
+            continue;
+        auto *priority = dyn_cast<ConstantInt>(entry->getOperand(0));
+        auto *target = dyn_cast<Constant>(entry->getOperand(1));
+        if (!priority || !target)
+            continue;
+        if (constantReferencesGlobal(target, &TargetFn))
+            priorities.push_back(
+                static_cast<unsigned>(priority->getZExtValue()));
+    }
+    return priorities;
+}
+
 std::size_t countAliases(Module &M) {
     return static_cast<std::size_t>(
         std::distance(M.alias_begin(), M.alias_end()));
@@ -17144,6 +17168,9 @@ entry:
     CHECK(M->getFunction("morok.watchdog") != nullptr);
     Function *AntiDbg = M->getFunction("morok.antidbg");
     REQUIRE(AntiDbg != nullptr);
+    const auto antiDbgPriorities = ctorPrioritiesForTarget(*M, *AntiDbg);
+    CHECK(std::find(antiDbgPriorities.begin(), antiDbgPriorities.end(), 0u) !=
+          antiDbgPriorities.end());
     CHECK(M->getGlobalVariable("morok.antidbg.seccomp.sigsys.slot", true) !=
           nullptr);
     CHECK(M->getGlobalVariable("morok.antidbg.faultcf.sentinel", true) !=
@@ -17273,6 +17300,11 @@ entry:
               *AntiDbg, "morok.antidbg.ptrace.init.chain.raw.libc.xor") >=
           1u);
     CHECK(functionHasConstantInt(*AntiDbg, 101u)); // x86_64 ptrace syscall
+    Instruction *PtraceFirstEperm = findNamedInstruction(
+        *AntiDbg, "morok.antidbg.ptrace.init.chain.raw.first.eperm");
+    REQUIRE(PtraceFirstEperm != nullptr);
+    CHECK(valueFeedsNamedInstruction(PtraceFirstEperm,
+                                     "morok.seal.fold.anti_debug"));
     Instruction *PtraceChain =
         findNamedInstruction(*AntiDbg, "morok.antidbg.ptrace.init.chain.diverged");
     REQUIRE(PtraceChain != nullptr);
@@ -17476,6 +17508,11 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getFunction("ptrace") != nullptr);
     CHECK(M->getFunction("__errno_location") != nullptr);
     CHECK(M->getFunction("syscall") != nullptr);
+    Instruction *PtraceFirstEperm = findNamedInstruction(
+        *Ctor, "morok.antidbg.ptrace.init.chain.raw.first.eperm");
+    REQUIRE(PtraceFirstEperm != nullptr);
+    CHECK(valueFeedsNamedInstruction(PtraceFirstEperm,
+                                     "morok.seal.fold.anti_debug"));
     Instruction *PtraceChain =
         findNamedInstruction(*Ctor, "morok.antidbg.ptrace.init.chain.diverged");
     REQUIRE(PtraceChain != nullptr);

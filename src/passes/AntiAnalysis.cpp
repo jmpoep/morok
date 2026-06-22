@@ -653,9 +653,13 @@ void emitLinuxPtraceTraceMeChain(IRBuilder<> &B, Module &M,
     if (!linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr)) {
         auto *i32 = Type::getInt32Ty(M.getContext());
         Value *traceRc = emitLinuxPtrace(B, M, TT, 0);
+        Value *traceEperm =
+            B.CreateICmpEQ(traceRc, ConstantInt::getSigned(i32, -1),
+                           Name + ".fallback.eperm");
         foldFlag(B, State,
                  B.CreateICmpSLT(traceRc, ConstantInt::getSigned(i32, 0)),
                  Salt, Name);
+        sealFold(B, traceEperm, Salt ^ 0xD4E12B9C6A7F8351ULL);
         return;
     }
 
@@ -676,6 +680,9 @@ void emitLinuxPtraceTraceMeChain(IRBuilder<> &B, Module &M,
     Value *rawFirstFailed =
         B.CreateICmpSLT(rawFirst, zeroIp, base + ".chain.raw.first.fail");
     foldFlag(B, State, rawFirstFailed, Salt, Name);
+    Value *rawFirstEperm =
+        B.CreateICmpEQ(rawFirst, negOneIp, base + ".chain.raw.first.eperm");
+    sealFold(B, rawFirstEperm, Salt ^ 0x91F3D6A5C20B7E49ULL);
 
     Value *rawSecond =
         emitLinuxPtraceRaw(B, M, TT, 0, zeroIp, nullPtr, zeroIp,
