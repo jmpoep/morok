@@ -403,6 +403,21 @@ bool functionHasConstantInt(Function &F, std::uint64_t value) {
     return false;
 }
 
+bool namedGepUsesConstantOffset(Function &F, StringRef name,
+                                std::uint64_t offset) {
+    for (Instruction &I : instructions(F)) {
+        if (!I.getName().starts_with(name))
+            continue;
+        auto *GEP = dyn_cast<GetElementPtrInst>(&I);
+        if (!GEP)
+            continue;
+        auto *CI = dyn_cast<ConstantInt>(GEP->getOperand(1));
+        if (CI && CI->getZExtValue() == offset)
+            return true;
+    }
+    return false;
+}
+
 std::size_t countOpcode(Module &M, unsigned opcode) {
     std::size_t n = 0;
     for (Function &F : M)
@@ -17499,6 +17514,12 @@ define i32 @main() { ret i32 0 }
               *FaultCf, "morok.antidbg.faultcf.anti_debug.next") >= 1u);
     CHECK(countNamedInstructions(
               *FaultCfHandler, "morok.antidbg.faultcf.pc.next") >= 1u);
+    CHECK(namedGepUsesConstantOffset(*FaultCfHandler,
+                                     "morok.antidbg.faultcf.pc.ptr", 440u));
+    CHECK(namedGepUsesConstantOffset(
+        *FaultCfHandler, "morok.antidbg.faultcf.advance.pc.ptr", 440u));
+    CHECK_FALSE(namedGepUsesConstantOffset(
+        *FaultCfHandler, "morok.antidbg.faultcf.pc.ptr", 432u));
     CHECK(M->getFunction("morok.antidbg.seccomp.sigsys") != nullptr);
     CHECK(M->getFunction("morok.antidbg.seccomp.sigreturn") == nullptr);
     CHECK(M->getGlobalVariable("morok.seal.root.tracer", true) != nullptr);

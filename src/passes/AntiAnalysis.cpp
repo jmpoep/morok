@@ -2201,9 +2201,10 @@ bool linuxFaultFlowLayout(const Triple &TT, LinuxFaultFlowLayout &L) {
         L.instructionBytes = 2;
         return true;
     case Triple::aarch64:
-        // glibc aarch64 ucontext_t: uc_mcontext starts after flags/link/stack
-        // and sigmask; mcontext_t.pc follows fault_address, regs[31], and sp.
-        L.pcSlotOffset = 432;
+        // glibc aarch64 ucontext_t: uc_mcontext starts at offset 176;
+        // mcontext_t.pc follows fault_address, regs[31], and sp:
+        // 176 + 8 + (31 * 8) + 8 = 440. Offset 432 is saved sp.
+        L.pcSlotOffset = 440;
         L.instructionBytes = 4;
         return true;
     default:
