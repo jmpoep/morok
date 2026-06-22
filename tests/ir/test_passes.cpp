@@ -17295,7 +17295,52 @@ entry:
     CHECK(countNamedInstructions(*Dbi,
                                  "morok.antihook.dbi.jit.diff.shift") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.thread.sig") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.thread.strong") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.thread.weak") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.thread.pool_frida") >=
+          1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.thread.gdbus") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.thread.linjector") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.thread.task.fd") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.thread.task.getdents") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.thread.task.pool_frida") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.thread.task.gdbus") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.thread.task.linjector") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.frida.thread.task.strong") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.frida.thread.task.weak") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.port.sig0") >= 1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.port.sig2") >= 1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.fd.dir.fd") >= 1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.fd.getdents") >=
+          1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.fd.readlink") >=
+          1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.fd.tcp.cross") >=
+          1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.frida.port") >=
+          1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.frida.fd.tcp") >=
+          1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.frida.confirmed") >=
+          1u);
+    Instruction *FridaConfirmed =
+        findNamedInstruction(*Dbi, "morok.antihook.dbi.frida.confirmed");
+    REQUIRE(FridaConfirmed != nullptr);
+    CHECK(valueFeedsNamedInstruction(FridaConfirmed,
+                                     "morok.antihook.dbi.diff.ret"));
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.dlsym.dr") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.dlsym.qbdi") >= 1u);
     CHECK(countNamedInstructions(
@@ -17590,6 +17635,9 @@ entry:
     CHECK(M->getFunction("morok.antihook.static.atbase") == nullptr);
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/exe"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/maps"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/self/task"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/self/task/%ld/comm"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/self/fd"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/environ"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/comm"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/exe"));
@@ -17607,6 +17655,12 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "vgpreload_"));
     CHECK_FALSE(hasReadableByteString(*M, "valgrind"));
     CHECK_FALSE(hasReadableByteString(*M, "qemu-"));
+    CHECK_FALSE(hasReadableByteString(*M, "gum-js-loop"));
+    CHECK_FALSE(hasReadableByteString(*M, "frida-agent"));
+    CHECK_FALSE(hasReadableByteString(*M, "pool-frida"));
+    CHECK_FALSE(hasReadableByteString(*M, "gdbus"));
+    CHECK_FALSE(hasReadableByteString(*M, "linjector"));
+    CHECK_FALSE(hasReadableByteString(*M, "socket:["));
     CHECK_FALSE(hasReadableByteString(*M, "pinbin"));
     CHECK_FALSE(hasReadableByteString(*M, "libpin"));
     CHECK_FALSE(hasReadableByteString(*M, "pinvm.so"));

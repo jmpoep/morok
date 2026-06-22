@@ -13840,6 +13840,590 @@ bool linuxDbiParentSyscalls(const Triple &TT, std::uint32_t &Getppid,
     }
 }
 
+bool linuxDbiGetdents64Syscall(const Triple &TT, std::uint32_t &Getdents64) {
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        Getdents64 = 217;
+        return true;
+    case Triple::aarch64:
+        Getdents64 = 61;
+        return true;
+    default:
+        return false;
+    }
+}
+
+Value *bufferHasLinuxDbiTcpPortForSocketLink(
+    IRBuilder<> &B, Module &M, AllocaInst *TcpBuf, Value *TcpN,
+    AllocaInst *LinkBuf, Value *LinkN, std::uint64_t TcpMax,
+    std::uint64_t LinkMax, const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    Function *fn = B.GetInsertBlock()->getParent();
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *ip = intPtrTy(M);
+
+    auto *inodeSlot = B.CreateAlloca(ip, nullptr, Name + ".inode.slot");
+    auto *idxSlot = B.CreateAlloca(ip, nullptr, Name + ".idx.slot");
+    auto *posSlot = B.CreateAlloca(ip, nullptr, Name + ".pos.slot");
+    auto *foundSlot = B.CreateAlloca(i1, nullptr, Name + ".found.slot");
+    auto *linePortSlot = B.CreateAlloca(i1, nullptr, Name + ".line.port.slot");
+    auto *accSlot = B.CreateAlloca(ip, nullptr, Name + ".acc.slot");
+    auto *seenSlot = B.CreateAlloca(i1, nullptr, Name + ".seen.slot");
+    B.CreateStore(ConstantInt::get(ip, 0), inodeSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), idxSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::getFalse(ctx), foundSlot)->setVolatile(true);
+
+    auto *linkLoopBB = BasicBlock::Create(ctx, (Name + ".link.loop").str(), fn);
+    auto *linkBodyBB = BasicBlock::Create(ctx, (Name + ".link.body").str(), fn);
+    auto *digitInitBB =
+        BasicBlock::Create(ctx, (Name + ".digit.init").str(), fn);
+    auto *digitLoopBB =
+        BasicBlock::Create(ctx, (Name + ".digit.loop").str(), fn);
+    auto *digitBodyBB =
+        BasicBlock::Create(ctx, (Name + ".digit.body").str(), fn);
+    auto *linkNextBB = BasicBlock::Create(ctx, (Name + ".link.next").str(), fn);
+    auto *tcpInitBB = BasicBlock::Create(ctx, (Name + ".tcp.init").str(), fn);
+    auto *tcpLoopBB = BasicBlock::Create(ctx, (Name + ".tcp.loop").str(), fn);
+    auto *tcpBodyBB = BasicBlock::Create(ctx, (Name + ".tcp.body").str(), fn);
+    auto *tcpNextBB = BasicBlock::Create(ctx, (Name + ".tcp.next").str(), fn);
+    auto *doneBB = BasicBlock::Create(ctx, (Name + ".done").str(), fn);
+    B.CreateBr(linkLoopBB);
+
+    IRBuilder<> LLB(linkLoopBB);
+    auto *linkIdx = LLB.CreateLoad(ip, idxSlot, Name + ".link.idx");
+    linkIdx->setVolatile(true);
+    Value *prefixEnd =
+        LLB.CreateAdd(linkIdx, ConstantInt::get(ip, 8), Name + ".prefix.end");
+    Value *linkLive =
+        LLB.CreateAnd(LLB.CreateICmpSLE(prefixEnd, LinkN,
+                                        Name + ".prefix.in.read"),
+                      LLB.CreateICmpULE(prefixEnd, ConstantInt::get(ip, LinkMax),
+                                        Name + ".prefix.in.buf"),
+                      Name + ".link.live");
+    LLB.CreateCondBr(linkLive, linkBodyBB, doneBB);
+
+    IRBuilder<> LBB(linkBodyBB);
+    Value *prefix = ConstantInt::getTrue(ctx);
+    constexpr std::array<unsigned char, 8> kSocketPrefix = {
+        0x73, 0x6f, 0x63, 0x6b, 0x65, 0x74, 0x3a, 0x5b};
+    for (std::uint64_t i = 0; i < kSocketPrefix.size(); ++i) {
+        Value *ch = loadAt(LBB, M, i8, LinkBuf,
+                           LBB.CreateAdd(linkIdx, ConstantInt::get(ip, i)),
+                           Name + ".prefix.ch");
+        prefix = LBB.CreateAnd(
+            prefix, LBB.CreateICmpEQ(ch, ConstantInt::get(i8, kSocketPrefix[i])),
+            Name + ".prefix.match");
+    }
+    LBB.CreateCondBr(prefix, digitInitBB, linkNextBB);
+
+    IRBuilder<> DIB(digitInitBB);
+    DIB.CreateStore(prefixEnd, posSlot)->setVolatile(true);
+    DIB.CreateStore(ConstantInt::get(ip, 0), inodeSlot)->setVolatile(true);
+    DIB.CreateStore(ConstantInt::getFalse(ctx), seenSlot)->setVolatile(true);
+    DIB.CreateBr(digitLoopBB);
+
+    IRBuilder<> DLB(digitLoopBB);
+    auto *digitPos = DLB.CreateLoad(ip, posSlot, Name + ".digit.pos");
+    digitPos->setVolatile(true);
+    Value *digitLive =
+        DLB.CreateAnd(DLB.CreateICmpSLT(digitPos, LinkN,
+                                        Name + ".digit.in.read"),
+                      DLB.CreateICmpULT(digitPos, ConstantInt::get(ip, LinkMax),
+                                        Name + ".digit.in.buf"),
+                      Name + ".digit.live");
+    DLB.CreateCondBr(digitLive, digitBodyBB, doneBB);
+
+    IRBuilder<> DBB(digitBodyBB);
+    Value *digitCh = loadAt(DBB, M, i8, LinkBuf, digitPos, Name + ".digit.ch");
+    Value *isDigit = DBB.CreateAnd(
+        DBB.CreateICmpUGE(digitCh, ConstantInt::get(i8, '0'),
+                          Name + ".digit.ge0"),
+        DBB.CreateICmpULE(digitCh, ConstantInt::get(i8, '9'),
+                          Name + ".digit.le9"),
+        Name + ".digit");
+    auto *oldInode = DBB.CreateLoad(ip, inodeSlot, Name + ".inode.old");
+    oldInode->setVolatile(true);
+    Value *digitValue =
+        DBB.CreateZExt(DBB.CreateSub(digitCh, ConstantInt::get(i8, '0'),
+                                     Name + ".digit.raw"),
+                       ip, Name + ".digit.value");
+    Value *nextInode =
+        DBB.CreateAdd(DBB.CreateMul(oldInode, ConstantInt::get(ip, 10),
+                                    Name + ".inode.mul"),
+                      digitValue, Name + ".inode.next");
+    DBB.CreateStore(DBB.CreateSelect(isDigit, nextInode, oldInode,
+                                     Name + ".inode.select"),
+                    inodeSlot)
+        ->setVolatile(true);
+    auto *seenDigit = DBB.CreateLoad(i1, seenSlot, Name + ".seen.digit");
+    seenDigit->setVolatile(true);
+    DBB.CreateStore(DBB.CreateOr(seenDigit, isDigit, Name + ".seen.next"),
+                    seenSlot)
+        ->setVolatile(true);
+    Value *closeBracket =
+        DBB.CreateICmpEQ(digitCh, ConstantInt::get(i8, ']'), Name + ".bracket");
+    Value *ready = DBB.CreateAnd(closeBracket, seenDigit, Name + ".ready");
+    auto *digitNextBB =
+        BasicBlock::Create(ctx, (Name + ".digit.next").str(), fn);
+    auto *digitStopBB =
+        BasicBlock::Create(ctx, (Name + ".digit.stop").str(), fn);
+    DBB.CreateCondBr(ready, tcpInitBB, digitStopBB);
+
+    IRBuilder<> DSB(digitStopBB);
+    DSB.CreateCondBr(isDigit, digitNextBB, doneBB);
+
+    IRBuilder<> DNB(digitNextBB);
+    DNB.CreateStore(DNB.CreateAdd(digitPos, ConstantInt::get(ip, 1),
+                                  Name + ".digit.pos.next"),
+                    posSlot)
+        ->setVolatile(true);
+    DNB.CreateBr(digitLoopBB);
+
+    IRBuilder<> LNB(linkNextBB);
+    LNB.CreateStore(LNB.CreateAdd(linkIdx, ConstantInt::get(ip, 1),
+                                  Name + ".link.idx.next"),
+                    idxSlot)
+        ->setVolatile(true);
+    LNB.CreateBr(linkLoopBB);
+
+    IRBuilder<> TIB(tcpInitBB);
+    TIB.CreateStore(ConstantInt::get(ip, 0), idxSlot)->setVolatile(true);
+    TIB.CreateStore(ConstantInt::getFalse(ctx), linePortSlot)
+        ->setVolatile(true);
+    TIB.CreateStore(ConstantInt::get(ip, 0), accSlot)->setVolatile(true);
+    TIB.CreateStore(ConstantInt::getFalse(ctx), seenSlot)->setVolatile(true);
+    TIB.CreateBr(tcpLoopBB);
+
+    IRBuilder<> TLB(tcpLoopBB);
+    auto *tcpIdx = TLB.CreateLoad(ip, idxSlot, Name + ".tcp.idx");
+    tcpIdx->setVolatile(true);
+    auto *found = TLB.CreateLoad(i1, foundSlot, Name + ".found");
+    found->setVolatile(true);
+    Value *tcpWindow =
+        TLB.CreateAdd(tcpIdx, ConstantInt::get(ip, 4), Name + ".tcp.window");
+    Value *tcpLive =
+        TLB.CreateAnd(TLB.CreateICmpSLE(tcpWindow, TcpN, Name + ".tcp.in.read"),
+                      TLB.CreateICmpULE(tcpWindow, ConstantInt::get(ip, TcpMax),
+                                        Name + ".tcp.in.buf"),
+                      Name + ".tcp.live");
+    TLB.CreateCondBr(TLB.CreateAnd(tcpLive, TLB.CreateNot(found),
+                                   Name + ".tcp.keep"),
+                     tcpBodyBB, doneBB);
+
+    IRBuilder<> TBB(tcpBodyBB);
+    Value *tcpCh = loadAt(TBB, M, i8, TcpBuf, tcpIdx, Name + ".tcp.ch");
+    auto tcpCharAt = [&](std::uint64_t Off, unsigned char C) -> Value * {
+        Value *pos = TBB.CreateAdd(tcpIdx, ConstantInt::get(ip, Off),
+                                   Name + ".tcp.port.pos");
+        Value *ch = loadAt(TBB, M, i8, TcpBuf, pos, Name + ".tcp.port.ch");
+        return TBB.CreateICmpEQ(ch, ConstantInt::get(i8, C),
+                                Name + ".tcp.port.eq");
+    };
+    Value *portSafe =
+        TBB.CreateAnd(TBB.CreateICmpSLE(TBB.CreateAdd(tcpIdx,
+                                                      ConstantInt::get(ip, 4)),
+                                        TcpN, Name + ".tcp.port.in.read"),
+                      TBB.CreateICmpULE(TBB.CreateAdd(tcpIdx,
+                                                      ConstantInt::get(ip, 4)),
+                                        ConstantInt::get(ip, TcpMax),
+                                        Name + ".tcp.port.in.buf"),
+                      Name + ".tcp.port.safe");
+    Value *port69A2 =
+        TBB.CreateAnd(TBB.CreateAnd(tcpCharAt(0, '6'), tcpCharAt(1, '9')),
+                      TBB.CreateAnd(tcpCharAt(2, 'A'), tcpCharAt(3, '2')),
+                      Name + ".tcp.port.69A2");
+    Value *port69a2 =
+        TBB.CreateAnd(TBB.CreateAnd(tcpCharAt(0, '6'), tcpCharAt(1, '9')),
+                      TBB.CreateAnd(tcpCharAt(2, 'a'), tcpCharAt(3, '2')),
+                      Name + ".tcp.port.69a2");
+    Value *port69A3 =
+        TBB.CreateAnd(TBB.CreateAnd(tcpCharAt(0, '6'), tcpCharAt(1, '9')),
+                      TBB.CreateAnd(tcpCharAt(2, 'A'), tcpCharAt(3, '3')),
+                      Name + ".tcp.port.69A3");
+    Value *port69a3 =
+        TBB.CreateAnd(TBB.CreateAnd(tcpCharAt(0, '6'), tcpCharAt(1, '9')),
+                      TBB.CreateAnd(tcpCharAt(2, 'a'), tcpCharAt(3, '3')),
+                      Name + ".tcp.port.69a3");
+    Value *portHere = TBB.CreateAnd(
+        portSafe,
+        TBB.CreateOr(TBB.CreateOr(port69A2, port69a2),
+                     TBB.CreateOr(port69A3, port69a3), Name + ".tcp.port.any"),
+        Name + ".tcp.port.hit");
+    auto *linePort = TBB.CreateLoad(i1, linePortSlot, Name + ".line.port");
+    linePort->setVolatile(true);
+    Value *isNl =
+        TBB.CreateICmpEQ(tcpCh, ConstantInt::get(i8, '\n'), Name + ".tcp.nl");
+    Value *linePortNext = TBB.CreateSelect(
+        isNl, ConstantInt::getFalse(ctx),
+        TBB.CreateOr(linePort, portHere, Name + ".line.port.or"),
+        Name + ".line.port.next");
+    Value *tcpDigit = TBB.CreateAnd(
+        TBB.CreateICmpUGE(tcpCh, ConstantInt::get(i8, '0'),
+                          Name + ".tcp.digit.ge0"),
+        TBB.CreateICmpULE(tcpCh, ConstantInt::get(i8, '9'),
+                          Name + ".tcp.digit.le9"),
+        Name + ".tcp.digit");
+    auto *oldAcc = TBB.CreateLoad(ip, accSlot, Name + ".tcp.acc.old");
+    oldAcc->setVolatile(true);
+    auto *oldSeen = TBB.CreateLoad(i1, seenSlot, Name + ".tcp.seen.old");
+    oldSeen->setVolatile(true);
+    Value *tcpDigitValue =
+        TBB.CreateZExt(TBB.CreateSub(tcpCh, ConstantInt::get(i8, '0'),
+                                     Name + ".tcp.digit.raw"),
+                       ip, Name + ".tcp.digit.value");
+    Value *accNext =
+        TBB.CreateAdd(TBB.CreateMul(oldAcc, ConstantInt::get(ip, 10),
+                                    Name + ".tcp.acc.mul"),
+                      tcpDigitValue, Name + ".tcp.acc.next");
+    auto *targetInode =
+        TBB.CreateLoad(ip, inodeSlot, Name + ".target.inode");
+    targetInode->setVolatile(true);
+    Value *numberDone =
+        TBB.CreateAnd(oldSeen, TBB.CreateNot(tcpDigit), Name + ".number.done");
+    Value *inodeMatch = TBB.CreateAnd(
+        numberDone,
+        TBB.CreateAnd(linePort, TBB.CreateICmpEQ(oldAcc, targetInode,
+                                                 Name + ".inode.eq")),
+        Name + ".inode.match");
+    TBB.CreateStore(TBB.CreateOr(found, inodeMatch, Name + ".found.next"),
+                    foundSlot)
+        ->setVolatile(true);
+    TBB.CreateStore(TBB.CreateSelect(tcpDigit, accNext, ConstantInt::get(ip, 0),
+                                     Name + ".acc.store"),
+                    accSlot)
+        ->setVolatile(true);
+    TBB.CreateStore(tcpDigit, seenSlot)->setVolatile(true);
+    TBB.CreateStore(linePortNext, linePortSlot)->setVolatile(true);
+    TBB.CreateBr(tcpNextBB);
+
+    IRBuilder<> TNB(tcpNextBB);
+    TNB.CreateStore(TNB.CreateAdd(tcpIdx, ConstantInt::get(ip, 1),
+                                  Name + ".tcp.idx.next"),
+                    idxSlot)
+        ->setVolatile(true);
+    TNB.CreateBr(tcpLoopBB);
+
+    B.SetInsertPoint(doneBB);
+    auto *out = B.CreateLoad(i1, foundSlot, Name + ".out");
+    out->setVolatile(true);
+    return out;
+}
+
+void emitLinuxDbiThreadTableScan(IRBuilder<> &B, Module &M, Function *Fn,
+                                 AllocaInst *StrongDiff,
+                                 AllocaInst *WeakDiff, ir::IRRandom &rng,
+                                 const Triple &TT) {
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    std::uint32_t ptraceNr = 0;
+    std::uint32_t prctlNr = 0;
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    std::uint32_t getdentsNr = 0;
+    if (!linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr) ||
+        !linuxDbiGetdents64Syscall(TT, getdentsNr))
+        return;
+
+    auto *pathTy = ArrayType::get(i8, 128);
+    auto *dirTy = ArrayType::get(i8, 4096);
+    auto *commTy = ArrayType::get(i8, 64);
+    AllocaInst *path =
+        B.CreateAlloca(pathTy, nullptr, "morok.antihook.dbi.thread.task.path");
+    AllocaInst *dirBuf =
+        B.CreateAlloca(dirTy, nullptr, "morok.antihook.dbi.thread.task.dir");
+    AllocaInst *commBuf =
+        B.CreateAlloca(commTy, nullptr, "morok.antihook.dbi.thread.task.comm.buf");
+    Value *taskPath = ir::emitCloakedSymbol(B, M, "/proc/self/task", rng);
+    Value *fd = emitLinuxSyscall(B, M, TT, openatNr,
+                                 {ConstantInt::getSigned(ip, -100), taskPath,
+                                  ConstantInt::get(ip, 0x10000),
+                                  ConstantInt::get(ip, 0)});
+    fd->setName("morok.antihook.dbi.thread.task.fd");
+    auto *readBB =
+        BasicBlock::Create(ctx, "morok.antihook.dbi.thread.task.read", Fn);
+    auto *scanLoopBB =
+        BasicBlock::Create(ctx, "morok.antihook.dbi.thread.task.scan.loop", Fn);
+    auto *scanBodyBB =
+        BasicBlock::Create(ctx, "morok.antihook.dbi.thread.task.scan.body", Fn);
+    auto *readCommBB =
+        BasicBlock::Create(ctx, "morok.antihook.dbi.thread.task.comm.read", Fn);
+    auto *scanCommBB =
+        BasicBlock::Create(ctx, "morok.antihook.dbi.thread.task.comm.scan", Fn);
+    auto *scanNextBB =
+        BasicBlock::Create(ctx, "morok.antihook.dbi.thread.task.scan.next", Fn);
+    auto *closeBB =
+        BasicBlock::Create(ctx, "morok.antihook.dbi.thread.task.close", Fn);
+    auto *doneBB =
+        BasicBlock::Create(ctx, "morok.antihook.dbi.thread.task.done", Fn);
+    B.CreateCondBr(B.CreateICmpSGE(fd, ConstantInt::get(ip, 0),
+                                   "morok.antihook.dbi.thread.task.fd.ok"),
+                   readBB, doneBB);
+
+    IRBuilder<> RB(readBB);
+    Value *dirPtr = RB.CreateInBoundsGEP(
+        dirTy, dirBuf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antihook.dbi.thread.task.dir.ptr");
+    Value *nread = emitLinuxSyscall(
+        RB, M, TT, getdentsNr, {fd, dirPtr, ConstantInt::get(ip, 4096)});
+    nread->setName("morok.antihook.dbi.thread.task.getdents");
+    RB.CreateCondBr(RB.CreateICmpSGT(nread, ConstantInt::get(ip, 0),
+                                     "morok.antihook.dbi.thread.task.nread"),
+                    scanLoopBB, closeBB);
+
+    IRBuilder<> SLB(scanLoopBB);
+    auto *off = SLB.CreatePHI(ip, 2, "morok.antihook.dbi.thread.task.off");
+    off->addIncoming(ConstantInt::get(ip, 0), readBB);
+    SLB.CreateCondBr(SLB.CreateICmpULT(off, nread,
+                                       "morok.antihook.dbi.thread.task.live"),
+                     scanBodyBB, closeBB);
+
+    IRBuilder<> SB(scanBodyBB);
+    Value *reclenOff =
+        SB.CreateAdd(off, ConstantInt::get(ip, 16),
+                     "morok.antihook.dbi.thread.task.reclen.off");
+    Value *reclen =
+        loadAt(SB, M, i16, dirBuf, reclenOff,
+               "morok.antihook.dbi.thread.task.reclen");
+    Value *nameBase =
+        SB.CreateAdd(off, ConstantInt::get(ip, 19),
+                     "morok.antihook.dbi.thread.task.name.off");
+    Value *tid = ConstantInt::get(ip, 0);
+    Value *active = ConstantInt::getTrue(ctx);
+    Value *any = ConstantInt::getFalse(ctx);
+    for (std::uint64_t i = 0; i < 12; ++i) {
+        Value *ch =
+            loadAt(SB, M, i8, dirBuf, SB.CreateAdd(nameBase,
+                                                   ConstantInt::get(ip, i)),
+                   "morok.antihook.dbi.thread.task.name.ch");
+        Value *digit = SB.CreateAnd(
+            active,
+            SB.CreateAnd(SB.CreateICmpUGE(ch, ConstantInt::get(i8, '0')),
+                         SB.CreateICmpULE(ch, ConstantInt::get(i8, '9'))),
+            "morok.antihook.dbi.thread.task.name.digit");
+        Value *dval =
+            SB.CreateZExt(SB.CreateSub(ch, ConstantInt::get(i8, '0')), ip,
+                          "morok.antihook.dbi.thread.task.name.dval");
+        Value *nextTid =
+            SB.CreateAdd(SB.CreateMul(tid, ConstantInt::get(ip, 10)),
+                         dval, "morok.antihook.dbi.thread.task.tid.next");
+        tid = SB.CreateSelect(digit, nextTid, tid,
+                              "morok.antihook.dbi.thread.task.tid.acc");
+        any = SB.CreateOr(any, digit, "morok.antihook.dbi.thread.task.any");
+        active = digit;
+    }
+    SB.CreateCondBr(any, readCommBB, scanNextBB);
+
+    IRBuilder<> PCB(readCommBB);
+    Value *pathPtr = PCB.CreateInBoundsGEP(
+        pathTy, path, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antihook.dbi.thread.task.path.ptr");
+    FunctionCallee snprintfFn =
+        M.getOrInsertFunction("snprintf", FunctionType::get(i32, {ptr, ip, ptr},
+                                                             true));
+    PCB.CreateCall(snprintfFn,
+                   {pathPtr, ConstantInt::get(ip, 128),
+                    ir::emitCloakedSymbol(PCB, M, "/proc/self/task/%ld/comm",
+                                          rng),
+                    tid},
+                   "morok.antihook.dbi.thread.task.path.n");
+    Value *commFd = emitLinuxSyscall(
+        PCB, M, TT, openatNr,
+        {ConstantInt::getSigned(ip, -100), pathPtr, ConstantInt::get(ip, 0),
+         ConstantInt::get(ip, 0)});
+    commFd->setName("morok.antihook.dbi.thread.task.comm.fd");
+    PCB.CreateCondBr(PCB.CreateICmpSGE(commFd, ConstantInt::get(ip, 0),
+                                       "morok.antihook.dbi.thread.task.comm.fd.ok"),
+                     scanCommBB, scanNextBB);
+
+    IRBuilder<> CB(scanCommBB);
+    Value *commPtr = CB.CreateInBoundsGEP(
+        commTy, commBuf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antihook.dbi.thread.task.comm.ptr");
+    Value *commN = emitLinuxSyscall(
+        CB, M, TT, readNr, {commFd, commPtr, ConstantInt::get(ip, 63)});
+    commN->setName("morok.antihook.dbi.thread.task.comm.read.n");
+    emitLinuxSyscall(CB, M, TT, closeNr, {commFd});
+    Value *gumLoop = bufferHasLiteral(
+        CB, M, commBuf, commN,
+        {0x67, 0x75, 0x6d, 0x2d, 0x6a, 0x73, 0x2d, 0x6c, 0x6f, 0x6f, 0x70},
+        64, "morok.antihook.dbi.thread.task.gum_js_loop");
+    Value *fridaAgent = bufferHasLiteral(
+        CB, M, commBuf, commN,
+        {0x66, 0x72, 0x69, 0x64, 0x61, 0x2d, 0x61, 0x67, 0x65, 0x6e, 0x74},
+        64, "morok.antihook.dbi.thread.task.frida_agent");
+    Value *poolFrida = bufferHasLiteral(
+        CB, M, commBuf, commN,
+        {0x70, 0x6f, 0x6f, 0x6c, 0x2d, 0x66, 0x72, 0x69, 0x64, 0x61},
+        64, "morok.antihook.dbi.thread.task.pool_frida");
+    Value *linjector = bufferHasLiteral(
+        CB, M, commBuf, commN,
+        {0x6c, 0x69, 0x6e, 0x6a, 0x65, 0x63, 0x74, 0x6f, 0x72}, 64,
+        "morok.antihook.dbi.thread.task.linjector");
+    Value *gmain = bufferHasLiteral(
+        CB, M, commBuf, commN, {0x67, 0x6d, 0x61, 0x69, 0x6e}, 64,
+        "morok.antihook.dbi.thread.task.gmain");
+    Value *gdbus = bufferHasLiteral(
+        CB, M, commBuf, commN, {0x67, 0x64, 0x62, 0x75, 0x73}, 64,
+        "morok.antihook.dbi.thread.task.gdbus");
+    Value *strong = CB.CreateOr(
+        CB.CreateOr(gumLoop, fridaAgent),
+        CB.CreateOr(poolFrida, linjector),
+        "morok.antihook.dbi.thread.task.strong");
+    Value *weak =
+        CB.CreateOr(gmain, gdbus, "morok.antihook.dbi.thread.task.weak");
+    incrementDiff(CB, StrongDiff, strong,
+                  "morok.antihook.dbi.frida.thread.task.strong");
+    incrementDiff(CB, WeakDiff, weak,
+                  "morok.antihook.dbi.frida.thread.task.weak");
+    CB.CreateBr(scanNextBB);
+
+    IRBuilder<> SNB(scanNextBB);
+    Value *safeReclen = SNB.CreateSelect(
+        SNB.CreateICmpUGT(reclen, ConstantInt::get(i16, 0),
+                          "morok.antihook.dbi.thread.task.reclen.ok"),
+        SNB.CreateZExt(reclen, ip), nread,
+        "morok.antihook.dbi.thread.task.reclen.safe");
+    Value *nextOff = SNB.CreateAdd(off, safeReclen,
+                                   "morok.antihook.dbi.thread.task.next");
+    SNB.CreateBr(scanLoopBB);
+    off->addIncoming(nextOff, scanNextBB);
+
+    IRBuilder<> CLB(closeBB);
+    emitLinuxSyscall(CLB, M, TT, closeNr, {fd});
+    CLB.CreateBr(doneBB);
+
+    B.SetInsertPoint(doneBB);
+}
+
+Value *emitLinuxDbiFdTcpCrossRef(IRBuilder<> &B, Module &M, Function *Fn,
+                                 AllocaInst *TcpBuf, Value *TcpN,
+                                 ir::IRRandom &rng, const Triple &TT) {
+    LLVMContext &ctx = M.getContext();
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *ip = intPtrTy(M);
+    std::uint32_t ptraceNr = 0;
+    std::uint32_t prctlNr = 0;
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    std::uint32_t getdentsNr = 0;
+    std::uint32_t getppidNr = 0;
+    std::uint32_t readlinkatNr = 0;
+    if (!linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr) ||
+        !linuxDbiGetdents64Syscall(TT, getdentsNr) ||
+        !linuxDbiParentSyscalls(TT, getppidNr, readlinkatNr))
+        return ConstantInt::getFalse(ctx);
+
+    auto *dirTy = ArrayType::get(i8, 4096);
+    auto *linkTy = ArrayType::get(i8, 128);
+    AllocaInst *dirBuf =
+        B.CreateAlloca(dirTy, nullptr, "morok.antihook.dbi.fd.dir.buf");
+    AllocaInst *linkBuf =
+        B.CreateAlloca(linkTy, nullptr, "morok.antihook.dbi.fd.link.buf");
+    AllocaInst *foundSlot =
+        B.CreateAlloca(i1, nullptr, "morok.antihook.dbi.fd.tcp.found");
+    B.CreateStore(ConstantInt::getFalse(ctx), foundSlot)->setVolatile(true);
+    Value *fdPath = ir::emitCloakedSymbol(B, M, "/proc/self/fd", rng);
+    Value *fd = emitLinuxSyscall(B, M, TT, openatNr,
+                                 {ConstantInt::getSigned(ip, -100), fdPath,
+                                  ConstantInt::get(ip, 0x10000),
+                                  ConstantInt::get(ip, 0)});
+    fd->setName("morok.antihook.dbi.fd.dir.fd");
+
+    auto *readBB = BasicBlock::Create(ctx, "morok.antihook.dbi.fd.read", Fn);
+    auto *loopBB = BasicBlock::Create(ctx, "morok.antihook.dbi.fd.loop", Fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "morok.antihook.dbi.fd.body", Fn);
+    auto *scanBB = BasicBlock::Create(ctx, "morok.antihook.dbi.fd.scan", Fn);
+    auto *nextBB = BasicBlock::Create(ctx, "morok.antihook.dbi.fd.next", Fn);
+    auto *closeBB = BasicBlock::Create(ctx, "morok.antihook.dbi.fd.close", Fn);
+    auto *doneBB = BasicBlock::Create(ctx, "morok.antihook.dbi.fd.done", Fn);
+    B.CreateCondBr(B.CreateICmpSGE(fd, ConstantInt::get(ip, 0),
+                                   "morok.antihook.dbi.fd.dir.ok"),
+                   readBB, doneBB);
+
+    IRBuilder<> RB(readBB);
+    Value *dirPtr = RB.CreateInBoundsGEP(
+        dirTy, dirBuf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antihook.dbi.fd.dir.ptr");
+    Value *nread = emitLinuxSyscall(
+        RB, M, TT, getdentsNr, {fd, dirPtr, ConstantInt::get(ip, 4096)});
+    nread->setName("morok.antihook.dbi.fd.getdents");
+    RB.CreateCondBr(RB.CreateICmpSGT(nread, ConstantInt::get(ip, 0),
+                                     "morok.antihook.dbi.fd.nread"),
+                    loopBB, closeBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *off = LB.CreatePHI(ip, 2, "morok.antihook.dbi.fd.off");
+    off->addIncoming(ConstantInt::get(ip, 0), readBB);
+    auto *found = LB.CreateLoad(i1, foundSlot, "morok.antihook.dbi.fd.found.v");
+    found->setVolatile(true);
+    LB.CreateCondBr(LB.CreateAnd(LB.CreateICmpULT(off, nread,
+                                                  "morok.antihook.dbi.fd.live"),
+                                 LB.CreateNot(found)),
+                    bodyBB, closeBB);
+
+    IRBuilder<> BB(bodyBB);
+    Value *reclenOff =
+        BB.CreateAdd(off, ConstantInt::get(ip, 16),
+                     "morok.antihook.dbi.fd.reclen.off");
+    Value *reclen =
+        loadAt(BB, M, i16, dirBuf, reclenOff,
+               "morok.antihook.dbi.fd.reclen");
+    Value *nameBase =
+        BB.CreateAdd(off, ConstantInt::get(ip, 19),
+                     "morok.antihook.dbi.fd.name.off");
+    Value *namePtr =
+        gepI8(BB, M, dirBuf, nameBase, "morok.antihook.dbi.fd.name.ptr");
+    Value *linkPtr = BB.CreateInBoundsGEP(
+        linkTy, linkBuf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antihook.dbi.fd.link.ptr");
+    Value *linkN = emitLinuxSyscall(
+        BB, M, TT, readlinkatNr,
+        {fd, namePtr, linkPtr, ConstantInt::get(ip, 127)});
+    linkN->setName("morok.antihook.dbi.fd.readlink");
+    BB.CreateCondBr(BB.CreateICmpSGT(linkN, ConstantInt::get(ip, 0),
+                                     "morok.antihook.dbi.fd.link.ready"),
+                    scanBB, nextBB);
+
+    IRBuilder<> SB(scanBB);
+    Value *hit = bufferHasLinuxDbiTcpPortForSocketLink(
+        SB, M, TcpBuf, TcpN, linkBuf, linkN, 4096, 128,
+        "morok.antihook.dbi.fd.tcp.cross");
+    SB.CreateStore(SB.CreateOr(found, hit, "morok.antihook.dbi.fd.hit.next"),
+                   foundSlot)
+        ->setVolatile(true);
+    SB.CreateBr(nextBB);
+
+    IRBuilder<> NB(nextBB);
+    Value *safeReclen = NB.CreateSelect(
+        NB.CreateICmpUGT(reclen, ConstantInt::get(i16, 0),
+                         "morok.antihook.dbi.fd.reclen.ok"),
+        NB.CreateZExt(reclen, ip), nread,
+        "morok.antihook.dbi.fd.reclen.safe");
+    Value *nextOff =
+        NB.CreateAdd(off, safeReclen, "morok.antihook.dbi.fd.next.off");
+    NB.CreateBr(loopBB);
+    off->addIncoming(nextOff, nextBB);
+
+    IRBuilder<> CB(closeBB);
+    emitLinuxSyscall(CB, M, TT, closeNr, {fd});
+    CB.CreateBr(doneBB);
+
+    B.SetInsertPoint(doneBB);
+    auto *out =
+        B.CreateLoad(i1, foundSlot, "morok.antihook.dbi.fd.tcp.out");
+    out->setVolatile(true);
+    return out;
+}
+
 Value *emitValgrindRunningRequest(IRBuilder<> &B, Module &M) {
     const Triple TT(M.getTargetTriple());
     if (TT.getArch() != Triple::x86_64)
@@ -14540,9 +15124,15 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
         B.CreateAlloca(i64, nullptr, "morok.antihook.dbi.jit.diff");
     AllocaInst *pinDiff =
         B.CreateAlloca(i64, nullptr, "morok.antihook.dbi.pin.diff");
+    AllocaInst *fridaDiff =
+        B.CreateAlloca(i64, nullptr, "morok.antihook.dbi.frida.diff");
+    AllocaInst *fridaSoftDiff =
+        B.CreateAlloca(i64, nullptr, "morok.antihook.dbi.frida.soft.diff");
     B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
     B.CreateStore(ConstantInt::get(i64, 0), jitDiff)->setVolatile(true);
     B.CreateStore(ConstantInt::get(i64, 0), pinDiff)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), fridaDiff)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), fridaSoftDiff)->setVolatile(true);
     ReadFileIR maps =
         emitReadSmallFile(B, M, fn, "/proc/self/maps", 8192, rng, TT);
 
@@ -14689,10 +15279,30 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
         TB, M, name, ConstantInt::get(ip, 16),
         {0x66, 0x72, 0x69, 0x64, 0x61, 0x2d, 0x61, 0x67, 0x65, 0x6e, 0x74},
         16, "morok.antihook.dbi.thread.sig2");
-    Value *threadSig =
-        TB.CreateOr(TB.CreateOr(threadSig0, threadSig1), threadSig2,
-                    "morok.antihook.dbi.thread.sig");
-    incrementDiff(TB, diff, threadSig, "morok.antihook.dbi.thread");
+    Value *threadSig3 = bufferHasLiteral(
+        TB, M, name, ConstantInt::get(ip, 16),
+        {0x70, 0x6f, 0x6f, 0x6c, 0x2d, 0x66, 0x72, 0x69, 0x64, 0x61}, 16,
+        "morok.antihook.dbi.thread.pool_frida");
+    Value *threadSig4 = bufferHasLiteral(
+        TB, M, name, ConstantInt::get(ip, 16),
+        {0x67, 0x64, 0x62, 0x75, 0x73}, 16,
+        "morok.antihook.dbi.thread.gdbus");
+    Value *threadSig5 = bufferHasLiteral(
+        TB, M, name, ConstantInt::get(ip, 16),
+        {0x6c, 0x69, 0x6e, 0x6a, 0x65, 0x63, 0x74, 0x6f, 0x72}, 16,
+        "morok.antihook.dbi.thread.linjector");
+    Value *threadStrong = TB.CreateOr(
+        TB.CreateOr(threadSig0, threadSig2),
+        TB.CreateOr(threadSig3, threadSig5),
+        "morok.antihook.dbi.thread.strong");
+    Value *threadWeak =
+        TB.CreateOr(threadSig1, threadSig4, "morok.antihook.dbi.thread.weak");
+    TB.CreateOr(threadStrong, threadWeak, "morok.antihook.dbi.thread.sig");
+    incrementDiff(TB, fridaDiff, threadStrong,
+                  "morok.antihook.dbi.frida.thread.self.strong");
+    incrementDiff(TB, fridaSoftDiff, threadWeak,
+                  "morok.antihook.dbi.frida.thread.self.weak");
+    emitLinuxDbiThreadTableScan(TB, M, fn, fridaDiff, fridaSoftDiff, rng, TT);
 
     FunctionCallee dlsym =
         M.getOrInsertFunction("dlsym", FunctionType::get(ptr, {ptr, ptr}, false));
@@ -14848,8 +15458,22 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
     Value *portSig1 = bufferHasLiteral(
         PB, M, tcp.buf, tcp.n, {0x36, 0x39, 0x61, 0x32}, 4096,
         "morok.antihook.dbi.port.sig1");
-    incrementDiff(PB, diff, PB.CreateOr(portSig0, portSig1),
-                  "morok.antihook.dbi.port");
+    Value *portSig2 = bufferHasLiteral(
+        PB, M, tcp.buf, tcp.n, {0x36, 0x39, 0x41, 0x33}, 4096,
+        "morok.antihook.dbi.port.sig2");
+    Value *portSig3 = bufferHasLiteral(
+        PB, M, tcp.buf, tcp.n, {0x36, 0x39, 0x61, 0x33}, 4096,
+        "morok.antihook.dbi.port.sig3");
+    Value *portSig = PB.CreateOr(
+        PB.CreateOr(portSig0, portSig1),
+        PB.CreateOr(portSig2, portSig3),
+        "morok.antihook.dbi.port.sig");
+    Value *fdTcp =
+        emitLinuxDbiFdTcpCrossRef(PB, M, fn, tcp.buf, tcp.n, rng, TT);
+    incrementDiff(PB, fridaDiff, portSig,
+                  "morok.antihook.dbi.frida.port");
+    incrementDiff(PB, fridaDiff, fdTcp,
+                  "morok.antihook.dbi.frida.fd.tcp");
     PB.CreateBr(retBB);
 
     IRBuilder<> RB(retBB);
@@ -14858,17 +15482,33 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
     auto *soft =
         RB.CreateLoad(i64, jitDiff, "morok.antihook.dbi.jit.diff.soft");
     soft->setVolatile(true);
+    auto *frida =
+        RB.CreateLoad(i64, fridaDiff, "morok.antihook.dbi.frida.diff.hard");
+    frida->setVolatile(true);
+    auto *fridaSoft =
+        RB.CreateLoad(i64, fridaSoftDiff, "morok.antihook.dbi.frida.diff.soft");
+    fridaSoft->setVolatile(true);
     auto *pin =
         RB.CreateLoad(i64, pinDiff, "morok.antihook.dbi.pin.diff.hard");
     pin->setVolatile(true);
+    Value *fridaConfirmed =
+        RB.CreateICmpUGE(frida, ConstantInt::get(i64, 2),
+                         "morok.antihook.dbi.frida.confirmed");
+    Value *hardWithFrida =
+        RB.CreateAdd(hard, RB.CreateZExt(fridaConfirmed, i64),
+                     "morok.antihook.dbi.diff.hard.frida");
+    Value *softWithFrida =
+        RB.CreateAdd(RB.CreateAdd(soft, frida,
+                                  "morok.antihook.dbi.frida.hard.soft"),
+                     fridaSoft, "morok.antihook.dbi.frida.soft");
     Value *pinConfirmed =
         RB.CreateICmpUGE(pin, ConstantInt::get(i64, 2),
                          "morok.antihook.dbi.pin.confirmed");
     Value *hardWithPin =
-        RB.CreateAdd(hard, RB.CreateZExt(pinConfirmed, i64),
+        RB.CreateAdd(hardWithFrida, RB.CreateZExt(pinConfirmed, i64),
                      "morok.antihook.dbi.diff.hard.pin");
     Value *softWithPin =
-        RB.CreateAdd(soft, pin, "morok.antihook.dbi.jit.pin.soft");
+        RB.CreateAdd(softWithFrida, pin, "morok.antihook.dbi.jit.pin.soft");
     Value *packedHard =
         RB.CreateAnd(hardWithPin, ConstantInt::get(i64, 0xffffffffULL),
                      "morok.antihook.dbi.diff.pack.hard");
