@@ -308,6 +308,41 @@ static Value *emitArm64SvcInlineAsm(IRBuilder<> &B, Module &M, Value *Nr,
                         Name);
 }
 
+static Value *emitArm64Svc7InlineAsm(IRBuilder<> &B, Module &M, Value *Nr,
+                                     const std::array<Value *, 7> &A,
+                                     const Twine &Name) {
+    auto *IP = platformWordTy(M);
+    std::vector<Type *> Params(8, IP);
+    auto *AsmTy = FunctionType::get(IP, Params, false);
+    InlineAsm *Svc = InlineAsm::get(
+        AsmTy, "svc #0x80",
+        "={x0},{x16},0,{x1},{x2},{x3},{x4},{x5},{x6},~{memory},~{cc}",
+        /*hasSideEffects=*/true);
+    return B.CreateCall(
+        AsmTy, Svc, {Nr, A[0], A[1], A[2], A[3], A[4], A[5], A[6]}, Name);
+}
+
+static Value *emitX86DarwinMachTrap7(IRBuilder<> &B, Module &M,
+                                     std::int32_t Trap,
+                                     const std::array<Value *, 7> &A,
+                                     const Twine &Name) {
+    auto *IP = platformWordTy(M);
+    std::vector<Type *> Params(8, IP);
+    auto *AsmTy = FunctionType::get(IP, Params, false);
+    InlineAsm *TrapAsm = InlineAsm::get(
+        AsmTy,
+        "subq $$8, %rsp\nmovq $8, (%rsp)\nsyscall\naddq $$8, %rsp\n"
+        "sbbq %r11, %r11\norq %r11, %rax",
+        "={rax},{rax},{rdi},{rsi},{rdx},{r10},{r8},{r9},r,~{rcx},~{r11},"
+        "~{memory},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    return B.CreateCall(
+        AsmTy, TrapAsm,
+        {ConstantInt::getSigned(IP, Trap), A[0], A[1], A[2], A[3], A[4],
+         A[5], A[6]},
+        Name);
+}
+
 static Function *getOrCreateSvcFallback(Module &M) {
     if (auto *F = M.getFunction("morok.svc.fallback"))
         return F;
@@ -457,6 +492,44 @@ Value *emitDarwinCsops(IRBuilder<> &B, Module &M, const Triple &TT, Value *Pid,
     return B.CreateCall(Csops, {B.CreateTruncOrBitCast(Pid, I32),
                                 B.CreateTruncOrBitCast(Ops, I32), UserAddr,
                                 B.CreateZExtOrTrunc(UserSize, IP)});
+}
+
+Value *emitDarwinTaskGetExceptionPorts(
+    IRBuilder<> &B, Module &M, const Triple &TT, Value *Task,
+    Value *ExceptionMask, Value *Masks, Value *MaskCount, Value *Handlers,
+    Value *Behaviors, Value *Flavors, const Twine &Name) {
+    auto *I32 = Type::getInt32Ty(M.getContext());
+    auto *Ptr = PointerType::getUnqual(M.getContext());
+    constexpr std::int32_t kTaskGetExceptionPortsTrap = -36;
+    std::array<Value *, 7> Args = {
+        toSyscallArg(B, Task),       toSyscallArg(B, ExceptionMask),
+        toSyscallArg(B, Masks),      toSyscallArg(B, MaskCount),
+        toSyscallArg(B, Handlers),   toSyscallArg(B, Behaviors),
+        toSyscallArg(B, Flavors),
+    };
+
+    if (useDirectDarwinSyscalls(M, TT))
+        return B.CreateTruncOrBitCast(
+            emitX86DarwinMachTrap7(B, M, kTaskGetExceptionPortsTrap, Args,
+                                   Name),
+            I32);
+    if (TT.getArch() == Triple::aarch64 && directSyscallPolicy(M) != 2u)
+        return B.CreateTruncOrBitCast(
+            emitArm64Svc7InlineAsm(
+                B, M,
+                ConstantInt::getSigned(platformWordTy(M),
+                                       kTaskGetExceptionPortsTrap),
+                Args, Name),
+            I32);
+
+    FunctionCallee TaskGetExceptionPorts = M.getOrInsertFunction(
+        "task_get_exception_ports",
+        FunctionType::get(I32, {I32, I32, Ptr, Ptr, Ptr, Ptr, Ptr}, false));
+    return B.CreateCall(TaskGetExceptionPorts,
+                        {B.CreateTruncOrBitCast(Task, I32),
+                         B.CreateTruncOrBitCast(ExceptionMask, I32), Masks,
+                         MaskCount, Handlers, Behaviors, Flavors},
+                        Name + ".import");
 }
 
 Value *emitLinuxReadlink(IRBuilder<> &B, Module &M, const Triple &TT,

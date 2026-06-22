@@ -98,6 +98,12 @@ llvm::Value *emitDarwinCsops(llvm::IRBuilder<> &B, llvm::Module &M,
                              const llvm::Triple &TT, llvm::Value *Pid,
                              llvm::Value *Ops, llvm::Value *UserAddr,
                              llvm::Value *UserSize);
+llvm::Value *emitDarwinTaskGetExceptionPorts(
+    llvm::IRBuilder<> &B, llvm::Module &M, const llvm::Triple &TT,
+    llvm::Value *Task, llvm::Value *ExceptionMask, llvm::Value *Masks,
+    llvm::Value *MaskCount, llvm::Value *Handlers, llvm::Value *Behaviors,
+    llvm::Value *Flavors,
+    const llvm::Twine &Name = llvm::Twine("morok.darwin.exc_ports"));
 
 llvm::Value *emitLinuxReadlink(llvm::IRBuilder<> &B, llvm::Module &M,
                                const llvm::Triple &TT, llvm::Value *Path,

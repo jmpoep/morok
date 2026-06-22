@@ -16696,9 +16696,15 @@ entry:
     CHECK(M->getFunction("ptrace") == nullptr);
     CHECK(M->getFunction("sysctl") == nullptr);
     CHECK(M->getFunction("csops") == nullptr);
+    CHECK(M->getFunction("task_get_exception_ports") == nullptr);
     CHECK(M->getFunction("getpid") == nullptr);
     CHECK(M->getFunction("syscall") == nullptr);
     CHECK(M->getFunction("getenv") != nullptr);
+    CHECK(countNamedInstructions(*Ctor, "morok.antidbg.exc.task_ports") >= 1u);
+    CHECK(countNamedInstructions(*Ctor,
+                                 "morok.antidbg.exc.handler.nonnull") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antidbg.exc.any") >= 1u);
+    CHECK(functionHasConstantInt(*Ctor, 0x7FE));
     CHECK(M->getFunction("task_threads") != nullptr);
     CHECK(M->getFunction("thread_get_state") != nullptr);
     CHECK(M->getFunction("thread_set_state") != nullptr);
@@ -16860,6 +16866,7 @@ entry:
     CHECK(M->getFunction("ptrace") == nullptr);
     CHECK(M->getFunction("sysctl") == nullptr);
     CHECK(M->getFunction("csops") == nullptr);
+    CHECK(M->getFunction("task_get_exception_ports") == nullptr);
     CHECK(M->getFunction("getenv") != nullptr);
     // M2 direct syscall fallback: no imported MAP_JIT/icache helper can
     // interpose or patch a mutable syscall thunk before checks execute.
@@ -16873,6 +16880,13 @@ entry:
                        "morok.svc.fallback") >= 1u);
     CHECK(countCallsTo(*M->getFunction("morok.antidbg.probe"),
                        "morok.svc.fallback") >= 1u);
+    CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
+                                 "morok.antidbg.exc.task_ports") >= 1u);
+    CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
+                                 "morok.antidbg.exc.handler.nonnull") >= 1u);
+    CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
+                                 "morok.antidbg.exc.any") >= 1u);
+    CHECK(functionHasConstantInt(*M->getFunction("morok.antidbg"), 0x7FE));
     // M3: the loaded-image census enumerates dyld images to flag foreign
     // dylibs.
     CHECK(M->getFunction("_dyld_get_image_name") != nullptr);

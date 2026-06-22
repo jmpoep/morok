@@ -510,6 +510,15 @@ Value *emitDarwinCsops(IRBuilder<> &B, Module &M, const Triple &TT, Value *Pid,
     return runtime::emitDarwinCsops(B, M, TT, Pid, Ops, UserAddr, UserSize);
 }
 
+Value *emitDarwinTaskGetExceptionPorts(
+    IRBuilder<> &B, Module &M, const Triple &TT, Value *Task,
+    Value *ExceptionMask, Value *Masks, Value *MaskCount, Value *Handlers,
+    Value *Behaviors, Value *Flavors, const Twine &Name) {
+    return runtime::emitDarwinTaskGetExceptionPorts(
+        B, M, TT, Task, ExceptionMask, Masks, MaskCount, Handlers, Behaviors,
+        Flavors, Name);
+}
+
 FunctionCallee openDecl(Module &M) {
     return runtime::openDecl(M);
 }
@@ -2214,6 +2223,85 @@ void emitDarwinCsopsCheck(IRBuilder<> &B, Module &M, GlobalVariable *State,
     sealFold(B, dbgFlag, 0xF1D88C6C72195307ULL);
 }
 
+void emitDarwinExceptionPortProbe(IRBuilder<> &B, Module &M,
+                                  GlobalVariable *State, const Triple &TT) {
+    if (TT.getArch() != Triple::x86_64 && TT.getArch() != Triple::aarch64)
+        return;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    constexpr std::uint32_t kExcPortSlots = 32;
+    constexpr std::uint32_t kExcMaskAllWithoutResourceGuard = 0x7FE;
+
+    auto *arrayTy = ArrayType::get(i32, kExcPortSlots);
+    auto *masks = B.CreateAlloca(arrayTy, nullptr, "morok.antidbg.exc.masks");
+    auto *handlers =
+        B.CreateAlloca(arrayTy, nullptr, "morok.antidbg.exc.handlers");
+    auto *behaviors =
+        B.CreateAlloca(arrayTy, nullptr, "morok.antidbg.exc.behaviors");
+    auto *flavors =
+        B.CreateAlloca(arrayTy, nullptr, "morok.antidbg.exc.flavors");
+    auto *count = B.CreateAlloca(i32, nullptr, "morok.antidbg.exc.count");
+    B.CreateStore(ConstantInt::get(i32, kExcPortSlots), count);
+
+    for (std::uint32_t i = 0; i < kExcPortSlots; ++i) {
+        Value *idx[] = {ConstantInt::get(ip, 0), ConstantInt::get(ip, i)};
+        B.CreateStore(ConstantInt::get(i32, 0),
+                      B.CreateInBoundsGEP(arrayTy, masks, idx));
+        B.CreateStore(ConstantInt::get(i32, 0),
+                      B.CreateInBoundsGEP(arrayTy, handlers, idx));
+        B.CreateStore(ConstantInt::get(i32, 0),
+                      B.CreateInBoundsGEP(arrayTy, behaviors, idx));
+        B.CreateStore(ConstantInt::get(i32, 0),
+                      B.CreateInBoundsGEP(arrayTy, flavors, idx));
+    }
+
+    Value *zero = ConstantInt::get(ip, 0);
+    Value *masksPtr =
+        B.CreateInBoundsGEP(arrayTy, masks, {zero, zero},
+                            "morok.antidbg.exc.masks.ptr");
+    Value *handlersPtr =
+        B.CreateInBoundsGEP(arrayTy, handlers, {zero, zero},
+                            "morok.antidbg.exc.handlers.ptr");
+    Value *behaviorsPtr =
+        B.CreateInBoundsGEP(arrayTy, behaviors, {zero, zero},
+                            "morok.antidbg.exc.behaviors.ptr");
+    Value *flavorsPtr =
+        B.CreateInBoundsGEP(arrayTy, flavors, {zero, zero},
+                            "morok.antidbg.exc.flavors.ptr");
+
+    GlobalVariable *selfGV =
+        cast<GlobalVariable>(M.getOrInsertGlobal("mach_task_self_", i32));
+    Value *task = B.CreateLoad(i32, selfGV, "morok.antidbg.exc.task");
+    Value *mask =
+        ConstantInt::get(i32, kExcMaskAllWithoutResourceGuard);
+    Value *rc = emitDarwinTaskGetExceptionPorts(
+        B, M, TT, task, mask, masksPtr, count, handlersPtr, behaviorsPtr,
+        flavorsPtr, "morok.antidbg.exc.task_ports");
+
+    Value *anyHandler = ConstantInt::getFalse(ctx);
+    for (std::uint32_t i = 0; i < kExcPortSlots; ++i) {
+        Value *idx[] = {ConstantInt::get(ip, 0), ConstantInt::get(ip, i)};
+        Value *handler = B.CreateLoad(
+            i32, B.CreateInBoundsGEP(arrayTy, handlers, idx),
+            "morok.antidbg.exc.handler");
+        Value *nonnull =
+            B.CreateICmpNE(handler, ConstantInt::get(i32, 0),
+                           "morok.antidbg.exc.handler.nonnull");
+        anyHandler =
+            B.CreateOr(anyHandler, nonnull, "morok.antidbg.exc.any.scan");
+    }
+
+    Value *ok =
+        B.CreateICmpEQ(rc, ConstantInt::get(i32, 0), "morok.antidbg.exc.ok");
+    Value *tripped =
+        B.CreateAnd(ok, anyHandler, "morok.antidbg.exc.any");
+    foldFlag(B, State, tripped, 0xC90B5A4E67281D3FULL,
+             "morok.antidbg.exc_ports");
+    sealFold(B, tripped, 0xC90B5A4E67281D3FULL);
+}
+
 void emitDarwinDyldCensus(IRBuilder<> &B, Module &M, GlobalVariable *State,
                           ir::IRRandom &rng) {
     LLVMContext &ctx = M.getContext();
@@ -2496,6 +2584,7 @@ void emitDarwinAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
              0x9C2F71A6E5B30D4FULL);
     emitDarwinSysctlCheck(B, M, State, TT);
     emitDarwinCsopsCheck(B, M, State, TT);
+    emitDarwinExceptionPortProbe(B, M, State, TT);
     emitDarwinDyldCensus(B, M, State, rng);
     emitDarwinImageCensus(B, M, State);
     if (StartLiveWatchers) {
