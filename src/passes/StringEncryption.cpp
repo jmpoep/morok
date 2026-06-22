@@ -812,18 +812,25 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
         // the last returning frame re-encrypts it.  Escaped/static-address
         // strings retain the constructor fallback because no function-scope
         // release point can prove all observers are done with the address.
-        // musttail users cannot take an inserted release before ret; releasing
-        // before the tail call is not generally safe because the callee may
-        // receive the string pointer.
-        const bool scopedPlaintext =
-            stackCandidate && !escapes && !users.empty() &&
-            !hasMustTailReturn(users);
+        // musttail users cannot take an inserted function-exit release before
+        // ret; releasing before the tail call is not generally safe because the
+        // callee may receive the string pointer.  Load-only users are tighter:
+        // the string bytes can be decrypted immediately before each load and
+        // released immediately after it, even in a function that later musttail
+        // returns.
+        const bool scopedCandidate =
+            stackCandidate && !escapes && !users.empty();
         SmallVector<LoadInst *, 16> LoadScopeSites;
         SmallPtrSet<Value *, 16> SeenLoadUses;
         const bool loadScopedPlaintext =
-            scopedPlaintext &&
+            scopedCandidate &&
             collectLoadUseSites(target, LoadScopeSites, SeenLoadUses) &&
             !LoadScopeSites.empty();
+        const bool functionScopedPlaintext =
+            scopedCandidate && !loadScopedPlaintext &&
+            !hasMustTailReturn(users);
+        const bool scopedPlaintext =
+            loadScopedPlaintext || functionScopedPlaintext;
         target->setConstant(false); // mutated in place by its decryptor
         auto *decFn =
             Function::Create(FunctionType::get(voidTy, false),

@@ -13829,9 +13829,18 @@ entry:
     Function *Use = M->getFunction("use_tail");
     REQUIRE(Use);
     CHECK(countFunctions(*M, "morok.strdec") == 1u);
-    CHECK(countFunctions(*M, "morok.strrel") == 0u);
+    CHECK(countFunctions(*M, "morok.strrel") == 1u);
     CHECK(countCallsTo(*Use, "morok.strdec") == 1u);
+    CHECK(countCallsTo(*Use, "morok.strrel") == 1u);
+    CHECK(callToPrecedes(*Use, "morok.strrel", "tail_sink"));
     CHECK(ctorPrioritiesFor(*M, "morok.strdec").empty());
+    bool sawMustTail = false;
+    for (Instruction &I : instructions(*Use))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            if (Function *Callee = CI->getCalledFunction())
+                if (Callee->getName() == "tail_sink" && CI->isMustTailCall())
+                    sawMustTail = true;
+    CHECK(sawMustTail);
     CHECK_FALSE(hasReadableByteString(*M, "tailgate"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
