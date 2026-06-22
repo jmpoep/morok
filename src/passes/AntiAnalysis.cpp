@@ -428,9 +428,8 @@ constexpr std::uint32_t kSoftScoreThreshold = kSoftScoreWeight * 2;
 
 void foldSoftScore(IRBuilderBase &B, Value *Flag, std::uint64_t Salt,
                    const Twine &Name) {
-    // Timing currently contributes two independent soft signals. Keep the
-    // weighted gate reachable while foldWeightedFlag still requires distinct
-    // evidence bits before committing into the seal.
+    // A single soft signal contributes one low-weight evidence bit. The
+    // weighted gate only commits after independent evidence has accumulated.
     runtime_seal::foldWeightedFlag(
         B, runtime_seal::kAntiDebugChannel, Flag, kSoftScoreWeight,
         scoreEvidenceMask(Salt), kSoftScoreThreshold,
@@ -11385,11 +11384,11 @@ Function *timingOracleProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
         divergentSamples, ConstantInt::get(i32, 2),
         "morok.timing.divergent.distribution");
     const bool scoreSoftTiming = hasCycleClock;
-    // Score only when an independent cycle clock participates and corroborates
-    // sustained slowness. Wall-clock-only targets and lone stretched clocks are
-    // scheduler-sensitive telemetry, not consumed seal evidence.
+    // Score only the stronger two-clock coherent signal. A coherent stall is a
+    // subset of the broader bad-sample distribution, so scoring both would let
+    // one timing oracle satisfy the weighted seal threshold by itself.
     foldFlag(B, State, badDistribution, 0xA331D8B47E1C5905ULL,
-             "morok.timing.bad.distribution", scoreSoftTiming);
+             "morok.timing.bad.distribution");
     foldFlag(B, State, coherentDistribution, 0x4B1D6A80C2E39F17ULL,
              "morok.timing.coherent.distribution", scoreSoftTiming);
     foldFlag(B, State, divergentDistribution, 0x5E74B29D13C8A60BULL,

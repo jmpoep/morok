@@ -62,6 +62,16 @@ for fn in morok.timing.oracle morok.cachetime.oracle morok.microcanary.oracle; d
     echo "FAIL $fn folds a jitter-sensitive verdict into anti_debug seal" >&2
     exit 1
   fi
+  if [ "$fn" = "morok.timing.oracle" ]; then
+    if printf '%s\n' "$body" | grep -q 'morok\.timing\.bad\.distribution\.score\.'; then
+      echo "FAIL $fn scores nested bad timing distribution into anti_debug seal" >&2
+      exit 1
+    fi
+    if printf '%s\n' "$body" | grep -q 'morok\.timing\.divergent\.distribution\.score\.'; then
+      echo "FAIL $fn scores divergent timing distribution into anti_debug seal" >&2
+      exit 1
+    fi
+  fi
 done
 
 clean_out="$("$TMP/clean" 2>&1)"
