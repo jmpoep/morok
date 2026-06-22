@@ -4,12 +4,11 @@
 //
 // morok/passes/ReturnlessDispatch.cpp
 //
-// Tail-position returns are rewritten into indirect tail branches.  A function
+// Tail-position returns are rewritten into indirect dispatch sites.  A function
 // whose body ends in `%r = call g(args) ; ret %r` (or `call g(args) ; ret void`
-// for a void callee) leaves through a computed branch instead of a `ret`: the
-// callee address is read from a volatile slot, the call is made indirect, and
-// the tail-call kind forces the backend to emit `br x16` / `jmp *rax` with the
-// frame torn down correctly.
+// for a void callee) reads the callee address from a volatile slot and calls it
+// indirectly; only sites proven safe for tail-call lowering receive a tail-call
+// marker that lets the backend replace the epilogue/ret with a computed branch.
 //
 // Only genuine tail-position returns are touched.  A function rewritten to end
 // in a bare branch with no epilogue would skip the callee-saved restore and
@@ -20,14 +19,17 @@
 //
 // Perfect-forwarding sites (the call forwards F's own arguments with a matching
 // prototype, calling convention, and ABI attributes) are marked `musttail`,
-// which the verifier and backend guarantee lowers with no `ret`.  Any other
-// eligible site is marked `tail`, a best-effort hint the backend honors when it
-// can prove the call does not reference the local frame.
+// which the verifier and backend guarantee lowers with no `ret`.  Other
+// eligible sites are marked `tail` only when no pointer argument derives from
+// this function's frame; otherwise they stay ordinary indirect calls because
+// `tail` is our safety promise to the backend, not an analysis request.
 
 #include "morok/passes/ReturnlessDispatch.hpp"
 
 #include "morok/ir/Annotations.hpp"
 
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -49,7 +51,7 @@ namespace {
 
 struct Site {
     CallInst *call = nullptr;
-    bool must_tail = false;
+    CallInst::TailCallKind tail_kind = CallInst::TCK_None;
 };
 
 // ABI attributes that make a tail call unsafe or that the backend cannot tail
@@ -66,6 +68,33 @@ bool hasBlockingAbiAttrs(CallInst &CI) {
             CI.paramHasAttr(I, Attribute::Nest))
             return true;
     }
+    return false;
+}
+
+bool isLocalAlloca(const Value *V, const Function &F) {
+    const auto *AI = dyn_cast<AllocaInst>(V);
+    return AI && AI->getFunction() == &F;
+}
+
+bool valueMayReferenceLocalFrame(Value *V, Function &F) {
+    if (!V || !V->getType()->isPointerTy())
+        return false;
+
+    SmallVector<const Value *, 8> objects;
+    getUnderlyingObjects(V, objects);
+    for (const Value *object : objects)
+        if (isLocalAlloca(object, F))
+            return true;
+
+    if (const AllocaInst *AI = findAllocaForValue(V))
+        return AI->getFunction() == &F;
+    return false;
+}
+
+bool passesLocalFramePointer(Function &F, CallInst &CI) {
+    for (Use &Arg : CI.args())
+        if (valueMayReferenceLocalFrame(Arg.get(), F))
+            return true;
     return false;
 }
 
@@ -154,8 +183,7 @@ void rewriteSite(Module &M, const Site &S) {
     Value *Target = B.CreateIntToPtr(Enc, PtrTy, "morok.retless.target");
 
     CI->setCalledOperand(Target);
-    CI->setTailCallKind(S.must_tail ? CallInst::TCK_MustTail
-                                    : CallInst::TCK_Tail);
+    CI->setTailCallKind(S.tail_kind);
 }
 
 } // namespace
@@ -185,7 +213,12 @@ bool returnlessDispatchFunction(Function &F, const ReturnlessParams &params,
             continue;
         if (!rng.chance(params.probability))
             continue;
-        Sites.push_back({CI, qualifiesForMustTail(F, *CI)});
+        CallInst::TailCallKind tailKind = CallInst::TCK_None;
+        if (qualifiesForMustTail(F, *CI))
+            tailKind = CallInst::TCK_MustTail;
+        else if (!passesLocalFramePointer(F, *CI))
+            tailKind = CallInst::TCK_Tail;
+        Sites.push_back({CI, tailKind});
     }
     if (Sites.empty())
         return false;

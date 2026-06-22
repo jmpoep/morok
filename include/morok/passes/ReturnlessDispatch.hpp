@@ -3,9 +3,9 @@
 // Morok — modular LLVM IR obfuscator.
 //
 // morok/passes/ReturnlessDispatch.hpp — turn tail-position returns into
-// indirect tail branches so the function leaves through a computed `br x16` /
-// `jmp *rax` instead of a `ret`, with the callee target hidden behind a
-// volatile-loaded slot.
+// indirect dispatch sites with the callee target hidden behind a volatile-loaded
+// slot.  Sites that are safe for tail-call lowering can leave through a computed
+// `br x16` / `jmp *rax` instead of a `ret`.
 //
 // Scope (honest): this only covers returns that are already in tail position
 // (`ret %call` where `%call` is the immediately preceding call, or `ret void`
@@ -18,9 +18,9 @@
 //
 // For the perfect-forwarding subset (the call forwards F's own arguments with a
 // matching prototype) the call is marked `musttail`, which the verifier and
-// backend guarantee lowers to a tail branch with no `ret`.  Every other
-// eligible site is marked `tail` (a safe best-effort hint the backend honors on
-// AArch64/x86_64 when it can prove the call does not reference the local frame).
+// backend guarantee lowers to a tail branch with no `ret`.  Other eligible sites
+// are marked `tail` only when the pass can rule out pointer arguments derived
+// from F's local frame; unsafe sites remain ordinary indirect calls.
 
 #ifndef MOROK_PASSES_RETURNLESS_DISPATCH_HPP
 #define MOROK_PASSES_RETURNLESS_DISPATCH_HPP

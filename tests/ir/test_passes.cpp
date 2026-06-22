@@ -750,6 +750,18 @@ define internal void @vcallee() {
   ret void
 }
 
+define internal void @init(ptr %p) {
+entry:
+  store i32 7, ptr %p, align 4
+  ret void
+}
+
+define internal i32 @consume(ptr %p) {
+entry:
+  %v = load i32, ptr %p, align 4
+  ret i32 %v
+}
+
 define internal i32 @fwd(i32 %a) {
 entry:
   %r = call i32 @callee(i32 %a)
@@ -774,6 +786,14 @@ entry:
   %s = add i32 %r, 1
   ret i32 %s
 }
+
+define internal i32 @stackptr() {
+entry:
+  %x = alloca i32, align 4
+  call void @init(ptr %x)
+  %r = call i32 @consume(ptr %x)
+  ret i32 %r
+}
 )ir";
     auto M = parse(ctx, ir);
 
@@ -790,6 +810,13 @@ entry:
         for (Instruction &I : instructions(*F))
             if (auto *CI = dyn_cast<CallInst>(&I))
                 return CI;
+        return nullptr;
+    };
+    auto returnedCall = [](Function *F) -> CallInst * {
+        for (BasicBlock &BB : *F)
+            if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+                if (auto *CI = dyn_cast_or_null<CallInst>(RI->getPrevNode()))
+                    return CI;
         return nullptr;
     };
 
@@ -816,6 +843,13 @@ entry:
     REQUIRE(nt != nullptr);
     CHECK(nt->getCalledFunction() != nullptr);
     CHECK(nt->getTailCallKind() == CallInst::TCK_None);
+
+    // The indirect rewrite is still useful here, but stamping `tail` would be a
+    // false promise: the callee receives a pointer into stackptr's own frame.
+    CallInst *sp = returnedCall(M->getFunction("stackptr"));
+    REQUIRE(sp != nullptr);
+    CHECK(sp->getCalledFunction() == nullptr);
+    CHECK(sp->getTailCallKind() == CallInst::TCK_None);
 }
 
 TEST_CASE("PlatformRuntime emits direct Linux syscalls without libc import") {
