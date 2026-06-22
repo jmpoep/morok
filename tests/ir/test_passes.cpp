@@ -18351,11 +18351,13 @@ define i32 @main() { ret i32 0 }
 
     Function *Ctor = M->getFunction("morok.win.kdbg");
     Function *Probe = M->getFunction("morok.win.kdbg.probe");
+    Function *EnumCb = M->getFunction("morok.win.kdbg.window.enum.cb");
     Function *Peb = M->getFunction("morok.win.peb");
     Function *Resolve = M->getFunction("morok.win.pe.resolve");
     Function *Ldr = M->getFunction("morok.win.ldr.module");
     REQUIRE(Ctor != nullptr);
     REQUIRE(Probe != nullptr);
+    REQUIRE(EnumCb != nullptr);
     REQUIRE(Peb != nullptr);
     REQUIRE(Resolve != nullptr);
     REQUIRE(Ldr != nullptr);
@@ -18364,6 +18366,8 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getFunction("NtQuerySystemInformation") == nullptr);
     CHECK(M->getFunction("NtQueryInformationProcess") == nullptr);
     CHECK(M->getFunction("FindWindowA") == nullptr);
+    CHECK(M->getFunction("EnumWindows") == nullptr);
+    CHECK(M->getFunction("GetWindowTextA") == nullptr);
     CHECK(hasInlineAsmCall(*Peb));
     CHECK(countNamedInstructions(*Probe, "morok.win.kdbg.shared.enabled") >=
           1u);
@@ -18373,6 +18377,24 @@ define i32 @main() { ret i32 0 }
                                  "morok.win.kdbg.system.modules.status") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.kdbg.parent.pid") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.kdbg.window.windbg") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.kdbg.window.qt6") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.kdbg.enumwindows") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.kdbg.getwindowtext") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.kdbg.window.enum.result") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.kdbg.window.caption.hit") >= 1u);
+    CHECK(countNamedInstructions(*EnumCb,
+                                 "morok.win.kdbg.window.text.windbg") >= 1u);
+    CHECK(countNamedInstructions(*EnumCb,
+                                 "morok.win.kdbg.window.text.x64dbg") >= 1u);
+    CHECK(countNamedInstructions(*EnumCb,
+                                 "morok.win.kdbg.window.text.ollydbg") >= 1u);
+    Instruction *WindowHit =
+        findNamedInstruction(*Probe, "morok.win.kdbg.window.hit");
+    REQUIRE(WindowHit != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(WindowHit,
+                                           "morok.seal.fold.anti_debug"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

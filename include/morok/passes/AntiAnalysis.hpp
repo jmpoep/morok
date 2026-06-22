@@ -97,9 +97,9 @@ bool windowsAntiAttachModule(llvm::Module &M, morok::ir::IRRandom &rng);
 
 /// Inject Windows x86_64 kernel-debugger probes.  The emitted startup probe
 /// reads SharedUserData.KdDebugger* directly, calls
-/// NtQuerySystemInformation(SystemKernelDebuggerInformation), and folds
-/// driver, parent-PID, and debugger-window-class census signals into hidden
-/// state.  Returns true if code was added.
+/// NtQuerySystemInformation(SystemKernelDebuggerInformation), and folds driver,
+/// parent-PID, plus debugger-window class/caption telemetry into hidden state.
+/// Returns true if code was added.
 bool windowsKernelDebuggerModule(llvm::Module &M, morok::ir::IRRandom &rng);
 
 /// Inject Windows x86_64 direct and indirect syscall probes.  The emitted

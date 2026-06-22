@@ -12886,6 +12886,16 @@ std::uint64_t fnv1aLowerAsciiName(StringRef Name) {
     return h;
 }
 
+std::uint64_t packLowerAsciiToken(StringRef Name) {
+    std::uint64_t packed = 0;
+    for (unsigned char c : Name.bytes()) {
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<unsigned char>(c + ('a' - 'A'));
+        packed = (packed << 8) | c;
+    }
+    return packed;
+}
+
 GlobalVariable *windowsPeState(Module &M, ir::IRRandom &rng) {
     if (auto *existing =
             M.getGlobalVariable("morok.win.state", /*AllowInternal=*/true))
@@ -17332,6 +17342,199 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
     return fn;
 }
 
+Function *windowsToolWindowEnumCallback(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.kdbg.window.enum.cb"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    constexpr std::uint32_t kMaxTitleBytes = 128;
+    constexpr std::uint32_t kMaxWindows = 64;
+    constexpr std::uint64_t kToken3Mask = 0xFFFFFFULL;
+    constexpr std::uint64_t kToken6Mask = 0xFFFFFFFFFFFFULL;
+    constexpr std::uint64_t kToken7Mask = 0x00FFFFFFFFFFFFFFULL;
+
+    auto *fn = Function::Create(FunctionType::get(i32, {ptr, ip}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.kdbg.window.enum.cb", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    auto argIt = fn->arg_begin();
+    Value *hwnd = &*argIt++;
+    hwnd->setName("morok.win.kdbg.window.enum.hwnd");
+    Value *ctxValue = &*argIt;
+    ctxValue->setName("morok.win.kdbg.window.enum.ctx.value");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *queryBB = BasicBlock::Create(ctx, "query", fn);
+    auto *scanLoopBB = BasicBlock::Create(ctx, "scan.loop", fn);
+    auto *scanBodyBB = BasicBlock::Create(ctx, "scan.body", fn);
+    auto *scanDoneBB = BasicBlock::Create(ctx, "scan.done", fn);
+    auto *keepBB = BasicBlock::Create(ctx, "keep", fn);
+    auto *stopBB = BasicBlock::Create(ctx, "stop", fn);
+
+    IRBuilder<> B(entry);
+    Value *ctxPtr =
+        B.CreateIntToPtr(ctxValue, ptr, "morok.win.kdbg.window.enum.ctx");
+    Value *getText =
+        loadAt(B, M, ip, ctxPtr, 0ULL, "morok.win.kdbg.window.enum.gettext");
+    Value *oldCount =
+        loadAt(B, M, i32, ctxPtr, 12, "morok.win.kdbg.window.enum.count.old");
+    Value *nextCount =
+        B.CreateAdd(oldCount, ConstantInt::get(i32, 1),
+                    "morok.win.kdbg.window.enum.count.next");
+    storeAt(B, M, ctxPtr, 12, nextCount, "morok.win.kdbg.window.enum.count");
+    Value *canScan = B.CreateAnd(
+        B.CreateICmpNE(getText, ConstantInt::get(ip, 0),
+                       "morok.win.kdbg.window.enum.gettext.ready"),
+        B.CreateICmpULT(oldCount, ConstantInt::get(i32, kMaxWindows),
+                        "morok.win.kdbg.window.enum.under.cap"),
+        "morok.win.kdbg.window.enum.ready");
+    B.CreateCondBr(canScan, queryBB, stopBB);
+
+    IRBuilder<> QB(queryBB);
+    Value *buf = gepI8(QB, M, ctxPtr, constIp(M, 24),
+                       "morok.win.kdbg.window.enum.buf");
+    QB.CreateMemSet(buf, ConstantInt::get(i8, 0),
+                    ConstantInt::get(ip, kMaxTitleBytes), MaybeAlign(1));
+    auto *getTextTy = FunctionType::get(i32, {ptr, ptr, i32}, false);
+    Value *textLen = QB.CreateCall(
+        getTextTy,
+        QB.CreateIntToPtr(getText, ptr,
+                          "morok.win.kdbg.window.enum.gettext.ptr"),
+        {hwnd, buf, ConstantInt::get(i32, kMaxTitleBytes)},
+        "morok.win.kdbg.window.text.len");
+    Value *scanLimit = QB.CreateSelect(
+        QB.CreateICmpULT(textLen, ConstantInt::get(i32, kMaxTitleBytes - 1),
+                         "morok.win.kdbg.window.text.under.cap"),
+        textLen, ConstantInt::get(i32, kMaxTitleBytes - 1),
+        "morok.win.kdbg.window.text.scan.limit");
+    QB.CreateCondBr(QB.CreateICmpSGT(textLen, ConstantInt::get(i32, 0),
+                                     "morok.win.kdbg.window.text.present"),
+                    scanLoopBB, keepBB);
+
+    IRBuilder<> LB(scanLoopBB);
+    auto *idx = LB.CreatePHI(i32, 2, "morok.win.kdbg.window.text.idx");
+    auto *packed = LB.CreatePHI(i64, 2, "morok.win.kdbg.window.text.pack");
+    auto *hit = LB.CreatePHI(i1, 2, "morok.win.kdbg.window.caption.hit.phi");
+    idx->addIncoming(ConstantInt::get(i32, 0), queryBB);
+    packed->addIncoming(ConstantInt::get(i64, 0), queryBB);
+    hit->addIncoming(ConstantInt::getFalse(ctx), queryBB);
+    LB.CreateCondBr(LB.CreateICmpULT(idx, scanLimit,
+                                     "morok.win.kdbg.window.text.idx.ok"),
+                    scanBodyBB, scanDoneBB);
+
+    IRBuilder<> TB(scanBodyBB);
+    Value *ch =
+        loadAt(TB, M, i8, buf, TB.CreateZExt(idx, ip),
+               "morok.win.kdbg.window.text.ch");
+    Value *isUpper = TB.CreateAnd(
+        TB.CreateICmpUGE(ch, ConstantInt::get(i8, 'A'),
+                         "morok.win.kdbg.window.text.upper.lo"),
+        TB.CreateICmpULE(ch, ConstantInt::get(i8, 'Z'),
+                         "morok.win.kdbg.window.text.upper.hi"),
+        "morok.win.kdbg.window.text.upper");
+    Value *lower = TB.CreateSelect(
+        isUpper, TB.CreateAdd(ch, ConstantInt::get(i8, 'a' - 'A'),
+                              "morok.win.kdbg.window.text.lower.add"),
+        ch, "morok.win.kdbg.window.text.lower");
+    Value *nextPacked = TB.CreateAnd(
+        TB.CreateOr(TB.CreateShl(packed, ConstantInt::get(i64, 8),
+                                 "morok.win.kdbg.window.text.pack.shift"),
+                    TB.CreateZExt(lower, i64),
+                    "morok.win.kdbg.window.text.pack.append"),
+        ConstantInt::get(i64, kToken7Mask),
+        "morok.win.kdbg.window.text.pack.next");
+    Value *nextIdx =
+        TB.CreateAdd(idx, ConstantInt::get(i32, 1),
+                     "morok.win.kdbg.window.text.next.idx");
+    Value *tail3 = TB.CreateAnd(nextPacked, ConstantInt::get(i64, kToken3Mask),
+                                "morok.win.kdbg.window.text.tail3");
+    Value *tail6 = TB.CreateAnd(nextPacked, ConstantInt::get(i64, kToken6Mask),
+                                "morok.win.kdbg.window.text.tail6");
+    Value *tail7 = TB.CreateAnd(nextPacked, ConstantInt::get(i64, kToken7Mask),
+                                "morok.win.kdbg.window.text.tail7");
+    Value *idaHit = TB.CreateAnd(
+        TB.CreateICmpUGE(nextIdx, ConstantInt::get(i32, 3),
+                         "morok.win.kdbg.window.text.ge3"),
+        TB.CreateICmpEQ(tail3, ConstantInt::get(i64, packLowerAsciiToken("ida")),
+                        "morok.win.kdbg.window.text.ida"),
+        "morok.win.kdbg.window.text.ida.hit");
+    Value *dbg6Hit = TB.CreateAnd(
+        TB.CreateICmpUGE(nextIdx, ConstantInt::get(i32, 6),
+                         "morok.win.kdbg.window.text.ge6"),
+        TB.CreateOr(
+            TB.CreateOr(
+                TB.CreateICmpEQ(tail6,
+                                ConstantInt::get(i64,
+                                                 packLowerAsciiToken("windbg")),
+                                "morok.win.kdbg.window.text.windbg"),
+                TB.CreateICmpEQ(tail6,
+                                ConstantInt::get(i64,
+                                                 packLowerAsciiToken("x64dbg")),
+                                "morok.win.kdbg.window.text.x64dbg"),
+                "morok.win.kdbg.window.text.dbg6.a"),
+            TB.CreateOr(
+                TB.CreateICmpEQ(tail6,
+                                ConstantInt::get(i64,
+                                                 packLowerAsciiToken("x32dbg")),
+                                "morok.win.kdbg.window.text.x32dbg"),
+                TB.CreateICmpEQ(tail6,
+                                ConstantInt::get(i64,
+                                                 packLowerAsciiToken("ghidra")),
+                                "morok.win.kdbg.window.text.ghidra"),
+                "morok.win.kdbg.window.text.dbg6.b"),
+            "morok.win.kdbg.window.text.dbg6"),
+        "morok.win.kdbg.window.text.dbg6.hit");
+    Value *ollyHit = TB.CreateAnd(
+        TB.CreateICmpUGE(nextIdx, ConstantInt::get(i32, 7),
+                         "morok.win.kdbg.window.text.ge7"),
+        TB.CreateICmpEQ(tail7,
+                        ConstantInt::get(i64, packLowerAsciiToken("ollydbg")),
+                        "morok.win.kdbg.window.text.ollydbg"),
+        "morok.win.kdbg.window.text.ollydbg.hit");
+    Value *nextHit =
+        TB.CreateOr(hit, TB.CreateOr(idaHit, TB.CreateOr(dbg6Hit, ollyHit)),
+                    "morok.win.kdbg.window.caption.hit.next");
+    TB.CreateBr(scanLoopBB);
+    idx->addIncoming(nextIdx, scanBodyBB);
+    packed->addIncoming(nextPacked, scanBodyBB);
+    hit->addIncoming(nextHit, scanBodyBB);
+
+    IRBuilder<> DB(scanDoneBB);
+    Value *oldHit =
+        loadAt(DB, M, i32, ctxPtr, 8, "morok.win.kdbg.window.caption.old");
+    Value *hitWord = DB.CreateZExt(hit, i32, "morok.win.kdbg.window.caption.word");
+    storeAt(DB, M, ctxPtr, 8,
+            DB.CreateOr(oldHit, hitWord, "morok.win.kdbg.window.caption.next"),
+            "morok.win.kdbg.window.caption.hit");
+    Value *oldMix =
+        loadAt(DB, M, i64, ctxPtr, 16, "morok.win.kdbg.window.caption.mix.old");
+    Value *nextMix = DB.CreateXor(
+        DB.CreateMul(oldMix, ConstantInt::get(i64, 0xD6E8FEB86659FD93ULL),
+                     "morok.win.kdbg.window.caption.mix.mul"),
+        DB.CreateXor(packed, DB.CreateZExt(textLen, i64),
+                     "morok.win.kdbg.window.caption.mix.input"),
+        "morok.win.kdbg.window.caption.mix.next");
+    storeAt(DB, M, ctxPtr, 16, nextMix,
+            "morok.win.kdbg.window.caption.mix");
+    DB.CreateRet(DB.CreateSelect(hit, ConstantInt::get(i32, 0),
+                                 ConstantInt::get(i32, 1),
+                                 "morok.win.kdbg.window.enum.keep"));
+
+    IRBuilder<> KB(keepBB);
+    KB.CreateRet(ConstantInt::get(i32, 1));
+
+    IRBuilder<> SB(stopBB);
+    SB.CreateRet(ConstantInt::get(i32, 0));
+    return fn;
+}
+
 Function *windowsKernelDebuggerProbe(Module &M, GlobalVariable *State,
                                      ir::IRRandom &rng, const Triple &TT) {
     if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
@@ -17365,6 +17568,9 @@ Function *windowsKernelDebuggerProbe(Module &M, GlobalVariable *State,
     auto *qipBB = BasicBlock::Create(ctx, "qip", fn);
     auto *windowGateBB = BasicBlock::Create(ctx, "window.gate", fn);
     auto *windowBB = BasicBlock::Create(ctx, "window", fn);
+    auto *windowEnumGateBB = BasicBlock::Create(ctx, "window.enum.gate", fn);
+    auto *windowEnumBB = BasicBlock::Create(ctx, "window.enum", fn);
+    auto *windowFoldBB = BasicBlock::Create(ctx, "window.fold", fn);
     auto *retBB = BasicBlock::Create(ctx, "ret", fn);
 
     IRBuilder<> B(entry);
@@ -17393,15 +17599,26 @@ Function *windowsKernelDebuggerProbe(Module &M, GlobalVariable *State,
                    resolveBB, retBB);
 
     IRBuilder<> RB(resolveBB);
+    constexpr std::uint64_t kWindowEnumContextBytes = 160;
     AllocaInst *retLen = RB.CreateAlloca(i32, nullptr, "morok.win.kdbg.retlen");
     auto *kdInfoTy = ArrayType::get(i8, 2);
     auto *pbiTy = ArrayType::get(i8, 48);
     auto *moduleTy = ArrayType::get(i8, 4096);
+    auto *windowCtxTy = ArrayType::get(i8, kWindowEnumContextBytes);
     AllocaInst *kdInfo =
         RB.CreateAlloca(kdInfoTy, nullptr, "morok.win.kdbg.info");
     AllocaInst *pbi = RB.CreateAlloca(pbiTy, nullptr, "morok.win.kdbg.pbi");
     AllocaInst *modules =
         RB.CreateAlloca(moduleTy, nullptr, "morok.win.kdbg.modules");
+    AllocaInst *windowCtx =
+        RB.CreateAlloca(windowCtxTy, nullptr, "morok.win.kdbg.window.ctx");
+    AllocaInst *windowClassHit =
+        RB.CreateAlloca(i32, nullptr, "morok.win.kdbg.window.class.slot");
+    RB.CreateMemSet(windowCtx, ConstantInt::get(i8, 0),
+                    ConstantInt::get(ip, kWindowEnumContextBytes),
+                    MaybeAlign(1));
+    RB.CreateStore(ConstantInt::get(i32, 0), windowClassHit)
+        ->setVolatile(true);
     Value *ntdll = RB.CreateCall(
         moduleByHash,
         {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("ntdll.dll"))},
@@ -17421,8 +17638,18 @@ Function *windowsKernelDebuggerProbe(Module &M, GlobalVariable *State,
     Value *findWindow = RB.CreateCall(
         resolver, {user32, ConstantInt::get(i64, fnv1aName("FindWindowA"))},
         "morok.win.kdbg.findwindow");
+    Value *enumWindows = RB.CreateCall(
+        resolver, {user32, ConstantInt::get(i64, fnv1aName("EnumWindows"))},
+        "morok.win.kdbg.enumwindows");
+    Value *getWindowText = RB.CreateCall(
+        resolver, {user32, ConstantInt::get(i64, fnv1aName("GetWindowTextA"))},
+        "morok.win.kdbg.getwindowtext");
     foldState(RB, State, qsi, rng.next(), "morok.win.kdbg.ntqsi.mix");
     foldState(RB, State, qip, rng.next(), "morok.win.kdbg.ntqip.mix");
+    foldState(RB, State, enumWindows, rng.next(),
+              "morok.win.kdbg.enumwindows.mix");
+    foldState(RB, State, getWindowText, rng.next(),
+              "morok.win.kdbg.getwindowtext.mix");
     RB.CreateCondBr(RB.CreateICmpNE(qsi, ConstantInt::get(ip, 0),
                                     "morok.win.kdbg.ntqsi.ready"),
                     qsiBB, qipGateBB);
@@ -17488,7 +17715,7 @@ Function *windowsKernelDebuggerProbe(Module &M, GlobalVariable *State,
     IRBuilder<> WG(windowGateBB);
     WG.CreateCondBr(WG.CreateICmpNE(findWindow, ConstantInt::get(ip, 0),
                                     "morok.win.kdbg.findwindow.ready"),
-                    windowBB, retBB);
+                    windowBB, windowEnumGateBB);
 
     IRBuilder<> WB(windowBB);
     auto *findTy = FunctionType::get(ptr, {ptr, ptr}, false);
@@ -17496,7 +17723,8 @@ Function *windowsKernelDebuggerProbe(Module &M, GlobalVariable *State,
         WB.CreateIntToPtr(findWindow, ptr, "morok.win.kdbg.findwindow.ptr");
     Value *windbg = ir::emitCloakedSymbol(WB, M, "WinDbgFrameClass", rng);
     Value *olly = ir::emitCloakedSymbol(WB, M, "OLLYDBG", rng);
-    Value *qt = ir::emitCloakedSymbol(WB, M, "Qt5QWindowIcon", rng);
+    Value *qt5 = ir::emitCloakedSymbol(WB, M, "Qt5QWindowIcon", rng);
+    Value *qt6 = ir::emitCloakedSymbol(WB, M, "Qt6QWindowIcon", rng);
     Value *w0 = WB.CreateCall(findTy, findPtr,
                               {windbg, ConstantPointerNull::get(ptr)},
                               "morok.win.kdbg.window.windbg");
@@ -17504,16 +17732,80 @@ Function *windowsKernelDebuggerProbe(Module &M, GlobalVariable *State,
                               {olly, ConstantPointerNull::get(ptr)},
                               "morok.win.kdbg.window.olly");
     Value *w2 = WB.CreateCall(findTy, findPtr,
-                              {qt, ConstantPointerNull::get(ptr)},
-                              "morok.win.kdbg.window.qt");
-    Value *windowHit = WB.CreateOr(
+                              {qt5, ConstantPointerNull::get(ptr)},
+                              "morok.win.kdbg.window.qt5");
+    Value *w3 = WB.CreateCall(findTy, findPtr,
+                              {qt6, ConstantPointerNull::get(ptr)},
+                              "morok.win.kdbg.window.qt6");
+    Value *classHit = WB.CreateOr(
         WB.CreateICmpNE(w0, ConstantPointerNull::get(ptr)),
         WB.CreateOr(WB.CreateICmpNE(w1, ConstantPointerNull::get(ptr)),
-                    WB.CreateICmpNE(w2, ConstantPointerNull::get(ptr))),
+                    WB.CreateOr(WB.CreateICmpNE(w2, ConstantPointerNull::get(ptr)),
+                                WB.CreateICmpNE(w3,
+                                                ConstantPointerNull::get(ptr)))),
+        "morok.win.kdbg.window.class.hit");
+    WB.CreateStore(WB.CreateZExt(classHit, i32), windowClassHit)
+        ->setVolatile(true);
+    WB.CreateBr(windowEnumGateBB);
+
+    IRBuilder<> EG(windowEnumGateBB);
+    Value *captionReady = EG.CreateAnd(
+        EG.CreateICmpNE(enumWindows, ConstantInt::get(ip, 0),
+                        "morok.win.kdbg.enumwindows.ready"),
+        EG.CreateICmpNE(getWindowText, ConstantInt::get(ip, 0),
+                        "morok.win.kdbg.getwindowtext.ready"),
+        "morok.win.kdbg.window.caption.ready");
+    EG.CreateCondBr(captionReady, windowEnumBB, windowFoldBB);
+
+    IRBuilder<> EB(windowEnumBB);
+    Function *enumCallback = windowsToolWindowEnumCallback(M);
+    EB.CreateMemSet(windowCtx, ConstantInt::get(i8, 0),
+                    ConstantInt::get(ip, kWindowEnumContextBytes),
+                    MaybeAlign(1));
+    storeAt(EB, M, windowCtx, 0ULL, getWindowText,
+            "morok.win.kdbg.window.ctx.gettext");
+    auto *enumTy = FunctionType::get(i32, {ptr, ip}, false);
+    Value *enumResult = EB.CreateCall(
+        enumTy,
+        EB.CreateIntToPtr(enumWindows, ptr,
+                          "morok.win.kdbg.enumwindows.ptr"),
+        {enumCallback,
+         EB.CreatePtrToInt(windowCtx, ip, "morok.win.kdbg.window.ctx.ip")},
+        "morok.win.kdbg.window.enum.result");
+    Value *captionWord =
+        loadAt(EB, M, i32, windowCtx, 8, "morok.win.kdbg.window.caption.word");
+    Value *captionCount =
+        loadAt(EB, M, i32, windowCtx, 12, "morok.win.kdbg.window.caption.count");
+    Value *captionMix =
+        loadAt(EB, M, i64, windowCtx, 16, "morok.win.kdbg.window.caption.hash");
+    Value *captionHit =
+        EB.CreateICmpNE(captionWord, ConstantInt::get(i32, 0),
+                        "morok.win.kdbg.window.caption.hit");
+    foldState(EB, State, enumResult, rng.next(),
+              "morok.win.kdbg.window.enum.result.mix");
+    foldState(EB, State, captionCount, rng.next(),
+              "morok.win.kdbg.window.caption.count.mix");
+    foldState(EB, State, captionMix, rng.next(),
+              "morok.win.kdbg.window.caption.hash.mix");
+    foldFlag(EB, State, captionHit, 0x8A79C2D41F6350BEULL,
+             "morok.win.kdbg.window.caption");
+    EB.CreateBr(windowFoldBB);
+
+    IRBuilder<> FB(windowFoldBB);
+    Value *finalClassWord =
+        FB.CreateLoad(i32, windowClassHit, "morok.win.kdbg.window.class.word");
+    cast<LoadInst>(finalClassWord)->setVolatile(true);
+    Value *finalCaptionWord =
+        loadAt(FB, M, i32, windowCtx, 8, "morok.win.kdbg.window.caption.final");
+    Value *windowHit = FB.CreateOr(
+        FB.CreateICmpNE(finalClassWord, ConstantInt::get(i32, 0),
+                        "morok.win.kdbg.window.class.final.hit"),
+        FB.CreateICmpNE(finalCaptionWord, ConstantInt::get(i32, 0),
+                        "morok.win.kdbg.window.caption.final.hit"),
         "morok.win.kdbg.window.hit");
-    foldEnforcedFlag(WB, State, windowHit, 0xC52F6B9038D41EA7ULL,
-                     "morok.win.kdbg.window");
-    WB.CreateBr(retBB);
+    foldFlag(FB, State, windowHit, 0xC52F6B9038D41EA7ULL,
+             "morok.win.kdbg.window");
+    FB.CreateBr(retBB);
 
     IRBuilder<> RetB(retBB);
     RetB.CreateRetVoid();
