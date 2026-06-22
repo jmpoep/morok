@@ -13409,10 +13409,12 @@ Function *windowsVehAuditProbe(Module &M, GlobalVariable *State,
               "morok.win.veh.audit.shifted.mix");
     foldState(AB, State, seenTotal, rng.next(),
               "morok.win.veh.seen.total.mix");
-    foldEnforcedFlag(AB, State,
-                     AB.CreateICmpNE(badTotal, ConstantInt::get(i32, 0),
-                                     "morok.win.veh.bad.any"),
-                     0xAE6D401E2B75893FULL, "morok.win.veh.foreign");
+    // Foreign VEH classification is not zero-on-clean: legitimate runtimes can
+    // register non-image/JIT handlers, so keep it out of the enforced seal.
+    foldFlag(AB, State,
+             AB.CreateICmpNE(badTotal, ConstantInt::get(i32, 0),
+                             "morok.win.veh.bad.any"),
+             0xAE6D401E2B75893FULL, "morok.win.veh.foreign");
     AB.CreateBr(retBB);
 
     IRBuilder<> RetB(retBB);

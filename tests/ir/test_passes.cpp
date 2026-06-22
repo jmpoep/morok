@@ -17291,7 +17291,9 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Resolve != nullptr);
     REQUIRE(Ldr != nullptr);
     CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
-    checkSealEnforcement(*M, *Probe);
+    CHECK(M->getGlobalVariable("morok.seal.root.anti_debug", true) !=
+          nullptr);
+    checkNoSealEnforcement(*Probe);
     CHECK(M->getFunction("RtlAddVectoredExceptionHandler") == nullptr);
     CHECK(M->getFunction("RtlRemoveVectoredExceptionHandler") == nullptr);
     CHECK(M->getFunction("RtlDecodePointer") == nullptr);
@@ -17332,6 +17334,8 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.handler.foreign") >=
           1u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.bad.next") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.veh.bad.any") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.veh.foreign") >= 1u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.remove.status") == 0u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.remove.ready") == 0u);
     CHECK(countNamedInstructions(*Contains, "morok.win.ldr.contains.match") >=
