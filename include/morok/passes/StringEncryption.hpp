@@ -37,6 +37,22 @@ struct StrEncParams {
 bool stringEncryptModule(llvm::Module &M, const StrEncParams &params,
                          morok::ir::IRRandom &rng);
 
+/// Bind the runtime string-seed provider (morok.str.seed) to the anti-debug
+/// runtime seal: the per-string keystream seed is XORed with a KDF of the seal
+/// delta, which is zero on a clean run (strings decrypt normally) and nonzero
+/// once any analysis verdict trips (debugger/ptrace/anti-hook), so the whole
+/// string pool decodes to garbage under dynamic analysis.  Must run after the
+/// seal channel exists (integrity tail).  No-op if the seed or seal is absent.
+bool bindStringSeedToSeal(llvm::Module &M, morok::ir::IRRandom &rng);
+
+/// Replace `snprintf(buf, size, fmt, ...)` calls whose format is a constant
+/// string containing only `%s`/`%%`/literals with a generated, size-bounded
+/// per-format helper.  This removes the recoverable format-string constant
+/// (e.g. "%s@%s$%s&%s") *and* the observable snprintf call boundary that an
+/// in-process hook reads the secret canonicalization from.  Returns true if any
+/// call was rewritten.
+bool inlineConstantFormatCalls(llvm::Module &M);
+
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-strenc`).
 class StringEncryptionPass : public llvm::PassInfoMixin<StringEncryptionPass> {
 public:

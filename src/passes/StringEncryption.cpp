@@ -17,9 +17,11 @@
 
 #include "morok/ir/SymbolCloak.hpp"
 #include "morok/passes/CodeRegionKdf.hpp"
+#include "morok/passes/RuntimeSeal.hpp"
 
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -801,6 +803,230 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
         changed = true;
     }
     return changed;
+}
+
+bool bindStringSeedToSeal(Module &M, ir::IRRandom &rng) {
+    Function *Seed = M.getFunction("morok.str.seed");
+    if (!Seed || Seed->isDeclaration())
+        return false;
+    GlobalVariable *Seal =
+        runtime_seal::findChannel(M, runtime_seal::kAntiDebugChannel);
+    if (!Seal || !Seal->hasInitializer())
+        return false;
+    const std::uint64_t S0 = runtime_seal::initialValue(Seal);
+
+    bool changed = false;
+    for (BasicBlock &BB : *Seed) {
+        auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+        if (!RI || !RI->getReturnValue())
+            continue;
+        IRBuilder<> B(RI);
+        Value *RV = RI->getReturnValue();
+        // KDF(delta) is exactly 0 when the seal is clean (delta == 0), so the
+        // seed — and therefore every decrypted string — is byte-identical on a
+        // clean run and garbage once an analysis verdict has been folded in.
+        Value *Delta =
+            runtime_seal::emitDelta(B, Seal, S0, "morok.str.seed.seal");
+        Value *Key = runtime_seal::emitKdf64(B, Delta, rng.next(),
+                                             "morok.str.seed.seal.kdf");
+        RI->setOperand(0, B.CreateXor(RV, Key, "morok.str.seed.sealed"));
+        changed = true;
+    }
+    return changed;
+}
+
+bool inlineConstantFormatCalls(Module &M) {
+    Function *Snprintf = M.getFunction("snprintf");
+    if (!Snprintf || !Snprintf->isDeclaration())
+        return false;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I8 = Type::getInt8Ty(Ctx);
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+
+    // A format segment: either a run of literal bytes or one %s argument.
+    struct Seg {
+        bool isArg;
+        std::string lit;
+    };
+
+    // Parse an all-%s format.  Bails (returns false) on any other conversion so
+    // %d/%u/width/precision formats are left untouched.
+    auto parse = [](StringRef Fmt, std::vector<Seg> &Segs,
+                    unsigned &ArgCount) -> bool {
+        std::string lit;
+        ArgCount = 0;
+        for (std::size_t i = 0; i < Fmt.size(); ++i) {
+            char c = Fmt[i];
+            if (c == '%') {
+                if (i + 1 >= Fmt.size())
+                    return false;
+                char n = Fmt[i + 1];
+                if (n == '%') {
+                    lit.push_back('%');
+                    ++i;
+                    continue;
+                }
+                if (n == 's') {
+                    if (!lit.empty()) {
+                        Segs.push_back({false, lit});
+                        lit.clear();
+                    }
+                    Segs.push_back({true, {}});
+                    ++ArgCount;
+                    ++i;
+                    continue;
+                }
+                return false; // %d/%u/%f/width/… unsupported
+            }
+            lit.push_back(c);
+        }
+        if (!lit.empty())
+            Segs.push_back({false, lit});
+        return true;
+    };
+
+    auto constFmt = [](Value *V, std::string &Out) -> bool {
+        V = V->stripPointerCasts();
+        auto *GV = dyn_cast<GlobalVariable>(V);
+        if (!GV || !GV->isConstant() || !GV->hasInitializer())
+            return false;
+        auto *CDA = dyn_cast<ConstantDataArray>(GV->getInitializer());
+        if (!CDA || !CDA->isCString())
+            return false;
+        Out = CDA->getAsCString().str();
+        return true;
+    };
+
+    StringMap<Function *> HelperCache;
+    unsigned Counter = 0;
+
+    auto getHelper = [&](const std::string &Fmt, const std::vector<Seg> &Segs,
+                         unsigned ArgCount) -> Function * {
+        auto It = HelperCache.find(Fmt);
+        if (It != HelperCache.end())
+            return It->second;
+
+        SmallVector<Type *, 8> Params{Ptr, I64};
+        for (unsigned k = 0; k < ArgCount; ++k)
+            Params.push_back(Ptr);
+        auto *Fn = Function::Create(FunctionType::get(I32, Params, false),
+                                    GlobalValue::InternalLinkage,
+                                    "morok.fmt." + Twine(Counter++), &M);
+        Fn->setDSOLocal(true);
+        Fn->addFnAttr(Attribute::NoInline);
+        Fn->addFnAttr(Attribute::OptimizeNone);
+
+        Argument *Buf = Fn->getArg(0);
+        Argument *Size = Fn->getArg(1);
+
+        IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Fn));
+        AllocaInst *Pos = B.CreateAlloca(I64, nullptr, "morok.fmt.pos");
+        AllocaInst *Cnt = B.CreateAlloca(I64, nullptr, "morok.fmt.cnt");
+        AllocaInst *Scratch = B.CreateAlloca(I8, nullptr, "morok.fmt.scratch");
+        B.CreateStore(ConstantInt::get(I64, 0), Pos);
+        B.CreateStore(ConstantInt::get(I64, 0), Cnt);
+
+        // Append one byte with exact, branchless snprintf semantics: the store
+        // always executes but lands in a 1-byte scratch slot when the output is
+        // full (pos+1 >= size), so the destination buffer is never written out
+        // of bounds; pos advances only on a real write while count always grows.
+        auto appendByte = [&](Value *ByteVal) {
+            Value *P = B.CreateLoad(I64, Pos);
+            Value *C = B.CreateLoad(I64, Cnt);
+            Value *P1 = B.CreateAdd(P, ConstantInt::get(I64, 1));
+            Value *CanWrite = B.CreateICmpULT(P1, Size);
+            Value *DestBuf = B.CreateGEP(I8, Buf, {P});
+            Value *Dest = B.CreateSelect(CanWrite, DestBuf, Scratch);
+            B.CreateStore(ByteVal, Dest);
+            B.CreateStore(B.CreateSelect(CanWrite, P1, P), Pos);
+            B.CreateStore(B.CreateAdd(C, ConstantInt::get(I64, 1)), Cnt);
+        };
+
+        unsigned ArgIdx = 0;
+        for (const Seg &S : Segs) {
+            if (!S.isArg) {
+                for (char ch : S.lit)
+                    appendByte(ConstantInt::get(
+                        I8, static_cast<unsigned char>(ch)));
+                continue;
+            }
+            Argument *Arg = Fn->getArg(2 + ArgIdx++);
+            auto *Loop = BasicBlock::Create(Ctx, "morok.fmt.s.loop", Fn);
+            auto *Body = BasicBlock::Create(Ctx, "morok.fmt.s.body", Fn);
+            auto *Done = BasicBlock::Create(Ctx, "morok.fmt.s.done", Fn);
+            BasicBlock *Pre = B.GetInsertBlock();
+            B.CreateBr(Loop);
+            B.SetInsertPoint(Loop);
+            PHINode *J = B.CreatePHI(I64, 2, "morok.fmt.s.j");
+            J->addIncoming(ConstantInt::get(I64, 0), Pre);
+            Value *Ch = B.CreateLoad(I8, B.CreateGEP(I8, Arg, {J}));
+            B.CreateCondBr(B.CreateICmpEQ(Ch, ConstantInt::get(I8, 0)), Done,
+                           Body);
+            B.SetInsertPoint(Body);
+            appendByte(Ch);
+            Value *Jn = B.CreateAdd(J, ConstantInt::get(I64, 1));
+            J->addIncoming(Jn, Body);
+            B.CreateBr(Loop);
+            B.SetInsertPoint(Done);
+        }
+
+        // NUL-terminate at min(total, size-1) when size > 0, again routing the
+        // size==0 case to scratch so the buffer is never touched.
+        Value *P = B.CreateLoad(I64, Pos);
+        Value *C = B.CreateLoad(I64, Cnt);
+        Value *SizeNZ = B.CreateICmpNE(Size, ConstantInt::get(I64, 0));
+        Value *Dest =
+            B.CreateSelect(SizeNZ, B.CreateGEP(I8, Buf, {P}), Scratch);
+        B.CreateStore(ConstantInt::get(I8, 0), Dest);
+        B.CreateRet(B.CreateTrunc(C, I32));
+
+        HelperCache[Fmt] = Fn;
+        return Fn;
+    };
+
+    SmallVector<CallInst *, 16> Calls;
+    for (User *U : Snprintf->users())
+        if (auto *CI = dyn_cast<CallInst>(U))
+            if (CI->getCalledFunction() == Snprintf && CI->arg_size() >= 3)
+                Calls.push_back(CI);
+
+    bool Changed = false;
+    for (CallInst *CI : Calls) {
+        std::string Fmt;
+        if (!constFmt(CI->getArgOperand(2), Fmt))
+            continue;
+        std::vector<Seg> Segs;
+        unsigned ArgCount = 0;
+        if (!parse(Fmt, Segs, ArgCount))
+            continue;
+        // The variadic %s arguments must match the format and all be pointers.
+        if (ArgCount != CI->arg_size() - 3)
+            continue;
+        bool ok = true;
+        for (unsigned k = 0; k < ArgCount; ++k)
+            if (!CI->getArgOperand(3 + k)->getType()->isPointerTy())
+                ok = false;
+        if (!ok)
+            continue;
+
+        Function *Helper = getHelper(Fmt, Segs, ArgCount);
+        IRBuilder<> B(CI);
+        SmallVector<Value *, 8> Args{
+            CI->getArgOperand(0),
+            B.CreateZExtOrTrunc(CI->getArgOperand(1), I64)};
+        for (unsigned k = 0; k < ArgCount; ++k)
+            Args.push_back(CI->getArgOperand(3 + k));
+        CallInst *New = B.CreateCall(Helper->getFunctionType(), Helper, Args);
+        New->setDebugLoc(CI->getDebugLoc());
+        if (!CI->use_empty())
+            CI->replaceAllUsesWith(New);
+        CI->eraseFromParent();
+        Changed = true;
+    }
+    return Changed;
 }
 
 PreservedAnalyses StringEncryptionPass::run(Module &M,

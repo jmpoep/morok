@@ -591,6 +591,10 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
     // original direct call sites still expose argument attributes/use shapes.
     if (InitialModuleGrowthOk &&
         config_.passes.str_enc.enabled.value_or(false)) {
+        // Inline constant all-%s snprintf formats first, so the recoverable
+        // format constants and snprintf boundaries are gone before the dead
+        // format globals are swept (and the remaining strings encrypted).
+        changed |= passes::inlineConstantFormatCalls(M);
         passes::StrEncParams sp;
         sp.probability = config_.passes.str_enc.probability.value_or(100);
         sp.skip_content = config_.passes.str_enc.skip_content;
@@ -1190,6 +1194,12 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
     // XOR double-fold.
     if (InitialModuleGrowthOk)
         changed |= passes::bindLeafHelpersToSeal(M, rng);
+
+    // Bind the string-seed provider to the same anti-debug seal: zero-on-clean,
+    // so the encrypted string pool decodes only when no analysis verdict has
+    // fired — directly countering the dynamic recovery the field report used.
+    if (InitialModuleGrowthOk)
+        changed |= passes::bindStringSeedToSeal(M, rng);
 
     // Sensitive generated helpers are deliberately skipped by the normal
     // per-function loop because they are `morok.*`.  Once anti-debug,
