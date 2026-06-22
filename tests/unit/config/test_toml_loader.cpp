@@ -715,10 +715,12 @@ TEST_CASE("anti-debugging parses explicit distribution-signed gate") {
     const auto r = loadFromString(R"(
     [passes.anti_debugging]
     enabled = true
+    allow_self_trace = false
     distribution_signed = true
   )");
     REQUIRE(r.ok);
     CHECK(r.config.passes.anti_dbg.enabled == true);
+    CHECK(r.config.passes.anti_dbg.allow_self_trace == false);
     CHECK(r.config.passes.anti_dbg.distribution_signed == true);
 }
 

@@ -511,6 +511,16 @@ Value *packedI32Flag(IRBuilderBase &B, Value *Packed, std::uint32_t Mask,
     return B.CreateICmpNE(bits, ConstantInt::get(ty, 0), Name);
 }
 
+void foldLinuxTracerPidVerdict(IRBuilderBase &B, GlobalVariable *State,
+                               Value *Traced, bool AllowSelfTrace,
+                               std::uint64_t TelemetrySalt,
+                               std::uint64_t EnforcedSalt,
+                               const Twine &Name) {
+    foldFlag(B, State, Traced, TelemetrySalt, Name);
+    if (!AllowSelfTrace)
+        foldEnforcedFlag(B, State, Traced, EnforcedSalt, Name + ".enforced");
+}
+
 Value *constIp(Module &M, std::uint64_t V) {
     return ConstantInt::get(intPtrTy(M), V);
 }
@@ -3448,8 +3458,13 @@ Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
                                    0x6FAE31D54B8C9721ULL);
     Value *status = BB.CreateCall(StatusFn);
     Value *stat4 = BB.CreateCall(StatFn);
-    foldFlag(BB, State, BB.CreateICmpNE(status, ConstantInt::get(i32, 0)),
-             0x64C2D0B6D8F44A2DULL, "morok.antidbg.watch.status");
+    Value *statusTraced =
+        BB.CreateICmpNE(status, ConstantInt::get(i32, 0),
+                        "morok.antidbg.watch.status.traced");
+    foldLinuxTracerPidVerdict(BB, State, statusTraced, AllowSelfTrace,
+                              0x64C2D0B6D8F44A2DULL,
+                              0xB9281F3D4E6C507AULL,
+                              "morok.antidbg.watch.status");
     foldState(BB, State, stat4, 0x8CB92BA72F3D8DD7ULL,
               "morok.antidbg.watch.stat4");
     Value *statCoherence = packedI32Flag(
@@ -5424,7 +5439,8 @@ void emitLinuxWatcherStart(IRBuilder<> &B, Module &M, Function *WatchFn) {
 }
 
 Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
-                         const Triple &TT, bool DistributionSigned);
+                         const Triple &TT, bool AllowSelfTrace,
+                         bool DistributionSigned);
 Function *windowsTextChecksumProbe(Module &M, GlobalVariable *State,
                                    ir::IRRandom &rng, const Triple &TT);
 Function *windowsHardwareBreakpointProbe(Module &M, GlobalVariable *State,
@@ -5658,8 +5674,9 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
     Value *statusTraced =
         B.CreateICmpNE(status, ConstantInt::get(i32, 0),
                        "morok.antidbg.status.traced");
-    foldFlag(B, State, statusTraced, 0xA4756E49F2D31219ULL,
-             "morok.antidbg.status");
+    foldLinuxTracerPidVerdict(B, State, statusTraced, AllowSelfTrace,
+                              0xA4756E49F2D31219ULL,
+                              0xCB1E4D0A762F3958ULL, "morok.antidbg.status");
     foldState(B, State, stat4, 0xDA942042E4DD58B5ULL, "morok.antidbg.stat4");
     Value *statCoherence = packedI32Flag(
         B, stat4, 1u << 8, "morok.antidbg.stat.coherence.bits",
@@ -14465,7 +14482,8 @@ void emitProloguePatternChecks(IRBuilder<> &B, Module &M, const Triple &TT,
 }
 
 Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
-                         const Triple &TT, bool DistributionSigned) {
+                         const Triple &TT, bool AllowSelfTrace,
+                         bool DistributionSigned) {
     if (Function *existing = M.getFunction("morok.antidbg.probe"))
         return existing;
 
@@ -14493,8 +14511,10 @@ Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
         Value *statusTraced =
             B.CreateICmpNE(status, ConstantInt::get(i32, 0),
                            "morok.antidbg.probe.status.traced");
-        foldFlag(B, State, statusTraced, 0x3FEC9A6245A7DB13ULL,
-                 "morok.antidbg.probe.status");
+        foldLinuxTracerPidVerdict(B, State, statusTraced, AllowSelfTrace,
+                                  0x3FEC9A6245A7DB13ULL,
+                                  0x71D64A930CB25FE8ULL,
+                                  "morok.antidbg.probe.status");
         foldState(B, State, stat4, 0x84379D6FA21708C9ULL,
                   "morok.antidbg.probe.stat4");
         Value *statCoherence = packedI32Flag(
@@ -29103,7 +29123,8 @@ bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace,
         emitWindowsAntiDebug(M, ctor, state, rng, tt);
     else
         IRBuilder<>(&ctor->getEntryBlock()).CreateRetVoid();
-    Function *probe = antiDebugProbe(M, state, rng, tt, DistributionSigned);
+    Function *probe =
+        antiDebugProbe(M, state, rng, tt, AllowSelfTrace, DistributionSigned);
     insertAntiDebugCallsiteProbes(M, probe, rng);
     appendToGlobalCtors(M, ctor, 0);
     registerWindowsTlsCallbacks(M, ctor, "antidbg", rng);

@@ -249,6 +249,7 @@ TEST_CASE("merge handles every pass family") {
     src.func_wrap.times = 3u;
     src.fco.enabled = true;
     src.anti_dbg.enabled = true;
+    src.anti_dbg.allow_self_trace = false;
     src.anti_dbg.distribution_signed = true;
     src.windows_pe_foundation.enabled = true;
     src.windows_peb_heap_debug.enabled = true;
@@ -461,6 +462,7 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.func_wrap.times == 3u);
     CHECK(dst.fco.enabled == true);
     CHECK(dst.anti_dbg.enabled == true);
+    CHECK(dst.anti_dbg.allow_self_trace == false);
     CHECK(dst.anti_dbg.distribution_signed == true);
     CHECK(dst.windows_pe_foundation.enabled == true);
     CHECK(dst.windows_peb_heap_debug.enabled == true);

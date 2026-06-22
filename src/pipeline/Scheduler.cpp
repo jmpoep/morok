@@ -690,10 +690,15 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         changed |= passes::windowsVehAuditModule(M, rng);
     if (config_.passes.windows_process_mitigations.enabled.value_or(false))
         changed |= passes::windowsProcessMitigationsModule(M, rng);
-    if (config_.passes.anti_dbg.enabled.value_or(false))
+    if (config_.passes.anti_dbg.enabled.value_or(false)) {
+        bool allowSelfTrace =
+            config_.passes.anti_dbg.allow_self_trace.value_or(true);
+        if (config_.passes.trap_oracles.enabled.value_or(false))
+            allowSelfTrace = false;
         changed |= passes::antiDebuggingModule(
-            M, rng, !config_.passes.trap_oracles.enabled.value_or(false),
+            M, rng, allowSelfTrace,
             config_.passes.anti_dbg.distribution_signed.value_or(false));
+    }
     if (config_.passes.timing_oracles.enabled.value_or(false))
         changed |= passes::timingOracleModule(M, rng);
     if (config_.passes.scheduler_step_oracles.enabled.value_or(false))

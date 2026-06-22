@@ -61,6 +61,14 @@ set(_timing_false_positive_config
     "${CMAKE_CURRENT_SOURCE_DIR}/timing_false_positive.toml")
 set(_timing_false_positive_workload
     "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/timing_false_positive.c")
+set(_tracerpid_clean_driver
+    "${CMAKE_CURRENT_SOURCE_DIR}/tracerpid_zero_clean.sh")
+set(_tracerpid_clean_selftrace_config
+    "${CMAKE_CURRENT_SOURCE_DIR}/tracerpid_zero_clean_selftrace.toml")
+set(_tracerpid_clean_no_selftrace_config
+    "${CMAKE_CURRENT_SOURCE_DIR}/tracerpid_zero_clean_no_selftrace.toml")
+set(_tracerpid_clean_workload
+    "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/tracerpid_zero_clean.c")
 set(_release_audit_driver
     "${CMAKE_CURRENT_SOURCE_DIR}/release_audit_test.py")
 set(_boundary_trace_driver
@@ -215,6 +223,22 @@ set_tests_properties("e2e/string_dynamic_escape" PROPERTIES
   LABELS "e2e;security"
   REQUIRED_FILES
     "$<TARGET_FILE:morok_plugin>;${_string_dynamic_escape_config};${_string_dynamic_escape_workload}"
+  TIMEOUT 120)
+
+add_test(NAME "e2e/tracerpid_zero_clean"
+  COMMAND bash "${_tracerpid_clean_driver}"
+          "${CMAKE_C_COMPILER}"
+          "$<TARGET_FILE:morok_plugin>"
+          "${_sysroot}"
+          "${_tracerpid_clean_workload}"
+          "${_tracerpid_clean_selftrace_config}"
+          "${_tracerpid_clean_no_selftrace_config}"
+          1720)
+set_tests_properties("e2e/tracerpid_zero_clean" PROPERTIES
+  LABELS "e2e;security"
+  REQUIRED_FILES
+    "$<TARGET_FILE:morok_plugin>;${_tracerpid_clean_driver};${_tracerpid_clean_selftrace_config};${_tracerpid_clean_no_selftrace_config};${_tracerpid_clean_workload}"
+  SKIP_RETURN_CODE 77
   TIMEOUT 120)
 
 # Virtualization-specific differential gate.  Asserts the bytecode VM actually

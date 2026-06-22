@@ -468,6 +468,7 @@ void parseToggle(const toml::table &t, ToggleConfig &c) {
 
 void parseAntiDebugging(const toml::table &t, AntiDebuggingConfig &c) {
     c.enabled = readBool(t["enabled"]);
+    c.allow_self_trace = readBool(t["allow_self_trace"]);
     c.distribution_signed = readBool(t["distribution_signed"]);
 }
 

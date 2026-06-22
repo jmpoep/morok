@@ -406,6 +406,10 @@ struct ToggleConfig {
 
 struct AntiDebuggingConfig {
     Opt<bool> enabled;
+    // Defaults to true unless trap oracles require SIGTRAP ownership.  Set false
+    // for configurations that prefer seal-enforced TracerPid checks over
+    // PTRACE_TRACEME self-tracing.
+    Opt<bool> allow_self_trace;
     // Only release/distribution pipelines should set this.  Developer and
     // ad-hoc macOS builds commonly carry get-task-allow=true, so entitlement
     // probes must remain telemetry-only unless this is explicit.
