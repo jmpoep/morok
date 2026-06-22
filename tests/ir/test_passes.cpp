@@ -16142,6 +16142,17 @@ entry:
                                  "morok.antihook.sandbox.vmware.vendor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.tcg.vendor") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.qemu.brand") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.brand.available") >=
+          1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.tcg.tb.cold") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.tcg.tb.ratio") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.smc.flush") >= 1u);
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.vmware.backdoor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
@@ -16275,6 +16286,8 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "vgpreload_"));
     CHECK_FALSE(hasReadableByteString(*M, "valgrind"));
     CHECK_FALSE(hasReadableByteString(*M, "qemu-"));
+    CHECK_FALSE(hasReadableByteString(*M, "QEMU"));
+    CHECK_FALSE(hasReadableByteString(*M, "TCGTCGTCGTCG"));
     CHECK_FALSE(hasReadableByteString(*M, "dr_app_start"));
     CHECK_FALSE(hasReadableByteString(*M, "QBDI_addCodeRangeCB"));
     CHECK_FALSE(hasReadableByteString(*M, "ASAN_OPTIONS"));
@@ -16304,6 +16317,14 @@ define i32 @main() { ret i32 0 }
               1u);
         CHECK(countNamedInstructions(*S, "morok.antihook.sandbox.sleep.req") >=
               1u);
+        CHECK(countNamedInstructions(*S,
+                                     "morok.antihook.sandbox.qemu.brand") >=
+              1u);
+        CHECK(countNamedInstructions(*S,
+                                     "morok.antihook.sandbox.tcg.tb.cold") >=
+              1u);
+        CHECK(countNamedInstructions(*S,
+                                     "morok.antihook.sandbox.smc.flush") >= 1u);
     }
     // 32-bit: the sysconf CPU check still runs, but the wrong-layout timespec
     // timing heuristics are skipped (so the sandbox score can't be corrupted).
@@ -16324,6 +16345,14 @@ define i32 @main() { ret i32 0 }
               0u);
         CHECK(countNamedInstructions(*S, "morok.antihook.sandbox.boottime") ==
               0u);
+        CHECK(countNamedInstructions(*S,
+                                     "morok.antihook.sandbox.qemu.brand") >=
+              1u);
+        CHECK(countNamedInstructions(*S,
+                                     "morok.antihook.sandbox.tcg.tb.cold") ==
+              0u);
+        CHECK(countNamedInstructions(*S,
+                                     "morok.antihook.sandbox.smc.flush") == 0u);
     }
 }
 
@@ -16482,6 +16511,14 @@ entry:
               *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.tcg.vendor") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.qemu.brand") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.tcg.tb.cold") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.tcg.tb.ratio") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.smc.flush") >= 1u);
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.vmware.backdoor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
@@ -16602,6 +16639,14 @@ entry:
               *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.tcg.vendor") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.qemu.brand") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.tcg.tb.cold") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.tcg.tb.ratio") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.smc.flush") >= 1u);
     CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.flags.mismatch") >=
           1u);
     CHECK(countNamedInstructions(*Emu,

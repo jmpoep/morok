@@ -521,6 +521,7 @@ Value *emitDarwinSysctl(IRBuilder<> &B, Module &M, const Triple &TT, Value *Mib,
 
 Value *emitClockGettimeNanos(IRBuilder<> &B, Module &M, std::int32_t ClockId,
                              const Twine &Name);
+Value *emitRdtscp(IRBuilder<> &B, Module &M);
 
 Value *emitDarwinCsops(IRBuilder<> &B, Module &M, const Triple &TT, Value *Pid,
                        Value *Ops, Value *UserAddr, Value *UserSize) {
@@ -7128,6 +7129,7 @@ FunctionCallee nanosleepDecl(Module &M) {
 }
 
 FunctionCallee sigactionDecl(Module &M);
+Function *dbiSmcTarget(Module &M);
 
 GlobalVariable *sandboxTripwireGate(Module &M) {
     if (auto *existing = M.getGlobalVariable(
@@ -7183,6 +7185,318 @@ Value *emitVmwareBackdoor(IRBuilder<> &B, Module &M) {
         {ConstantInt::get(i32, 0x564D5868u), ConstantInt::get(i32, 0x0au),
          ConstantInt::get(i32, 0x5658u)},
         "morok.antihook.sandbox.vmware.backdoor");
+}
+
+GlobalVariable *sandboxBrandSalt(Module &M) {
+    if (auto *existing = M.getGlobalVariable(
+            "morok.antihook.sandbox.brand.salt", /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i32, 0), "morok.antihook.sandbox.brand.salt");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *sandboxTbState(Module &M) {
+    if (auto *existing = M.getGlobalVariable(
+            "morok.antihook.sandbox.tb.state", /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i64, 0), "morok.antihook.sandbox.tb.state");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+Value *sandboxNeedleByte(IRBuilder<> &B, Value *Salt, std::uint8_t Plain,
+                         std::uint32_t Site, const Twine &Name) {
+    auto *i32 = Type::getInt32Ty(B.getContext());
+    const std::uint32_t mix =
+        (0x9E3779B9u * (Site + 1u)) ^ (0xA5C3D217u + (Site << 7));
+    std::uint32_t key = ((mix >> ((Site & 3u) * 8u)) ^ mix ^ 0x5Du) & 0xffu;
+    if (key == 0)
+        key = 0xB7u;
+    const std::uint32_t bias =
+        ((0x6Du + Site * 29u) ^ (mix >> 11) ^ (Site << 3)) & 0xffu;
+    const std::uint32_t encoded =
+        ((static_cast<std::uint32_t>(Plain) + bias) & 0xffu) ^ key;
+    Value *saltByte = B.CreateAnd(Salt, ConstantInt::get(i32, 0xff),
+                                  Name + ".salt");
+    Value *dynKey =
+        B.CreateXor(ConstantInt::get(i32, key), saltByte, Name + ".key");
+    Value *mixed =
+        B.CreateXor(ConstantInt::get(i32, encoded), dynKey, Name + ".mix");
+    Value *unbiased =
+        B.CreateSub(mixed, ConstantInt::get(i32, bias), Name + ".unbias");
+    return B.CreateAnd(unbiased, ConstantInt::get(i32, 0xff), Name);
+}
+
+Value *emitQemuBrandMatch(IRBuilder<> &B, Module &M) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    Value *extLeaf = emitCpuid(B, M, ConstantInt::get(i32, 0x80000000u),
+                               ConstantInt::get(i32, 0));
+    Value *maxExt =
+        cpuidReg(B, extLeaf, 0, "morok.antihook.sandbox.brand.max");
+    Value *brandAvailable = B.CreateICmpUGE(
+        maxExt, ConstantInt::get(i32, 0x80000004u),
+        "morok.antihook.sandbox.brand.available");
+
+    auto *saltLoad = B.CreateLoad(i32, sandboxBrandSalt(M),
+                                  "morok.antihook.sandbox.brand.salt.load");
+    saltLoad->setVolatile(true);
+    SmallVector<Value *, 48> bytes;
+    bytes.reserve(48);
+    for (std::uint32_t leaf = 0; leaf < 3; ++leaf) {
+        Value *brandLeaf = emitCpuid(
+            B, M, ConstantInt::get(i32, 0x80000002u + leaf),
+            ConstantInt::get(i32, 0));
+        for (unsigned reg = 0; reg < 4; ++reg) {
+            Value *word = cpuidReg(
+                B, brandLeaf, reg,
+                Twine("morok.antihook.sandbox.brand.word.") + Twine(leaf) +
+                    "." + Twine(reg));
+            for (unsigned byte = 0; byte < 4; ++byte) {
+                Value *shifted =
+                    byte == 0
+                        ? word
+                        : B.CreateLShr(
+                              word, ConstantInt::get(i32, byte * 8),
+                              Twine("morok.antihook.sandbox.brand.shift.") +
+                                  Twine(bytes.size()));
+                bytes.push_back(B.CreateAnd(
+                    shifted, ConstantInt::get(i32, 0xff),
+                    Twine("morok.antihook.sandbox.brand.byte.") +
+                        Twine(bytes.size())));
+            }
+        }
+    }
+
+    const std::array<std::uint8_t, 4> qemu = {
+        std::uint8_t{0x51}, std::uint8_t{0x45}, std::uint8_t{0x4D},
+        std::uint8_t{0x55}};
+    Value *any = ConstantInt::getFalse(ctx);
+    std::uint32_t site = 0;
+    for (std::size_t offset = 0; offset + qemu.size() <= bytes.size();
+         ++offset) {
+        Value *window = ConstantInt::getTrue(ctx);
+        for (std::size_t i = 0; i < qemu.size(); ++i) {
+            Value *needle = sandboxNeedleByte(
+                B, saltLoad, qemu[i], site++,
+                Twine("morok.antihook.sandbox.qemu.brand.needle.") +
+                    Twine(offset) + "." + Twine(i));
+            Value *eq = B.CreateICmpEQ(
+                bytes[offset + i], needle,
+                Twine("morok.antihook.sandbox.qemu.brand.eq.") +
+                    Twine(offset) + "." + Twine(i));
+            window = B.CreateAnd(
+                window, eq,
+                Twine("morok.antihook.sandbox.qemu.brand.window.") +
+                    Twine(offset) + "." + Twine(i));
+        }
+        any = B.CreateOr(any, window,
+                         Twine("morok.antihook.sandbox.qemu.brand.any.") +
+                             Twine(offset));
+    }
+    return B.CreateAnd(brandAvailable, any,
+                       "morok.antihook.sandbox.qemu.brand");
+}
+
+Function *sandboxTbTimingTarget(Module &M) {
+    if (Function *existing = M.getFunction("morok.antihook.sandbox.tb.target"))
+        return existing;
+    LLVMContext &ctx = M.getContext();
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, {i64}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.sandbox.tb.target", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *seed = fn->getArg(0);
+    seed->setName("seed");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    auto *state = B.CreateLoad(i64, sandboxTbState(M),
+                               "morok.antihook.sandbox.tb.state.load");
+    state->setVolatile(true);
+    Value *x = B.CreateXor(seed, state, "morok.antihook.sandbox.tb.mix");
+    for (unsigned i = 0; i < 10; ++i) {
+        Value *lo = B.CreateShl(x, ConstantInt::get(i64, (i % 7) + 3),
+                                Twine("morok.antihook.sandbox.tb.lo.") +
+                                    Twine(i));
+        Value *hi = B.CreateLShr(x, ConstantInt::get(i64, (i % 5) + 11),
+                                 Twine("morok.antihook.sandbox.tb.hi.") +
+                                     Twine(i));
+        x = B.CreateAdd(
+            B.CreateXor(lo, hi,
+                        Twine("morok.antihook.sandbox.tb.xor.") + Twine(i)),
+            ConstantInt::get(i64,
+                             0x9E3779B97F4A7C15ULL ^
+                                 (0xD1B54A32D192ED03ULL * (i + 1))),
+            Twine("morok.antihook.sandbox.tb.round.") + Twine(i));
+    }
+    auto *st = B.CreateStore(x, sandboxTbState(M));
+    st->setVolatile(true);
+    B.CreateRet(x);
+    return fn;
+}
+
+void emitSandboxTbTiming(IRBuilder<> &B, Module &M, AllocaInst *Score) {
+    Function *target = sandboxTbTimingTarget(M);
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    Value *seed = B.CreatePtrToInt(target, i64,
+                                   "morok.antihook.sandbox.tcg.tb.seed");
+    Value *t0 = emitRdtscp(B, M);
+    Value *coldResult =
+        B.CreateCall(target->getFunctionType(), target, {seed},
+                     "morok.antihook.sandbox.tcg.tb.cold.result");
+    Value *t1 = emitRdtscp(B, M);
+    Value *warmResult =
+        B.CreateCall(target->getFunctionType(), target, {coldResult},
+                     "morok.antihook.sandbox.tcg.tb.warm.result");
+    Value *t2 = emitRdtscp(B, M);
+    Value *cold = B.CreateSub(t1, t0, "morok.antihook.sandbox.tcg.tb.cold");
+    Value *warm = B.CreateSub(t2, t1, "morok.antihook.sandbox.tcg.tb.warm");
+    Value *clockOk = B.CreateAnd(
+        B.CreateICmpUGT(t1, t0, "morok.antihook.sandbox.tcg.tb.t1.ok"),
+        B.CreateICmpUGT(t2, t1, "morok.antihook.sandbox.tcg.tb.t2.ok"),
+        "morok.antihook.sandbox.tcg.tb.clock.ok");
+    Value *warmScaled =
+        B.CreateShl(warm, ConstantInt::get(i64, 3),
+                    "morok.antihook.sandbox.tcg.tb.warm.scaled");
+    Value *ratio = B.CreateAnd(
+        B.CreateICmpUGT(cold, warmScaled,
+                        "morok.antihook.sandbox.tcg.tb.ratio"),
+        B.CreateICmpUGT(cold, ConstantInt::get(i64, 20000),
+                        "morok.antihook.sandbox.tcg.tb.floor"),
+        "morok.antihook.sandbox.tcg.tb.slow");
+    Value *resultOk =
+        B.CreateICmpNE(warmResult, ConstantInt::get(i64, 0),
+                       "morok.antihook.sandbox.tcg.tb.result.ok");
+    incrementDiff(B, Score, B.CreateAnd(clockOk, B.CreateAnd(ratio, resultOk)),
+                  "morok.antihook.sandbox.tcg.tb");
+}
+
+void emitSandboxSmcLatency(IRBuilder<> &B, Module &M, const Triple &TT,
+                           AllocaInst *Score) {
+    if (intPtrTy(M)->getBitWidth() != 64 ||
+        (!TT.isOSLinux() && !TT.isOSDarwin() && !TT.isOSWindows()))
+        return;
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    Function *target = dbiSmcTarget(M);
+    Function *parent = B.GetInsertBlock()->getParent();
+    Value *targetAddr =
+        B.CreatePtrToInt(target, ip, "morok.antihook.sandbox.smc.addr");
+    Value *page = B.CreateAnd(targetAddr, ConstantInt::get(ip, ~0xfffULL),
+                              "morok.antihook.sandbox.smc.page");
+    Value *codePtr =
+        B.CreateIntToPtr(targetAddr, ptr, "morok.antihook.sandbox.smc.ptr");
+    Value *protectOk = ConstantInt::getFalse(ctx);
+    if (TT.isOSLinux()) {
+        Value *rc = emitLinuxMprotect(B, M, TT, page, ConstantInt::get(ip, 4096),
+                                      ConstantInt::get(i32, 7));
+        rc->setName("morok.antihook.sandbox.smc.mprotect.rwx");
+        protectOk = B.CreateICmpEQ(rc, ConstantInt::get(i32, 0),
+                                   "morok.antihook.sandbox.smc.rwx.ok");
+    } else if (TT.isOSDarwin()) {
+        Value *rc = emitDarwinMprotect(B, M, TT, page, ConstantInt::get(ip, 4096),
+                                       ConstantInt::get(i32, 7));
+        rc->setName("morok.antihook.sandbox.smc.mprotect.rwx");
+        protectOk = B.CreateICmpEQ(rc, ConstantInt::get(i32, 0),
+                                   "morok.antihook.sandbox.smc.rwx.ok");
+    } else if (TT.isOSWindows()) {
+        auto *oldProt =
+            B.CreateAlloca(i32, nullptr, "morok.antihook.sandbox.smc.old");
+        FunctionCallee virtualProtect = M.getOrInsertFunction(
+            "VirtualProtect", FunctionType::get(i32, {ptr, ip, i32, ptr}, false));
+        Value *rc = B.CreateCall(
+            virtualProtect,
+            {B.CreateIntToPtr(page, ptr), ConstantInt::get(ip, 4096),
+             ConstantInt::get(i32, 0x40), oldProt},
+            "morok.antihook.sandbox.smc.virtualprotect.rwx");
+        protectOk = B.CreateICmpNE(rc, ConstantInt::get(i32, 0),
+                                   "morok.antihook.sandbox.smc.rwx.ok");
+    } else {
+        return;
+    }
+
+    auto *hotBB = BasicBlock::Create(ctx, "morok.antihook.sandbox.smc", parent);
+    auto *afterBB =
+        BasicBlock::Create(ctx, "morok.antihook.sandbox.after.smc", parent);
+    B.CreateCondBr(protectOk, hotBB, afterBB);
+
+    IRBuilder<> HB(hotBB);
+    auto *oldByte =
+        HB.CreateLoad(i8, codePtr, "morok.antihook.sandbox.smc.byte");
+    oldByte->setVolatile(true);
+    auto *touch = HB.CreateStore(oldByte, codePtr);
+    touch->setVolatile(true);
+    if (TT.isOSLinux()) {
+        Value *rc = emitLinuxMprotect(HB, M, TT, page,
+                                      ConstantInt::get(ip, 4096),
+                                      ConstantInt::get(i32, 5));
+        rc->setName("morok.antihook.sandbox.smc.mprotect.rx");
+    } else if (TT.isOSDarwin()) {
+        Value *rc = emitDarwinMprotect(HB, M, TT, page,
+                                       ConstantInt::get(ip, 4096),
+                                       ConstantInt::get(i32, 5));
+        rc->setName("morok.antihook.sandbox.smc.mprotect.rx");
+    } else {
+        auto *oldProt2 =
+            HB.CreateAlloca(i32, nullptr, "morok.antihook.sandbox.smc.old2");
+        FunctionCallee virtualProtect = M.getOrInsertFunction(
+            "VirtualProtect", FunctionType::get(i32, {ptr, ip, i32, ptr}, false));
+        HB.CreateCall(virtualProtect,
+                      {HB.CreateIntToPtr(page, ptr),
+                       ConstantInt::get(ip, 4096), ConstantInt::get(i32, 0x20),
+                       oldProt2},
+                      "morok.antihook.sandbox.smc.virtualprotect.rx");
+    }
+    Value *mid = emitRdtscp(HB, M);
+    Value *first =
+        HB.CreateCall(target->getFunctionType(), target, {},
+                      "morok.antihook.sandbox.smc.first.result");
+    Value *t1 = emitRdtscp(HB, M);
+    Value *second =
+        HB.CreateCall(target->getFunctionType(), target, {},
+                      "morok.antihook.sandbox.smc.second.result");
+    Value *t2 = emitRdtscp(HB, M);
+    Value *flush =
+        HB.CreateSub(t1, mid, "morok.antihook.sandbox.smc.flush");
+    Value *warm = HB.CreateSub(t2, t1, "morok.antihook.sandbox.smc.warm");
+    Value *clockOk = HB.CreateAnd(
+        HB.CreateICmpUGT(t1, mid, "morok.antihook.sandbox.smc.t1.ok"),
+        HB.CreateICmpUGT(t2, t1, "morok.antihook.sandbox.smc.t2.ok"),
+        "morok.antihook.sandbox.smc.clock.ok");
+    Value *warmScaled =
+        HB.CreateShl(warm, ConstantInt::get(i64, 3),
+                     "morok.antihook.sandbox.smc.warm.scaled");
+    Value *slow = HB.CreateAnd(
+        HB.CreateICmpUGT(flush, warmScaled,
+                         "morok.antihook.sandbox.smc.ratio"),
+        HB.CreateICmpUGT(flush, ConstantInt::get(i64, 20000),
+                         "morok.antihook.sandbox.smc.floor"),
+        "morok.antihook.sandbox.smc.slow");
+    Value *resultsOk = HB.CreateAnd(
+        HB.CreateICmpEQ(first, ConstantInt::get(i32, 0x13579BDFu),
+                        "morok.antihook.sandbox.smc.first.ok"),
+        HB.CreateICmpEQ(second, ConstantInt::get(i32, 0x13579BDFu),
+                        "morok.antihook.sandbox.smc.second.ok"),
+        "morok.antihook.sandbox.smc.result.ok");
+    incrementDiff(HB, Score,
+                  HB.CreateAnd(clockOk, HB.CreateAnd(slow, resultsOk)),
+                  "morok.antihook.sandbox.smc.flush");
+    HB.CreateBr(afterBB);
+    B.SetInsertPoint(afterBB);
 }
 
 Function *sandboxHeuristicProbe(Module &M, const Triple &TT) {
@@ -7263,6 +7577,13 @@ Function *sandboxHeuristicProbe(Module &M, const Triple &TT) {
             "morok.antihook.sandbox.tcg.vendor");
         incrementDiff(B, score, tcgVendor,
                       "morok.antihook.sandbox.tcg.vendor");
+        Value *qemuBrand = emitQemuBrandMatch(B, M);
+        incrementDiff(B, score, qemuBrand,
+                      "morok.antihook.sandbox.qemu.brand");
+        if (TT.isArch64Bit()) {
+            emitSandboxTbTiming(B, M, score);
+            emitSandboxSmcLatency(B, M, TT, score);
+        }
 
         auto *backdoorBB =
             BasicBlock::Create(ctx, "morok.antihook.sandbox.vmware", fn);
