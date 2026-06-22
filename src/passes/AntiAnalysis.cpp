@@ -7685,6 +7685,38 @@ bool isPrologueProbeCandidate(Function &F) {
     return true;
 }
 
+void appendPrologueTarget(std::vector<Function *> &Targets, Function *Target) {
+    if (!Target || Target->isDeclaration() || Target->empty())
+        return;
+    for (Function *existing : Targets)
+        if (existing == Target)
+            return;
+    Targets.push_back(Target);
+}
+
+void appendNamedPrologueTarget(Module &M, std::vector<Function *> &Targets,
+                               StringRef Name) {
+    appendPrologueTarget(Targets, M.getFunction(Name));
+}
+
+void appendImportVerifierTargets(Module &M, const Triple &TT,
+                                 std::vector<Function *> &Targets) {
+    if (TT.isOSLinux()) {
+        appendNamedPrologueTarget(M, Targets, "morok.antihook.got.plt");
+        appendNamedPrologueTarget(M, Targets, "morok.antihook.elf.rx");
+        appendNamedPrologueTarget(M, Targets, "morok.antihook.got.lazy");
+        appendNamedPrologueTarget(M, Targets, "morok.antihook.got.needed");
+    } else if (TT.isOSDarwin()) {
+        appendNamedPrologueTarget(M, Targets, "morok.antihook.macho.fixups");
+        appendNamedPrologueTarget(M, Targets,
+                                  "morok.antihook.macho.dylib.ordinal");
+        appendNamedPrologueTarget(M, Targets,
+                                  "morok.antihook.macho.expected.symbol");
+        appendNamedPrologueTarget(M, Targets,
+                                  "morok.antihook.macho.image.text");
+    }
+}
+
 LoadInst *loadCodeByte(IRBuilder<> &B, Module &M, Value *Base,
                        std::uint64_t Offset, const Twine &Name) {
     auto *LI = loadUnaligned(
@@ -22297,6 +22329,17 @@ Function *windowsVehHeadMatcher(Module &M) {
     return fn;
 }
 
+void emitWindowsVerifierPrologueCheck(IRBuilder<> &B, Module &M,
+                                      GlobalVariable *State, Function *Target,
+                                      std::uint64_t Salt, const Twine &Name) {
+    if (!Target || Target->isDeclaration() || Target->empty())
+        return;
+    Value *pattern = emitX86ProloguePattern(B, M, Target);
+    Value *hit = B.CreateOr(pattern, ConstantInt::getFalse(M.getContext()),
+                            Name + ".hit");
+    foldEnforcedFlag(B, State, hit, Salt, Name);
+}
+
 Function *windowsPeFoundationProbe(Module &M, GlobalVariable *State,
                                    ir::IRRandom &rng, const Triple &TT) {
     if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
@@ -22367,6 +22410,12 @@ Function *windowsPeFoundationProbe(Module &M, GlobalVariable *State,
     Value *stubScan = B.CreateCall(scanner, {imagePtr, ConstantInt::getFalse(ctx)},
                                    "morok.win.foundation.sys.scan");
     foldState(B, State, stubScan, rng.next(), "morok.win.foundation.sys");
+    emitWindowsVerifierPrologueCheck(
+        B, M, State, resolver, rng.next() ^ 0x41B7D9C062A5E38FULL,
+        "morok.win.foundation.resolve.self");
+    emitWindowsVerifierPrologueCheck(
+        B, M, State, scanner, rng.next() ^ 0xA6E31C5D90B2478FULL,
+        "morok.win.foundation.scanner.self");
 
     FunctionCallee addVeh = M.getOrInsertFunction(
         "AddVectoredExceptionHandler",
@@ -29979,6 +30028,9 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         if (isPrologueProbeCandidate(F))
             prologueTargets.push_back(&F);
     }
+    Function *gotProbe = linuxGotPltProbe(M, tt);
+    Function *fixupProbe = darwinFixupProbe(M, tt);
+    appendImportVerifierTargets(M, tt, prologueTargets);
     functionMacTargetTable(M, prologueTargets);
 
     Function *ctor = makeCtorShell(M, "morok.antihook");
@@ -30000,7 +30052,6 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
                  "morok.antihook.clean.changed");
         prologueTargets.push_back(clean);
     }
-    Function *gotProbe = linuxGotPltProbe(M, tt);
     if (gotProbe) {
         Value *diff = B.CreateCall(gotProbe, {}, "morok.antihook.got.diff");
         Value *changed =
@@ -30041,8 +30092,8 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         foldFlag(B, state, noRandomize, 0xD35F9072AC18B46EULL,
                  "morok.antihook.loader.no_randomize");
     }
-    if (Function *fixups = darwinFixupProbe(M, tt)) {
-        Value *diff = B.CreateCall(fixups, {}, "morok.antihook.fixup.diff");
+    if (fixupProbe) {
+        Value *diff = B.CreateCall(fixupProbe, {}, "morok.antihook.fixup.diff");
         Value *changed =
             B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0),
                            "morok.corroborate.fixup.changed");
@@ -30259,11 +30310,13 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
                  "morok.negative.timing.changed");
     }
     insertStackOriginChecks(M, stackOriginCheck(M), state, prologueTargets, rng);
+    Function *gotRecheckProbe =
+        gotProbe ? linuxGotRecheckProbe(M, gotProbe, state) : nullptr;
+    appendPrologueTarget(prologueTargets, gotRecheckProbe);
     emitProloguePatternChecks(B, M, tt, state, prologueTargets, rng);
     emitPosixStubIntegrityChecks(B, M, tt, state, rng);
     if (gotProbe)
-        insertAntiHookGotRecheckSites(M, linuxGotRecheckProbe(M, gotProbe, state),
-                                      rng);
+        insertAntiHookGotRecheckSites(M, gotRecheckProbe, rng);
     if (Function *dbiOverhead = dbiOverheadProbe(M, rng, tt)) {
         Value *sample = B.CreateCall(dbiOverhead, {},
                                      "morok.antihook.dbi.overhead.sample");

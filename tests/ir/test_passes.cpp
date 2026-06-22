@@ -733,6 +733,11 @@ bool constantReferencesGlobal(const Constant *C, const GlobalValue *GV) {
     return false;
 }
 
+bool globalInitializerReferences(GlobalVariable *GV, const GlobalValue *Target) {
+    return GV && GV->hasInitializer() &&
+           constantReferencesGlobal(GV->getInitializer(), Target);
+}
+
 bool instructionReferencesGlobal(const Instruction &I, const GlobalValue *GV) {
     for (const Use &U : I.operands()) {
         if (U.get() == GV)
@@ -16953,7 +16958,13 @@ entry:
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
     checkSealEnforcement(*M, *Ctor);
     checkGateScoring(*Ctor);
-    CHECK(M->getGlobalVariable("morok.antihook.mac.targets", true) != nullptr);
+    GlobalVariable *MacTargets =
+        M->getGlobalVariable("morok.antihook.mac.targets", true);
+    REQUIRE(MacTargets != nullptr);
+    CHECK(globalInitializerReferences(MacTargets, Got));
+    CHECK(globalInitializerReferences(MacTargets, Rx));
+    CHECK(globalInitializerReferences(MacTargets, Lazy));
+    CHECK(globalInitializerReferences(MacTargets, Needed));
     GlobalVariable *SmcGate =
         M->getGlobalVariable("morok.antihook.dbi.smc.gate", true);
     REQUIRE(SmcGate != nullptr);
@@ -17928,7 +17939,13 @@ entry:
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
     checkSealEnforcement(*M, *Ctor);
     checkGateScoring(*Ctor);
-    CHECK(M->getGlobalVariable("morok.antihook.mac.targets", true) != nullptr);
+    GlobalVariable *DarwinMacTargets =
+        M->getGlobalVariable("morok.antihook.mac.targets", true);
+    REQUIRE(DarwinMacTargets != nullptr);
+    CHECK(globalInitializerReferences(DarwinMacTargets, Fixups));
+    CHECK(globalInitializerReferences(DarwinMacTargets, DylibOrdinal));
+    CHECK(globalInitializerReferences(DarwinMacTargets, Expected));
+    CHECK(globalInitializerReferences(DarwinMacTargets, ImageText));
     CHECK(M->getFunction("morok.antihook.got.plt") == nullptr);
     CHECK(hasInlineAsmCall(*Clean));
     CHECK(hasInlineAsmCall(*Sandbox));
@@ -20203,6 +20220,16 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Probe, "morok.win.foundation.teb.peb") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.foundation.headers.ok") >=
           1u);
+    Instruction *ResolveSelf =
+        findNamedInstruction(*Probe, "morok.win.foundation.resolve.self.hit");
+    REQUIRE(ResolveSelf != nullptr);
+    CHECK(valueFeedsNamedInstruction(ResolveSelf,
+                                     "morok.seal.fold.anti_debug"));
+    Instruction *ScannerSelf =
+        findNamedInstruction(*Probe, "morok.win.foundation.scanner.self.hit");
+    REQUIRE(ScannerSelf != nullptr);
+    CHECK(valueFeedsNamedInstruction(ScannerSelf,
+                                     "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Probe, "morok.win.foundation.veh.handle") >=
           1u);
     CHECK(countNamedInstructions(*Resolve, "morok.win.pe.export.rva") >= 1u);
