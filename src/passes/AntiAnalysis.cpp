@@ -7125,6 +7125,8 @@ FunctionCallee nanosleepDecl(Module &M) {
                                  FunctionType::get(i32, {ptr, ptr}, false));
 }
 
+FunctionCallee sigactionDecl(Module &M);
+
 GlobalVariable *sandboxTripwireGate(Module &M) {
     if (auto *existing = M.getGlobalVariable(
             "morok.antihook.sandbox.tripwire", /*AllowInternal=*/true))
@@ -7389,6 +7391,400 @@ Function *sandboxHeuristicProbe(Module &M, const Triple &TT) {
     return fn;
 }
 
+GlobalVariable *emuSignalMaskGlobal(Module &M) {
+    if (auto *existing = M.getGlobalVariable("morok.antihook.emu.sig.mask",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i32, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i32, 0),
+                                  "morok.antihook.emu.sig.mask");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *emuFaultAddrGlobal(Module &M) {
+    if (auto *existing = M.getGlobalVariable("morok.antihook.emu.fault.addr",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *ip = intPtrTy(M);
+    auto *gv = new GlobalVariable(M, ip, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(ip, 0),
+                                  "morok.antihook.emu.fault.addr");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+void storeEmuSiginfoAction(IRBuilder<> &B, Module &M, AllocaInst *Action,
+                           Function *Handler, const Twine &Prefix) {
+    constexpr std::uint64_t kLinuxX64SigactionSize = 152;
+    constexpr std::uint64_t kLinuxX64SigactionFlagsOffset = 136;
+    constexpr std::uint32_t kSaSiginfo = 4;
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    for (std::uint64_t i = 0; i < kLinuxX64SigactionSize; ++i)
+        B.CreateStore(ConstantInt::get(i8, 0),
+                      gepI8(B, M, Action, constIp(M, i)));
+    B.CreateStore(Handler,
+                  gepI8(B, M, Action, constIp(M, 0), Prefix + ".handler"));
+    B.CreateStore(ConstantInt::get(i32, kSaSiginfo),
+                  gepI8(B, M, Action,
+                        constIp(M, kLinuxX64SigactionFlagsOffset),
+                        Prefix + ".flags"));
+}
+
+Function *emuLinuxX86SignalHandler(Module &M) {
+    if (Function *existing = M.getFunction("morok.antihook.emu.sig.handler"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(
+        FunctionType::get(Type::getVoidTy(ctx), {i32, ptr, ptr}, false),
+        GlobalValue::PrivateLinkage, "morok.antihook.emu.sig.handler", &M);
+    fn->setDSOLocal(true);
+    Argument *sig = fn->getArg(0);
+    sig->setName("sig");
+    Argument *info = fn->getArg(1);
+    info->setName("info");
+    Argument *uctx = fn->getArg(2);
+    uctx->setName("uctx");
+
+    constexpr std::uint64_t kLinuxX64SiginfoAddrOffset = 16;
+    constexpr std::uint64_t kLinuxX64UcontextRipOffset = 168;
+    constexpr std::uint32_t kSegvBit = 1u;
+    constexpr std::uint32_t kUd2Bit = 2u;
+    constexpr std::uint32_t kLockNopBit = 4u;
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loadFaultBB = BasicBlock::Create(ctx, "fault.addr", fn);
+    auto *classifyBB = BasicBlock::Create(ctx, "classify", fn);
+    auto *decodeBB = BasicBlock::Create(ctx, "decode", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "done", fn);
+
+    IRBuilder<> B(entry);
+    B.CreateCondBr(B.CreateICmpNE(info, ConstantPointerNull::get(ptr)),
+                   loadFaultBB, classifyBB);
+
+    IRBuilder<> FB(loadFaultBB);
+    Value *fault = loadAt(FB, M, ip, info, kLinuxX64SiginfoAddrOffset,
+                          "morok.antihook.emu.sig.fault");
+    FB.CreateBr(classifyBB);
+
+    IRBuilder<> CB(classifyBB);
+    auto *faultPhi = CB.CreatePHI(ip, 2, "morok.antihook.emu.sig.fault.phi");
+    faultPhi->addIncoming(ConstantInt::get(ip, 0), entry);
+    faultPhi->addIncoming(fault, loadFaultBB);
+    CB.CreateCondBr(CB.CreateICmpNE(uctx, ConstantPointerNull::get(ptr)),
+                    decodeBB, doneBB);
+
+    IRBuilder<> DB(decodeBB);
+    Value *ripSlot = gepI8(DB, M, uctx, constIp(M, kLinuxX64UcontextRipOffset),
+                           "morok.antihook.emu.sig.rip.slot");
+    Value *rip = DB.CreateLoad(ip, ripSlot, "morok.antihook.emu.sig.rip");
+    cast<LoadInst>(rip)->setAlignment(Align(1));
+    Value *pc = DB.CreateIntToPtr(rip, ptr, "morok.antihook.emu.sig.pc");
+    auto *op0 = DB.CreateLoad(i8, pc, "morok.antihook.emu.sig.op0");
+    op0->setVolatile(true);
+    op0->setAlignment(Align(1));
+    auto *op1 = DB.CreateLoad(
+        i8, gepI8(DB, M, pc, constIp(M, 1), "morok.antihook.emu.sig.op1.ptr"),
+        "morok.antihook.emu.sig.op1");
+    op1->setVolatile(true);
+    op1->setAlignment(Align(1));
+
+    Value *isSegv =
+        DB.CreateICmpEQ(sig, ConstantInt::get(i32, 11),
+                        "morok.antihook.emu.sig.segv");
+    Value *isIll = DB.CreateICmpEQ(sig, ConstantInt::get(i32, 4),
+                                   "morok.antihook.emu.sig.ill");
+    Value *segvOp = DB.CreateAnd(
+        DB.CreateICmpEQ(op0, ConstantInt::get(i8, 0x8a)),
+        DB.CreateICmpEQ(op1, ConstantInt::get(i8, 0x08)),
+        "morok.antihook.emu.sig.segv.op");
+    Value *segvHit = DB.CreateAnd(isSegv, segvOp,
+                                  "morok.antihook.emu.sig.segv.hit");
+    Value *ud2Hit = DB.CreateAnd(
+        isIll,
+        DB.CreateAnd(DB.CreateICmpEQ(op0, ConstantInt::get(i8, 0x0f)),
+                     DB.CreateICmpEQ(op1, ConstantInt::get(i8, 0x0b))),
+        "morok.antihook.emu.sig.ud2");
+    Value *lockNopHit = DB.CreateAnd(
+        isIll,
+        DB.CreateAnd(DB.CreateICmpEQ(op0, ConstantInt::get(i8, 0xf0)),
+                     DB.CreateICmpEQ(op1, ConstantInt::get(i8, 0x90))),
+        "morok.antihook.emu.sig.locknop");
+    Value *bit = DB.CreateSelect(
+        segvHit, ConstantInt::get(i32, kSegvBit),
+        DB.CreateSelect(ud2Hit, ConstantInt::get(i32, kUd2Bit),
+                        DB.CreateSelect(lockNopHit,
+                                        ConstantInt::get(i32, kLockNopBit),
+                                        ConstantInt::get(i32, 0))),
+        "morok.antihook.emu.sig.bit");
+    auto *oldMask =
+        DB.CreateLoad(i32, emuSignalMaskGlobal(M), "morok.antihook.emu.sig.mask.old");
+    oldMask->setVolatile(true);
+    Value *nextMask =
+        DB.CreateOr(oldMask, bit, "morok.antihook.emu.sig.mask.next");
+    DB.CreateStore(nextMask, emuSignalMaskGlobal(M))->setVolatile(true);
+
+    auto *oldFault = DB.CreateLoad(ip, emuFaultAddrGlobal(M),
+                                   "morok.antihook.emu.fault.addr.old");
+    oldFault->setVolatile(true);
+    Value *faultNext =
+        DB.CreateSelect(segvHit, faultPhi, oldFault,
+                        "morok.antihook.emu.fault.addr.next");
+    DB.CreateStore(faultNext, emuFaultAddrGlobal(M))->setVolatile(true);
+
+    Value *known = DB.CreateICmpNE(bit, ConstantInt::get(i32, 0),
+                                   "morok.antihook.emu.sig.known");
+    Value *advance = DB.CreateSelect(known, ConstantInt::get(ip, 2),
+                                     ConstantInt::get(ip, 0),
+                                     "morok.antihook.emu.sig.advance");
+    auto *pcStore =
+        DB.CreateStore(DB.CreateAdd(rip, advance,
+                                    "morok.antihook.emu.sig.rip.next"),
+                       ripSlot);
+    pcStore->setAlignment(Align(1));
+    DB.CreateBr(doneBB);
+
+    IRBuilder<> RB(doneBB);
+    RB.CreateRetVoid();
+    return fn;
+}
+
+Value *emitRdrandCarry(IRBuilder<> &B, const Twine &Name) {
+    auto *i32 = Type::getInt32Ty(B.getContext());
+    auto *asmTy = FunctionType::get(i32, false);
+    InlineAsm *rdrand = InlineAsm::get(
+        asmTy, "rdrandq %rax\n\tsetc %al\n\tmovzbl %al, %eax",
+        "={eax},~{memory},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    return B.CreateCall(asmTy, rdrand, {}, Name);
+}
+
+void emitRdrandCfGap(IRBuilder<> &B, Module &M, Function *Fn,
+                     AllocaInst *Diff, Value *Leaf1Ecx) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    Value *supported = B.CreateICmpNE(
+        B.CreateAnd(Leaf1Ecx, ConstantInt::get(i32, 1u << 30),
+                    "morok.antihook.emu.rdrand.bit"),
+        ConstantInt::get(i32, 0), "morok.antihook.emu.rdrand.supported");
+
+    auto *tryBB = BasicBlock::Create(ctx, "morok.antihook.emu.rdrand.try", Fn);
+    auto *doneBB =
+        BasicBlock::Create(ctx, "morok.antihook.emu.rdrand.done", Fn);
+    B.CreateCondBr(supported, tryBB, doneBB);
+
+    IRBuilder<> RB(tryBB);
+    Value *cfTotal = ConstantInt::get(i32, 0);
+    for (unsigned attempt = 0; attempt < 10; ++attempt) {
+        Value *cf = emitRdrandCarry(
+            RB, Twine("morok.antihook.emu.rdrand.cf") + Twine(attempt));
+        cfTotal = RB.CreateAdd(cfTotal, cf,
+                               "morok.antihook.emu.rdrand.cf.total");
+    }
+    Value *mismatch =
+        RB.CreateICmpEQ(cfTotal, ConstantInt::get(i32, 0),
+                        "morok.antihook.emu.rdrand.cf.mismatch");
+    incrementDiff(RB, Diff, mismatch, "morok.antihook.emu.rdrand.cf");
+    RB.CreateBr(doneBB);
+
+    B.SetInsertPoint(doneBB);
+}
+
+void emitLinuxX86SemanticGapProbe(IRBuilder<> &B, Module &M, const Triple &TT,
+                                  Function *Fn, AllocaInst *Diff) {
+    if (!TT.isOSLinux() || !useDirectLinuxSyscalls(M, TT))
+        return;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    constexpr std::uint32_t kIoctl = 16;
+    constexpr std::uint32_t kFcntl = 72;
+    constexpr std::uint64_t kLinuxX64SigactionSize = 152;
+    constexpr std::uint32_t kSegvBit = 1u;
+    constexpr std::uint32_t kUd2Bit = 2u;
+    constexpr std::uint32_t kLockNopBit = 4u;
+    constexpr std::uint32_t kExpectedSignalMask =
+        kSegvBit | kUd2Bit | kLockNopBit;
+
+    Value *ioctlRc = emitLinuxSyscall(
+        B, M, TT, kIoctl,
+        {ConstantInt::getSigned(ip, -1), ConstantInt::get(ip, 0),
+         ConstantInt::get(ip, 0)});
+    ioctlRc->setName("morok.antihook.emu.errno.ioctl");
+    Value *ioctlBad =
+        B.CreateICmpNE(ioctlRc, ConstantInt::getSigned(ip, -9),
+                       "morok.antihook.emu.errno.ioctl.bad");
+    Value *fcntlRc = emitLinuxSyscall(
+        B, M, TT, kFcntl,
+        {ConstantInt::getSigned(ip, -1), ConstantInt::get(ip, 3),
+         ConstantInt::get(ip, 0)});
+    fcntlRc->setName("morok.antihook.emu.errno.fcntl");
+    Value *fcntlBad =
+        B.CreateICmpNE(fcntlRc, ConstantInt::getSigned(ip, -9),
+                       "morok.antihook.emu.errno.fcntl.bad");
+    Value *errnoMismatch =
+        B.CreateOr(ioctlBad, fcntlBad, "morok.antihook.emu.errno.mismatch");
+    incrementDiff(B, Diff, errnoMismatch, "morok.antihook.emu.errno");
+
+    Value *pageSize = ConstantInt::get(ip, 4096);
+    Value *mapped = emitPosixAnonMmapAddr(
+        B, M, TT, pageSize, ConstantInt::get(ip, 3),
+        ConstantInt::get(ip, 2u | 0x20u), "morok.antihook.emu.fault.mmap");
+    mapped->setName("morok.antihook.emu.fault.mmap");
+    Value *mappedOk = B.CreateAnd(
+        B.CreateICmpUGT(mapped, ConstantInt::get(ip, 4096)),
+        B.CreateICmpULT(mapped, ConstantInt::getSigned(ip, -4095)),
+        "morok.antihook.emu.fault.mapped");
+
+    auto *installSegvBB =
+        BasicBlock::Create(ctx, "morok.antihook.emu.sig.install.segv", Fn);
+    auto *installIllBB =
+        BasicBlock::Create(ctx, "morok.antihook.emu.sig.install.ill", Fn);
+    auto *restoreSegvBB =
+        BasicBlock::Create(ctx, "morok.antihook.emu.sig.restore.segv", Fn);
+    auto *protectBB =
+        BasicBlock::Create(ctx, "morok.antihook.emu.fault.protect", Fn);
+    auto *stimuliBB =
+        BasicBlock::Create(ctx, "morok.antihook.emu.sig.stimuli", Fn);
+    auto *analyzeBB =
+        BasicBlock::Create(ctx, "morok.antihook.emu.sig.analyze", Fn);
+    auto *restoreAllBB =
+        BasicBlock::Create(ctx, "morok.antihook.emu.sig.restore.all", Fn);
+    auto *unmapBB =
+        BasicBlock::Create(ctx, "morok.antihook.emu.fault.unmap", Fn);
+    auto *doneBB = BasicBlock::Create(ctx, "morok.antihook.emu.sig.done", Fn);
+    B.CreateCondBr(mappedOk, installSegvBB, doneBB);
+
+    IRBuilder<> SB(installSegvBB);
+    SB.CreateStore(ConstantInt::get(i32, 0), emuSignalMaskGlobal(M))
+        ->setVolatile(true);
+    SB.CreateStore(ConstantInt::get(ip, 0), emuFaultAddrGlobal(M))
+        ->setVolatile(true);
+    Function *handler = emuLinuxX86SignalHandler(M);
+    auto *actionTy = ArrayType::get(i8, kLinuxX64SigactionSize);
+    AllocaInst *action =
+        SB.CreateAlloca(actionTy, nullptr, "morok.antihook.emu.sa");
+    AllocaInst *oldSegv =
+        SB.CreateAlloca(actionTy, nullptr, "morok.antihook.emu.old.segv");
+    AllocaInst *oldIll =
+        SB.CreateAlloca(actionTy, nullptr, "morok.antihook.emu.old.ill");
+    storeEmuSiginfoAction(SB, M, action, handler, "morok.antihook.emu.sa");
+    FunctionCallee sigactionFn = sigactionDecl(M);
+    Value *segvRc =
+        SB.CreateCall(sigactionFn,
+                      {ConstantInt::get(i32, 11), action, oldSegv},
+                      "morok.antihook.emu.sigaction.segv");
+    SB.CreateCondBr(SB.CreateICmpEQ(segvRc, ConstantInt::get(i32, 0),
+                                    "morok.antihook.emu.sigaction.segv.ok"),
+                    installIllBB, unmapBB);
+
+    IRBuilder<> IB(installIllBB);
+    Value *illRc =
+        IB.CreateCall(sigactionFn, {ConstantInt::get(i32, 4), action, oldIll},
+                      "morok.antihook.emu.sigaction.ill");
+    IB.CreateCondBr(IB.CreateICmpEQ(illRc, ConstantInt::get(i32, 0),
+                                    "morok.antihook.emu.sigaction.ill.ok"),
+                    protectBB, restoreSegvBB);
+
+    IRBuilder<> RSB(restoreSegvBB);
+    RSB.CreateCall(sigactionFn,
+                   {ConstantInt::get(i32, 11), oldSegv,
+                    ConstantPointerNull::get(ptr)},
+                   "morok.antihook.emu.restore.segv.partial");
+    RSB.CreateBr(unmapBB);
+
+    IRBuilder<> PB(protectBB);
+    Value *noneRc = emitPosixMprotect(PB, M, TT, mapped, pageSize,
+                                      ConstantInt::get(ip, 0));
+    noneRc->setName("morok.antihook.emu.mprotect.none");
+    PB.CreateCondBr(PB.CreateICmpEQ(noneRc, ConstantInt::get(i32, 0),
+                                    "morok.antihook.emu.mprotect.none.ok"),
+                    stimuliBB, restoreAllBB);
+
+    IRBuilder<> TB(stimuliBB);
+    auto *voidTy = FunctionType::get(Type::getVoidTy(ctx), false);
+    InlineAsm *ud2 = InlineAsm::get(voidTy, "ud2",
+                                    "~{dirflag},~{fpsr},~{flags}",
+                                    /*hasSideEffects=*/true);
+    TB.CreateCall(voidTy, ud2);
+    InlineAsm *lockNop =
+        InlineAsm::get(voidTy, ".byte 0xf0,0x90",
+                       "~{dirflag},~{fpsr},~{flags}",
+                       /*hasSideEffects=*/true);
+    TB.CreateCall(voidTy, lockNop);
+    Value *faultAddr =
+        TB.CreateAdd(mapped, ConstantInt::get(ip, 37),
+                     "morok.antihook.emu.fault.expected");
+    auto *faultTy = FunctionType::get(Type::getVoidTy(ctx), {ptr}, false);
+    InlineAsm *faultLoad =
+        InlineAsm::get(faultTy, "movb (%rax), %cl",
+                       "{rax},~{rcx},~{memory},~{dirflag},~{fpsr},~{flags}",
+                       /*hasSideEffects=*/true);
+    TB.CreateCall(faultTy, faultLoad,
+                  {TB.CreateIntToPtr(faultAddr, ptr,
+                                     "morok.antihook.emu.fault.ptr")});
+    TB.CreateBr(analyzeBB);
+
+    IRBuilder<> AB(analyzeBB);
+    auto *mask =
+        AB.CreateLoad(i32, emuSignalMaskGlobal(M), "morok.antihook.emu.sig.mask");
+    mask->setVolatile(true);
+    Value *illMaskBad =
+        AB.CreateICmpNE(AB.CreateAnd(mask,
+                                     ConstantInt::get(i32, kUd2Bit | kLockNopBit),
+                                     "morok.antihook.emu.ill.mask"),
+                        ConstantInt::get(i32, kUd2Bit | kLockNopBit),
+                        "morok.antihook.emu.ill.mask.bad");
+    auto *observedFault =
+        AB.CreateLoad(ip, emuFaultAddrGlobal(M), "morok.antihook.emu.fault.addr");
+    observedFault->setVolatile(true);
+    Value *faultMaskBad = AB.CreateICmpNE(
+        AB.CreateAnd(mask, ConstantInt::get(i32, kSegvBit),
+                     "morok.antihook.emu.fault.mask"),
+        ConstantInt::get(i32, kSegvBit), "morok.antihook.emu.fault.mask.bad");
+    Value *faultAddrBad =
+        AB.CreateICmpNE(observedFault, faultAddr,
+                        "morok.antihook.emu.fault.addr.bad");
+    Value *signalMaskBad =
+        AB.CreateICmpNE(mask, ConstantInt::get(i32, kExpectedSignalMask),
+                        "morok.antihook.emu.sig.mask.bad");
+    Value *signalMismatch = AB.CreateOr(
+        AB.CreateOr(illMaskBad, faultMaskBad),
+        AB.CreateOr(faultAddrBad, signalMaskBad),
+        "morok.antihook.emu.signal.mismatch");
+    incrementDiff(AB, Diff, signalMismatch, "morok.antihook.emu.signal");
+    AB.CreateBr(restoreAllBB);
+
+    IRBuilder<> RB(restoreAllBB);
+    RB.CreateCall(sigactionFn,
+                  {ConstantInt::get(i32, 4), oldIll,
+                   ConstantPointerNull::get(ptr)},
+                  "morok.antihook.emu.restore.ill");
+    RB.CreateCall(sigactionFn,
+                  {ConstantInt::get(i32, 11), oldSegv,
+                   ConstantPointerNull::get(ptr)},
+                  "morok.antihook.emu.restore.segv");
+    RB.CreateBr(unmapBB);
+
+    IRBuilder<> UB(unmapBB);
+    emitLinuxMunmap(UB, M, TT, mapped, pageSize);
+    UB.CreateBr(doneBB);
+
+    B.SetInsertPoint(doneBB);
+}
+
 Function *emulationDivergenceProbe(Module &M, const Triple &TT) {
     if (TT.getArch() != Triple::x86_64)
         return nullptr;
@@ -7483,6 +7879,7 @@ Function *emulationDivergenceProbe(Module &M, const Triple &TT) {
         "morok.antihook.emu.cpuid.leaf0.bad");
     Value *leaf1 = emitCpuid(B, M, ConstantInt::get(i32, 1),
                              ConstantInt::get(i32, 0));
+    Value *ecx = cpuidReg(B, leaf1, 2, "morok.antihook.emu.cpuid.ecx1");
     Value *edx = cpuidReg(B, leaf1, 3, "morok.antihook.emu.cpuid.edx1");
     constexpr std::uint32_t kX86_64BaselineFeatures =
         (1u << 0) | (1u << 15) | (1u << 26); // FPU, CMOV, SSE2.
@@ -7495,6 +7892,8 @@ Function *emulationDivergenceProbe(Module &M, const Triple &TT) {
     Value *cpuidMismatch = B.CreateOr(leaf0Bad, baselineBad,
                                       "morok.antihook.emu.cpuid.mismatch");
     incrementDiff(B, diff, cpuidMismatch, "morok.antihook.emu.cpuid");
+    emitRdrandCfGap(B, M, fn, diff, ecx);
+    emitLinuxX86SemanticGapProbe(B, M, TT, fn, diff);
     emitRetDiff(B, diff);
     return fn;
 }

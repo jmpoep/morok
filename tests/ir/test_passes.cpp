@@ -15909,6 +15909,9 @@ entry:
     REQUIRE(Diverge != nullptr);
     Function *Emu = M->getFunction("morok.antihook.emu.x86");
     REQUIRE(Emu != nullptr);
+    Function *EmuSignalHandler =
+        M->getFunction("morok.antihook.emu.sig.handler");
+    REQUIRE(EmuSignalHandler != nullptr);
     Function *Sandbox = M->getFunction("morok.antihook.sandbox");
     REQUIRE(Sandbox != nullptr);
     Function *Dbi = M->getFunction("morok.antihook.dbi.linux");
@@ -15959,6 +15962,9 @@ entry:
     CHECK(M->getGlobalVariable("morok.antihook.schro.page", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.schro.armed", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.schro.old.segv", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.antihook.emu.sig.mask", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.antihook.emu.fault.addr", true) !=
           nullptr);
     CHECK(Dynamic->hasExternalWeakLinkage());
     CHECK(hasGuardedDlsymBlock);
@@ -16060,6 +16066,35 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Emu,
                                  "morok.antihook.emu.cpuid.baseline") >= 1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.rdrand.supported") >= 1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.rdrand.cf.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.errno.ioctl") >= 1u);
+    CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.errno.fcntl") >= 1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.errno.mismatch") >= 1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.sigaction.segv") >= 1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.sigaction.ill") >= 1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.mprotect.none") >= 1u);
+    CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.ill.mask.bad") >=
+          1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.fault.addr.bad") >= 1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.signal.mismatch") >= 1u);
+    CHECK(countNamedInstructions(*EmuSignalHandler,
+                                 "morok.antihook.emu.sig.segv.hit") >= 1u);
+    CHECK(countNamedInstructions(*EmuSignalHandler,
+                                 "morok.antihook.emu.sig.ud2") >= 1u);
+    CHECK(countNamedInstructions(*EmuSignalHandler,
+                                 "morok.antihook.emu.sig.locknop") >= 1u);
+    CHECK(countNamedInstructions(*EmuSignalHandler,
+                                 "morok.antihook.emu.sig.mask.next") >= 1u);
     Instruction *EmuChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.emu.changed");
     REQUIRE(EmuChanged != nullptr);
