@@ -18454,6 +18454,94 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("trapOracleModule emits Windows VEH trap flag single-step probe") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-pc-windows-msvc"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8863);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::trapOracleModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.trap");
+    Function *Probe = M->getFunction("morok.trap.win.tf");
+    Function *Handler = M->getFunction("morok.trap.win.veh");
+    Function *Peb = M->getFunction("morok.win.peb");
+    Function *Ldr = M->getFunction("morok.win.ldr.module");
+    Function *Resolve = M->getFunction("morok.win.pe.resolve");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Probe != nullptr);
+    REQUIRE(Handler != nullptr);
+    REQUIRE(Peb != nullptr);
+    REQUIRE(Ldr != nullptr);
+    REQUIRE(Resolve != nullptr);
+    CHECK(M->getGlobalVariable("morok.trap.state", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.trap.hits", true) != nullptr);
+    CHECK(countCallsTo(*Ctor, "morok.trap.win.tf") >= 1u);
+    checkSealEnforcement(*M, *Probe);
+    CHECK(hasInlineAsmCall(*Probe));
+    CHECK(hasInlineAsmCall(*Peb));
+    CHECK(M->getFunction("AddVectoredExceptionHandler") == nullptr);
+    CHECK(M->getFunction("RtlAddVectoredExceptionHandler") == nullptr);
+    CHECK(M->getFunction("RtlRemoveVectoredExceptionHandler") == nullptr);
+    CHECK(countNamedInstructions(*Probe, "morok.trap.win.peb") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.trap.win.ntdll") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.trap.win.rtladd") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.trap.win.rtlremove") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.trap.win.veh.handle") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.trap.win.single_step.missing") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.trap.win.remove.status") >=
+          1u);
+    CHECK(countNamedInstructions(*Handler,
+                                 "morok.trap.win.veh.single.step") >= 1u);
+    CHECK(countNamedInstructions(*Handler,
+                                 "morok.trap.win.veh.eflags.clear") >= 1u);
+    Instruction *Missing =
+        findNamedInstruction(*Probe, "morok.trap.win.single_step.missing");
+    REQUIRE(Missing != nullptr);
+    CHECK(valueFeedsNamedInstruction(Missing, "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("trapOracleModule emits i686 Windows stdcall VEH trap probe") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "i686-pc-windows-msvc"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8864);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::trapOracleModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.trap");
+    Function *Probe = M->getFunction("morok.trap.win.tf");
+    Function *Handler = M->getFunction("morok.trap.win.veh");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Probe != nullptr);
+    REQUIRE(Handler != nullptr);
+    CHECK(Handler->getCallingConv() == CallingConv::X86_StdCall);
+    CHECK(countCallsTo(*Ctor, "morok.trap.win.tf") >= 1u);
+    CHECK(hasInlineAsmCall(*Probe));
+    CHECK(M->getFunction("RtlAddVectoredExceptionHandler") == nullptr);
+    CHECK(countNamedInstructions(*Probe, "morok.trap.win.rtladd") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.trap.win.veh.handle") >= 1u);
+    CHECK(countNamedInstructions(*Handler,
+                                 "morok.trap.win.veh.eflags.clear") >= 1u);
+    CallInst *Register = nullptr;
+    for (Instruction &I : instructions(*Probe))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            if (CI->getName() == "morok.trap.win.veh.handle")
+                Register = CI;
+    REQUIRE(Register != nullptr);
+    CHECK(Register->getCallingConv() == CallingConv::X86_StdCall);
+    checkSealEnforcement(*M, *Probe);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE(
     "trapOracleModule preserves Darwin SIGTRAP dispositions with sigaction") {
     LLVMContext ctx;

@@ -16681,6 +16681,235 @@ Function *windowsProcessMitigationsProbe(Module &M, GlobalVariable *State,
     return fn;
 }
 
+Function *windowsTrapFlagVehHandler(Module &M, GlobalVariable *Counter,
+                                    GlobalVariable *State, const Triple &TT) {
+    const bool x86 = TT.getArch() == Triple::x86;
+    const bool x64 = TT.getArch() == Triple::x86_64;
+    if (!TT.isOSWindows() || (!x86 && !x64))
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.trap.win.veh"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i32, {ptr}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.trap.win.veh", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    if (x86)
+        fn->setCallingConv(CallingConv::X86_StdCall);
+    fn->setDSOLocal(true);
+    Argument *exceptionPointers = fn->getArg(0);
+    exceptionPointers->setName("exception_pointers");
+
+    const unsigned contextRecordOff = x86 ? 0x04 : 0x08;
+    const unsigned exceptionAddressOff = x86 ? 0x0c : 0x10;
+    const unsigned eflagsOff = x86 ? 0xc4 : 0x44;
+    constexpr std::uint32_t kExceptionSingleStep = 0x80000004u;
+    constexpr std::uint32_t kTrapFlag = 0x00000100u;
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *recordBB = BasicBlock::Create(ctx, "record", fn);
+    auto *hitBB = BasicBlock::Create(ctx, "single.step", fn);
+    auto *searchBB = BasicBlock::Create(ctx, "search", fn);
+
+    IRBuilder<> B(entry);
+    B.CreateCondBr(B.CreateICmpNE(exceptionPointers,
+                                  ConstantPointerNull::get(ptr),
+                                  "morok.trap.win.veh.args.present"),
+                   recordBB, searchBB);
+
+    IRBuilder<> RB(recordBB);
+    Value *record = loadAt(RB, M, ptr, exceptionPointers, 0ULL,
+                           "morok.trap.win.veh.record");
+    Value *context = loadAt(RB, M, ptr, exceptionPointers, contextRecordOff,
+                            "morok.trap.win.veh.context");
+    Value *hasRecord =
+        RB.CreateICmpNE(record, ConstantPointerNull::get(ptr),
+                        "morok.trap.win.veh.record.present");
+    Value *hasContext =
+        RB.CreateICmpNE(context, ConstantPointerNull::get(ptr),
+                        "morok.trap.win.veh.context.present");
+    Value *safeRecord = RB.CreateSelect(
+        hasRecord, record, exceptionPointers, "morok.trap.win.veh.record.safe");
+    Value *code =
+        loadAt(RB, M, i32, safeRecord, 0ULL, "morok.trap.win.veh.code");
+    Value *singleStep =
+        RB.CreateICmpEQ(code, ConstantInt::get(i32, kExceptionSingleStep),
+                        "morok.trap.win.veh.single.step");
+    RB.CreateCondBr(
+        RB.CreateAnd(RB.CreateAnd(hasRecord, hasContext,
+                                  "morok.trap.win.veh.pointers.ready"),
+                     singleStep, "morok.trap.win.veh.ready"),
+        hitBB, searchBB);
+
+    IRBuilder<> HB(hitBB);
+    auto *old = HB.CreateLoad(i32, Counter, "morok.trap.win.hits.old");
+    old->setVolatile(true);
+    Value *next =
+        HB.CreateAdd(old, ConstantInt::get(i32, 1),
+                     "morok.trap.win.hits.next");
+    HB.CreateStore(next, Counter)->setVolatile(true);
+    Value *address =
+        loadAt(HB, M, ip, record, exceptionAddressOff,
+               "morok.trap.win.veh.address");
+    Value *eflags =
+        loadAt(HB, M, i32, context, eflagsOff, "morok.trap.win.veh.eflags");
+    Value *cleared =
+        HB.CreateAnd(eflags, ConstantInt::get(i32, ~kTrapFlag),
+                     "morok.trap.win.veh.eflags.clear");
+    storeAt(HB, M, context, eflagsOff, cleared,
+            "morok.trap.win.veh.eflags.store");
+    foldState(HB, State, code, 0x82F4C97B31A6D508ULL,
+              "morok.trap.win.veh.code.mix");
+    foldState(HB, State, address, 0x36AD5E940F2C17B1ULL,
+              "morok.trap.win.veh.address.mix");
+    foldState(HB, State, next, 0xC7B1246D8E039FA5ULL,
+              "morok.trap.win.veh.count.mix");
+    HB.CreateRet(ConstantInt::getSigned(i32, -1));
+
+    IRBuilder<> SB(searchBB);
+    SB.CreateRet(ConstantInt::get(i32, 0));
+    return fn;
+}
+
+Function *windowsTrapFlagProbe(Module &M, GlobalVariable *Counter,
+                               GlobalVariable *State, ir::IRRandom &rng,
+                               const Triple &TT) {
+    const bool x86 = TT.getArch() == Triple::x86;
+    const bool x64 = TT.getArch() == Triple::x86_64;
+    if (!TT.isOSWindows() || (!x86 && !x64))
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.trap.win.tf"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.trap.win.tf", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    Function *pebReader = windowsPebReader(M);
+    Function *moduleByHash = windowsLdrModuleByHash(M);
+    Function *resolver = windowsPeExportResolver(M);
+    Function *handler = windowsTrapFlagVehHandler(M, Counter, State, TT);
+    if (!pebReader || !moduleByHash || !resolver || !handler)
+        return nullptr;
+
+    auto setWinApiCallConv = [&](CallInst *CI) {
+        if (x86)
+            CI->setCallingConv(CallingConv::X86_StdCall);
+    };
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *resolveBB = BasicBlock::Create(ctx, "resolve", fn);
+    auto *registerBB = BasicBlock::Create(ctx, "register", fn);
+    auto *stimulusBB = BasicBlock::Create(ctx, "stimulus", fn);
+    auto *removeBB = BasicBlock::Create(ctx, "remove", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    B.CreateStore(ConstantInt::get(i32, 0), Counter)->setVolatile(true);
+    Value *peb = B.CreateCall(pebReader, {}, "morok.trap.win.peb");
+    foldState(B, State, peb, rng.next(), "morok.trap.win.peb.mix");
+    B.CreateCondBr(B.CreateICmpNE(peb, ConstantInt::get(ip, 0),
+                                  "morok.trap.win.peb.present"),
+                   resolveBB, retBB);
+
+    IRBuilder<> RB(resolveBB);
+    Value *ntdll = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("ntdll.dll"))},
+        "morok.trap.win.ntdll");
+    Value *rtlAdd = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64,
+                                 fnv1aName("RtlAddVectoredExceptionHandler"))},
+        "morok.trap.win.rtladd");
+    Value *rtlRemove = RB.CreateCall(
+        resolver,
+        {ntdll,
+         ConstantInt::get(i64,
+                          fnv1aName("RtlRemoveVectoredExceptionHandler"))},
+        "morok.trap.win.rtlremove");
+    foldState(RB, State, ntdll, rng.next(), "morok.trap.win.ntdll.mix");
+    foldState(RB, State, rtlAdd, rng.next(), "morok.trap.win.rtladd.mix");
+    foldState(RB, State, rtlRemove, rng.next(),
+              "morok.trap.win.rtlremove.mix");
+    Value *missingAdd =
+        RB.CreateICmpEQ(rtlAdd, ConstantInt::get(ip, 0),
+                        "morok.trap.win.rtladd.missing");
+    foldEnforcedFlag(RB, State, missingAdd, 0x8F27D63B4A159CE0ULL,
+                     "morok.trap.win.veh.register");
+    RB.CreateCondBr(RB.CreateNot(missingAdd, "morok.trap.win.rtladd.ready"),
+                    registerBB, retBB);
+
+    IRBuilder<> GB(registerBB);
+    auto *addTy = FunctionType::get(ptr, {i32, ptr}, false);
+    auto *handle = GB.CreateCall(
+        addTy,
+        GB.CreateIntToPtr(rtlAdd, ptr, "morok.trap.win.rtladd.ptr"),
+        {ConstantInt::get(i32, 1), handler}, "morok.trap.win.veh.handle");
+    setWinApiCallConv(handle);
+    foldState(GB, State, handle, rng.next(), "morok.trap.win.veh.handle.mix");
+    Value *missingHandle =
+        GB.CreateICmpEQ(handle, ConstantPointerNull::get(ptr),
+                        "morok.trap.win.veh.missing");
+    foldEnforcedFlag(GB, State, missingHandle, 0xA1C94E7B3058D62FULL,
+                     "morok.trap.win.veh.missing");
+    GB.CreateCondBr(GB.CreateNot(missingHandle,
+                                 "morok.trap.win.veh.handle.ready"),
+                    stimulusBB, retBB);
+
+    IRBuilder<> SB(stimulusBB);
+    if (x64)
+        emitTrapInlineAsm(SB,
+                          "pushfq\npopq %rax\norq $$256, %rax\npushq "
+                          "%rax\npopfq\nnop\npushfq\npopq %rax\nandq "
+                          "$$-257, %rax\npushq %rax\npopfq",
+                          "~{rax},~{dirflag},~{fpsr},~{flags}");
+    else
+        emitTrapInlineAsm(SB,
+                          "pushfl\npopl %eax\norl $$256, %eax\npushl "
+                          "%eax\npopfl\nnop\npushfl\npopl %eax\nandl "
+                          "$$-257, %eax\npushl %eax\npopfl",
+                          "~{eax},~{dirflag},~{fpsr},~{flags}");
+    auto *hits = SB.CreateLoad(i32, Counter, "morok.trap.win.hits.final");
+    hits->setVolatile(true);
+    foldState(SB, State, hits, 0x4D7C2B91E605A83FULL,
+              "morok.trap.win.hits.final.mix");
+    Value *missing =
+        SB.CreateICmpULT(hits, ConstantInt::get(i32, 1),
+                         "morok.trap.win.single_step.missing");
+    foldEnforcedFlag(SB, State, missing, 0xD06B8A31F4752CE9ULL,
+                     "morok.trap.win.single_step.missing");
+    SB.CreateCondBr(SB.CreateICmpNE(rtlRemove, ConstantInt::get(ip, 0),
+                                    "morok.trap.win.rtlremove.ready"),
+                    removeBB, retBB);
+
+    IRBuilder<> RMB(removeBB);
+    auto *removeTy = FunctionType::get(i32, {ptr}, false);
+    auto *removeStatus = RMB.CreateCall(
+        removeTy,
+        RMB.CreateIntToPtr(rtlRemove, ptr, "morok.trap.win.rtlremove.ptr"),
+        {handle}, "morok.trap.win.remove.status");
+    setWinApiCallConv(removeStatus);
+    foldState(RMB, State, removeStatus, rng.next(),
+              "morok.trap.win.remove.status.mix");
+    RMB.CreateBr(retBB);
+
+    IRBuilder<> RetB(retBB);
+    RetB.CreateRetVoid();
+    return fn;
+}
+
 void emitWindowsAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
                           ir::IRRandom &rng, const Triple &TT) {
     IRBuilder<> B(&Ctor->getEntryBlock());
@@ -16765,6 +16994,27 @@ bool schedulerStepOracleModule(Module &M, ir::IRRandom &rng) {
 
 bool trapOracleModule(Module &M, ir::IRRandom &rng) {
     const Triple tt(M.getTargetTriple());
+    if (tt.isOSWindows()) {
+        const bool x86 = tt.getArch() == Triple::x86;
+        const bool x64 = tt.getArch() == Triple::x86_64;
+        if (!x86 && !x64)
+            return false;
+
+        Function *ctor = makeCtorShell(M, "morok.trap");
+        antiDebugSeal(M, rng);
+        GlobalVariable *state = trapOracleState(M, rng);
+        GlobalVariable *counter = trapHitCounter(M);
+        Function *probe = windowsTrapFlagProbe(M, counter, state, rng, tt);
+        if (!probe)
+            return false;
+
+        IRBuilder<> B(&ctor->getEntryBlock());
+        B.CreateCall(probe);
+        B.CreateRetVoid();
+        appendToGlobalCtors(M, ctor, 0);
+        return true;
+    }
+
     TrapSigactionLayout layout;
     if (intPtrTy(M)->getBitWidth() != 64 || !trapSigactionLayout(tt, layout))
         return false;
