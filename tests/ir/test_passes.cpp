@@ -303,6 +303,40 @@ void checkDarwinCsopsTaskAllowSignals(Function &F,
         findNamedInstruction(F, "morok.antidbg.csops.gta.absent.debugged");
     REQUIRE(Absent != nullptr);
     CHECK(valueFeedsNamedInstruction(Absent, "morok.seal.fold.anti_debug"));
+    Instruction *AuditTokenOk =
+        findNamedInstruction(F, "morok.antidbg.csops.audit.token.ok");
+    Instruction *AuditFlag =
+        findNamedInstruction(F, "morok.antidbg.csops.audit.flag");
+    Instruction *AuditDrift =
+        findNamedInstruction(F, "morok.antidbg.csops.audit.debug.drift");
+    Instruction *AuditAbsent = findNamedInstruction(
+        F, "morok.antidbg.csops.audit.gta.absent.debugged");
+    Instruction *AnyAbsent =
+        findNamedInstruction(F, "morok.antidbg.csops.gta.absent.any");
+    REQUIRE(AuditTokenOk != nullptr);
+    REQUIRE(AuditFlag != nullptr);
+    REQUIRE(AuditDrift != nullptr);
+    REQUIRE(AuditAbsent != nullptr);
+    REQUIRE(AnyAbsent != nullptr);
+    CHECK(countNamedInstructions(F,
+                                 "morok.antidbg.csops.audit.task_info") >= 1u);
+    CHECK(countNamedInstructions(F,
+                                 "morok.antidbg.csops.audit.gta.bits") >= 1u);
+    CHECK(countNamedInstructions(F,
+                                 "morok.antidbg.csops.audit.gta.missing") >=
+          1u);
+    CHECK(valueFeedsNamedInstruction(AuditTokenOk,
+                                     "morok.antidbg.csops.audit.ok"));
+    CHECK(valueFeedsNamedInstruction(AuditFlag,
+                                     "morok.seal.fold.anti_debug"));
+    CHECK(valueFeedsNamedInstruction(AuditDrift,
+                                     "morok.seal.fold.anti_debug"));
+    CHECK(valueFeedsNamedInstruction(AuditAbsent,
+                                     "morok.seal.fold.anti_debug"));
+    CHECK(valueFeedsNamedInstruction(AuditAbsent,
+                                     "morok.antidbg.csops.gta.absent.any"));
+    CHECK(valueFeedsNamedInstruction(Absent,
+                                     "morok.antidbg.csops.gta.absent.any"));
 
     CHECK(countNamedInstructions(F, "morok.antidbg.csops.sigclass.adhoc.bits") >=
           1u);
@@ -1578,6 +1612,70 @@ TEST_CASE("PlatformRuntime emits Darwin arm64 exception-port query through "
     CHECK(countNamedInstructions(*F, "morok.test.exc.msg2.ports") >= 1u);
     CHECK(countNamedInstructions(*F, "morok.test.exc.direct.rc") >= 1u);
     checkDarwinExceptionPortVariableReplyParser(*F, "morok.test.exc");
+    CHECK_FALSE(verifyModule(M, &errs()));
+}
+
+TEST_CASE("PlatformRuntime emits Darwin task audit-token query through direct "
+          "Mach IPC") {
+    LLVMContext ctx;
+    Module M("platform-runtime-darwin-task-audit-direct", ctx);
+    M.setTargetTriple(Triple("x86_64-apple-macosx13.0.0"));
+    auto *I32 = Type::getInt32Ty(ctx);
+    auto *ArrayTy = ArrayType::get(I32, 8);
+    auto *F = Function::Create(FunctionType::get(I32, false),
+                               GlobalValue::ExternalLinkage, "probe", M);
+    IRBuilder<> B(BasicBlock::Create(ctx, "entry", F));
+    AllocaInst *Token = B.CreateAlloca(ArrayTy, nullptr, "token");
+    Value *Zero = ConstantInt::get(Type::getInt64Ty(ctx), 0);
+    Value *First = B.CreateInBoundsGEP(ArrayTy, Token, {Zero, Zero});
+
+    Value *Rc = morok::runtime::emitDarwinTaskInfoAuditToken(
+        B, M, Triple(M.getTargetTriple()), ConstantInt::get(I32, 1), First,
+        "morok.test.task.audit");
+    B.CreateRet(Rc);
+
+    CHECK(M.getFunction("task_info") == nullptr);
+    CHECK(M.getFunction("syscall") == nullptr);
+    CHECK(hasInlineAsmCall(*F));
+    CHECK(countNamedInstructions(*F,
+                                 "morok.test.task.audit.mig.message") >= 1u);
+    CHECK(countNamedInstructions(*F,
+                                 "morok.test.task.audit.reply_port") >= 1u);
+    CHECK(countNamedInstructions(*F, "morok.test.task.audit.mach_msg") >= 1u);
+    CHECK(countNamedInstructions(*F, "morok.test.task.audit.copy.word") >= 8u);
+    CHECK(countNamedInstructions(*F, "morok.test.task.audit.direct.rc") >= 1u);
+    CHECK(functionHasConstantInt(*F, 3405));
+    CHECK(functionHasConstantInt(*F, 3505));
+    CHECK_FALSE(verifyModule(M, &errs()));
+}
+
+TEST_CASE("PlatformRuntime emits Darwin csops audit-token status through raw "
+          "syscall") {
+    LLVMContext ctx;
+    Module M("platform-runtime-darwin-csops-audit", ctx);
+    M.setTargetTriple(Triple("x86_64-apple-macosx13.0.0"));
+    auto *I32 = Type::getInt32Ty(ctx);
+    auto *IP = morok::runtime::platformWordTy(M);
+    auto *ArrayTy = ArrayType::get(I32, 8);
+    auto *F = Function::Create(FunctionType::get(I32, false),
+                               GlobalValue::ExternalLinkage, "probe", M);
+    IRBuilder<> B(BasicBlock::Create(ctx, "entry", F));
+    AllocaInst *Status = B.CreateAlloca(I32, nullptr, "status");
+    AllocaInst *Token = B.CreateAlloca(ArrayTy, nullptr, "token");
+    Value *Zero = ConstantInt::get(IP, 0);
+    Value *First = B.CreateInBoundsGEP(ArrayTy, Token, {Zero, Zero});
+
+    Value *Rc = morok::runtime::emitDarwinCsopsAuditToken(
+        B, M, Triple(M.getTargetTriple()), ConstantInt::get(I32, 1),
+        ConstantInt::get(I32, 0), Status, ConstantInt::get(IP, 4), First);
+    B.CreateRet(Rc);
+
+    CHECK(M.getFunction("csops") == nullptr);
+    CHECK(M.getFunction("csops_audittoken") == nullptr);
+    CHECK(M.getFunction("syscall") == nullptr);
+    CHECK(hasInlineAsmCall(*F));
+    CHECK(functionHasConstantInt(*F, 0x020000AAU));
+    CHECK(countNamedInstructions(*F, "morok.darwin.csops.audit") >= 1u);
     CHECK_FALSE(verifyModule(M, &errs()));
 }
 
@@ -18559,6 +18657,8 @@ entry:
     CHECK(M->getFunction("ptrace") == nullptr);
     CHECK(M->getFunction("sysctl") == nullptr);
     CHECK(M->getFunction("csops") == nullptr);
+    CHECK(M->getFunction("csops_audittoken") == nullptr);
+    CHECK(M->getFunction("task_info") == nullptr);
     CHECK(M->getFunction("task_get_exception_ports") == nullptr);
     CHECK(M->getFunction("csr_get_active_config") == nullptr);
     CHECK(M->getFunction("SecTaskCreateFromSelf") == nullptr);
@@ -18580,6 +18680,9 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.antidbg.dyld.coherence") >= 8u);
     CHECK(countNamedInstructions(*Ctor, "morok.imgcensus.library.apple") >=
           1u);
+    CHECK(countNamedInstructions(
+              *Ctor, "morok.antidbg.csops.audit.task_info.direct.rc") >= 1u);
+    CHECK(functionHasConstantInt(*Ctor, 0x020000AAU));
     CHECK(countNamedInstructions(*Ctor, "morok.antidbg.exc.task_ports") >= 1u);
     CHECK(countNamedInstructions(*Ctor,
                                  "morok.antidbg.exc.task_ports.import") == 0u);
@@ -18826,6 +18929,8 @@ entry:
     CHECK(M->getFunction("ptrace") == nullptr);
     CHECK(M->getFunction("sysctl") == nullptr);
     CHECK(M->getFunction("csops") == nullptr);
+    CHECK(M->getFunction("csops_audittoken") == nullptr);
+    CHECK(M->getFunction("task_info") == nullptr);
     CHECK(M->getFunction("task_get_exception_ports") == nullptr);
     CHECK(M->getFunction("csr_get_active_config") == nullptr);
     CHECK(M->getFunction("getenv") != nullptr);
@@ -18840,6 +18945,9 @@ entry:
                                  "morok.antidbg.dyld.coherence") >= 8u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
                                  "morok.imgcensus.library.apple") >= 1u);
+    CHECK(countNamedInstructions(
+              *M->getFunction("morok.antidbg"),
+              "morok.antidbg.csops.audit.task_info.direct.rc") >= 1u);
     // M2 direct syscall fallback: no imported MAP_JIT/icache helper can
     // interpose or patch a mutable syscall thunk before checks execute.
     CHECK(M->getGlobalVariable("morok.svc.thunk", true) == nullptr);

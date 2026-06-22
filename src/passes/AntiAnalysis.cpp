@@ -1015,6 +1015,20 @@ Value *emitDarwinCsops(IRBuilder<> &B, Module &M, const Triple &TT, Value *Pid,
     return runtime::emitDarwinCsops(B, M, TT, Pid, Ops, UserAddr, UserSize);
 }
 
+Value *emitDarwinCsopsAuditToken(IRBuilder<> &B, Module &M, const Triple &TT,
+                                 Value *Pid, Value *Ops, Value *UserAddr,
+                                 Value *UserSize, Value *AuditToken) {
+    return runtime::emitDarwinCsopsAuditToken(B, M, TT, Pid, Ops, UserAddr,
+                                             UserSize, AuditToken);
+}
+
+Value *emitDarwinTaskInfoAuditToken(IRBuilder<> &B, Module &M,
+                                    const Triple &TT, Value *Task,
+                                    Value *AuditToken, const Twine &Name) {
+    return runtime::emitDarwinTaskInfoAuditToken(B, M, TT, Task, AuditToken,
+                                                 Name);
+}
+
 Value *emitDarwinTaskGetExceptionPorts(
     IRBuilder<> &B, Module &M, const Triple &TT, Value *Task,
     Value *ExceptionMask, Value *Masks, Value *MaskCount, Value *Handlers,
@@ -3518,7 +3532,8 @@ DarwinCsopsSignals emitDarwinCsopsCheck(IRBuilder<> &B, Module &M,
 
     auto *status = B.CreateAlloca(i32, nullptr, "morok.antidbg.cs");
     B.CreateStore(ConstantInt::get(i32, 0), status);
-    Value *rc = emitDarwinCsops(B, M, TT, emitDarwinGetpid(B, M, TT),
+    Value *selfPid = emitDarwinGetpid(B, M, TT);
+    Value *rc = emitDarwinCsops(B, M, TT, selfPid,
                                 ConstantInt::get(i32, 0), status,
                                 ConstantInt::get(ip, 4));
     Value *flags = B.CreateLoad(i32, status);
@@ -3529,6 +3544,62 @@ DarwinCsopsSignals emitDarwinCsopsCheck(IRBuilder<> &B, Module &M,
     Value *dbgFlag = B.CreateAnd(ok, debugged, "morok.antidbg.csops.debugged");
     foldFlag(B, State, dbgFlag, 0xF1D88C6C72195307ULL, "morok.antidbg.csops");
     sealFold(B, dbgFlag, 0xF1D88C6C72195307ULL);
+
+    auto *tokenTy = ArrayType::get(i32, 8);
+    auto *auditToken =
+        B.CreateAlloca(tokenTy, nullptr, "morok.antidbg.csops.audit.token");
+    Value *zero = ConstantInt::get(ip, 0);
+    Value *auditTokenPtr =
+        B.CreateInBoundsGEP(tokenTy, auditToken, {zero, zero},
+                            "morok.antidbg.csops.audit.token.ptr");
+    for (std::uint32_t i = 0; i < 8; ++i) {
+        Value *idx[] = {ConstantInt::get(ip, 0), ConstantInt::get(ip, i)};
+        B.CreateStore(ConstantInt::get(i32, 0),
+                      B.CreateInBoundsGEP(tokenTy, auditToken, idx));
+    }
+    GlobalVariable *selfGV =
+        cast<GlobalVariable>(M.getOrInsertGlobal("mach_task_self_", i32));
+    Value *task = B.CreateLoad(i32, selfGV, "morok.antidbg.csops.audit.task");
+    Value *tokenRc = emitDarwinTaskInfoAuditToken(
+        B, M, TT, task, auditTokenPtr, "morok.antidbg.csops.audit.task_info");
+    Value *tokenOk =
+        B.CreateICmpEQ(tokenRc, ConstantInt::get(i32, 0),
+                       "morok.antidbg.csops.audit.token.ok");
+
+    auto *auditStatus =
+        B.CreateAlloca(i32, nullptr, "morok.antidbg.csops.audit.cs");
+    B.CreateStore(ConstantInt::get(i32, 0), auditStatus);
+    Value *auditRc = emitDarwinCsopsAuditToken(
+        B, M, TT, selfPid, ConstantInt::get(i32, 0), auditStatus,
+        ConstantInt::get(ip, 4), auditTokenPtr);
+    Value *auditFlags =
+        B.CreateLoad(i32, auditStatus, "morok.antidbg.csops.audit.flags");
+    Value *auditDebugged = B.CreateICmpNE(
+        B.CreateAnd(auditFlags, ConstantInt::get(i32, 0x10000000),
+                    "morok.antidbg.csops.audit.debugged.bits"),
+        ConstantInt::get(i32, 0), "morok.antidbg.csops.audit.debugged");
+    Value *auditRcOk =
+        B.CreateICmpEQ(auditRc, ConstantInt::get(i32, 0),
+                       "morok.antidbg.csops.audit.rc.ok");
+    Value *auditOk =
+        B.CreateAnd(tokenOk, auditRcOk, "morok.antidbg.csops.audit.ok");
+    Value *auditDbgFlag =
+        B.CreateAnd(auditOk, auditDebugged, "morok.antidbg.csops.audit.flag");
+    foldFlag(B, State, auditDbgFlag, 0x8C6F5A73E1B492D5ULL,
+             "morok.antidbg.csops.audit");
+    sealFold(B, auditDbgFlag, 0x8C6F5A73E1B492D5ULL);
+
+    Value *bothCsopsOk =
+        B.CreateAnd(ok, auditOk, "morok.antidbg.csops.audit.both.ok");
+    Value *debugDiverges =
+        B.CreateXor(debugged, auditDebugged,
+                    "morok.antidbg.csops.audit.debug.delta");
+    Value *debugDrift =
+        B.CreateAnd(bothCsopsOk, debugDiverges,
+                    "morok.antidbg.csops.audit.debug.drift");
+    foldFlag(B, State, debugDrift, 0x37B4E6D89A5012CFULL,
+             "morok.antidbg.csops.audit.coherence");
+    sealFold(B, debugDrift, 0x37B4E6D89A5012CFULL);
 
     auto classBit = [&](std::uint32_t flag, std::uint32_t bit,
                         const Twine &Name) -> Value * {
@@ -3605,7 +3676,28 @@ DarwinCsopsSignals emitDarwinCsopsCheck(IRBuilder<> &B, Module &M,
     foldFlag(B, State, debuggedWithoutTaskAllow, 0x4B6E8A13D927C5F1ULL,
              "morok.antidbg.csops.gta.absent");
     sealFold(B, debuggedWithoutTaskAllow, 0x4B6E8A13D927C5F1ULL);
-    return {dbgFlag, debuggedWithoutTaskAllow};
+
+    Value *auditTaskAllowBits =
+        B.CreateAnd(auditFlags, ConstantInt::get(i32, 0x4),
+                    "morok.antidbg.csops.audit.gta.bits");
+    Value *auditTaskAllowed =
+        B.CreateICmpNE(auditTaskAllowBits, ConstantInt::get(i32, 0),
+                       "morok.antidbg.csops.audit.gta");
+    Value *auditMissingTaskAllow =
+        B.CreateNot(auditTaskAllowed, "morok.antidbg.csops.audit.gta.missing");
+    Value *auditDebuggedWithoutTaskAllow =
+        B.CreateAnd(auditDbgFlag, auditMissingTaskAllow,
+                    "morok.antidbg.csops.audit.gta.absent.debugged");
+    foldFlag(B, State, auditDebuggedWithoutTaskAllow, 0xD7E9B43A6501C28FULL,
+             "morok.antidbg.csops.audit.gta.absent");
+    sealFold(B, auditDebuggedWithoutTaskAllow, 0xD7E9B43A6501C28FULL);
+
+    Value *anyDebugged =
+        B.CreateOr(dbgFlag, auditDbgFlag, "morok.antidbg.csops.any");
+    Value *anyDebuggedWithoutTaskAllow = B.CreateOr(
+        debuggedWithoutTaskAllow, auditDebuggedWithoutTaskAllow,
+        "morok.antidbg.csops.gta.absent.any");
+    return {anyDebugged, anyDebuggedWithoutTaskAllow};
 }
 
 Value *emitDarwinExceptionPortProbe(IRBuilder<> &B, Module &M,

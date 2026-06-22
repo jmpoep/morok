@@ -558,6 +558,208 @@ Value *emitDarwinCsops(IRBuilder<> &B, Module &M, const Triple &TT, Value *Pid,
                                 B.CreateZExtOrTrunc(UserSize, IP)});
 }
 
+Value *emitDarwinCsopsAuditToken(IRBuilder<> &B, Module &M, const Triple &TT,
+                                 Value *Pid, Value *Ops, Value *UserAddr,
+                                 Value *UserSize, Value *AuditToken) {
+    auto *I32 = Type::getInt32Ty(M.getContext());
+    if (useDirectDarwinSyscalls(M, TT))
+        return B.CreateTruncOrBitCast(
+            emitDarwinSyscall(B, M, TT, 170,
+                              {Pid, Ops, UserAddr, UserSize, AuditToken},
+                              "morok.darwin.csops.audit"),
+            I32);
+    if (TT.getArch() == Triple::aarch64 && directSyscallPolicy(M) != 2u)
+        return B.CreateTruncOrBitCast(
+            emitDarwinArm64Svc(B, M, 170,
+                               {Pid, Ops, UserAddr, UserSize, AuditToken},
+                               "morok.darwin.csops.audit.svc"),
+            I32);
+    return B.CreateTruncOrBitCast(
+        emitDarwinSyscall(B, M, TT, 170,
+                          {Pid, Ops, UserAddr, UserSize, AuditToken},
+                          "morok.darwin.csops.audit"),
+        I32);
+}
+
+Value *emitDarwinTaskInfoAuditToken(IRBuilder<> &B, Module &M, const Triple &TT,
+                                    Value *Task, Value *AuditToken,
+                                    const Twine &Name) {
+    LLVMContext &Ctx = M.getContext();
+    auto *I8 = Type::getInt8Ty(Ctx);
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *IP = platformWordTy(M);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+    constexpr std::uint32_t kTaskAuditTokenFlavor = 15;
+    constexpr std::uint32_t kTaskAuditTokenCount = 8;
+
+    if (useDirectDarwinMachTraps(M, TT)) {
+        auto *HeaderTy =
+            StructType::get(Ctx, {I32, I32, I32, I32, I32, I32});
+        auto *NdrTy = ArrayType::get(I8, 8);
+        auto *ReqTy = StructType::get(Ctx, {HeaderTy, NdrTy, I32, I32});
+        auto *MsgTy = ArrayType::get(I8, 448);
+
+        constexpr std::uint32_t kRequestSize = 40;
+        constexpr std::uint32_t kMessageBufferSize = 448;
+        constexpr std::uint32_t kReplyRetCodeOffset = 32;
+        constexpr std::uint32_t kReplyCountOffset = 36;
+        constexpr std::uint32_t kReplyInfoOffset = 40;
+        constexpr std::uint32_t kTaskInfoId = 3405;
+        constexpr std::uint32_t kTaskInfoReplyId = 3505;
+        constexpr std::uint32_t kMachMsgBitsCopySendMakeSendOnce =
+            19U | (21U << 8);
+        constexpr std::int32_t kMigReplyMismatch = -301;
+
+        AllocaInst *Msg =
+            B.CreateAlloca(MsgTy, nullptr, Name + ".mig.message");
+        B.CreateMemSet(Msg, ConstantInt::get(I8, 0),
+                       ConstantInt::get(IP, kMessageBufferSize), MaybeAlign(4));
+        auto gepI8Const = [&](IRBuilder<> &Builder, std::uint32_t Offset,
+                              const Twine &GepName) -> Value * {
+            return Builder.CreateInBoundsGEP(
+                I8, Msg, ConstantInt::get(IP, Offset), GepName);
+        };
+        auto loadI32AtConst = [&](IRBuilder<> &Builder, std::uint32_t Offset,
+                                  const Twine &LoadName) -> LoadInst * {
+            Value *Slot = gepI8Const(Builder, Offset, LoadName + ".ptr");
+            return Builder.CreateAlignedLoad(I32, Slot, Align(4), LoadName);
+        };
+
+        Value *ReplyPort =
+            emitDarwinMachTrap0(B, M, TT, -26, Name + ".reply_port");
+        Value *ReplyPort32 = B.CreateTruncOrBitCast(
+            ReplyPort, I32, Name + ".reply_port.name");
+        Value *Task32 = B.CreateTruncOrBitCast(Task, I32, Name + ".task.name");
+
+        Value *ReqHeader = B.CreateStructGEP(ReqTy, Msg, 0);
+        B.CreateStore(ConstantInt::get(I32, kMachMsgBitsCopySendMakeSendOnce),
+                      B.CreateStructGEP(HeaderTy, ReqHeader, 0));
+        B.CreateStore(ConstantInt::get(I32, kRequestSize),
+                      B.CreateStructGEP(HeaderTy, ReqHeader, 1));
+        B.CreateStore(Task32, B.CreateStructGEP(HeaderTy, ReqHeader, 2));
+        B.CreateStore(ReplyPort32, B.CreateStructGEP(HeaderTy, ReqHeader, 3));
+        B.CreateStore(ConstantInt::get(I32, 0),
+                      B.CreateStructGEP(HeaderTy, ReqHeader, 4));
+        B.CreateStore(ConstantInt::get(I32, kTaskInfoId),
+                      B.CreateStructGEP(HeaderTy, ReqHeader, 5));
+
+        Value *Ndr = B.CreateStructGEP(ReqTy, Msg, 1);
+        constexpr std::array<std::uint8_t, 8> kNdrRecord = {0, 0, 0, 0,
+                                                            1, 0, 0, 0};
+        for (std::uint32_t I = 0; I < kNdrRecord.size(); ++I) {
+            Value *Slot = B.CreateInBoundsGEP(
+                NdrTy, Ndr, {ConstantInt::get(IP, 0), ConstantInt::get(IP, I)},
+                Name + ".ndr");
+            B.CreateStore(ConstantInt::get(I8, kNdrRecord[I]), Slot);
+        }
+        B.CreateStore(ConstantInt::get(I32, kTaskAuditTokenFlavor),
+                      B.CreateStructGEP(ReqTy, Msg, 2));
+        B.CreateStore(ConstantInt::get(I32, kTaskAuditTokenCount),
+                      B.CreateStructGEP(ReqTy, Msg, 3));
+
+        Value *ReplyPortIP =
+            B.CreateZExtOrTrunc(ReplyPort32, IP, Name + ".reply_port.ip");
+        Value *MsgRc = nullptr;
+        if (TT.getArch() == Triple::aarch64) {
+            Value *RemoteLocal = B.CreateOr(
+                B.CreateShl(ReplyPortIP, ConstantInt::get(IP, 32),
+                            Name + ".msg2.local"),
+                B.CreateZExtOrTrunc(Task32, IP), Name + ".msg2.ports");
+            Value *TimeoutReceive = B.CreateShl(
+                ReplyPortIP, ConstantInt::get(IP, 32), Name + ".msg2.receive");
+            std::array<Value *, 8> Args = {
+                toSyscallArg(B, Msg),
+                ConstantInt::get(IP, (std::uint64_t{0x2} << 32) |
+                                         (0x00000001U | 0x00000002U)),
+                ConstantInt::get(IP, (std::uint64_t{kRequestSize} << 32) |
+                                         kMachMsgBitsCopySendMakeSendOnce),
+                RemoteLocal,
+                ConstantInt::get(IP, std::uint64_t{kTaskInfoId} << 32),
+                TimeoutReceive,
+                ConstantInt::get(IP, kMessageBufferSize),
+                ConstantInt::get(IP, 0),
+            };
+            MsgRc = emitArm64Svc8InlineAsm(B, M, ConstantInt::getSigned(IP, -47),
+                                           Args, Name + ".mach_msg");
+        } else {
+            std::array<Value *, 7> Args = {
+                toSyscallArg(B, Msg),
+                ConstantInt::get(IP, 0x00000001U | 0x00000002U),
+                ConstantInt::get(IP, kRequestSize),
+                ConstantInt::get(IP, kMessageBufferSize),
+                ReplyPortIP,
+                ConstantInt::get(IP, 0),
+                ConstantInt::get(IP, 0),
+            };
+            MsgRc = emitDarwinMachTrap7(B, M, TT, -31, Args,
+                                        Name + ".mach_msg");
+        }
+        Value *MsgRc32 = B.CreateTruncOrBitCast(MsgRc, I32, Name + ".rc");
+        Value *ReplyId =
+            B.CreateLoad(I32, B.CreateStructGEP(HeaderTy, Msg, 5),
+                         Name + ".reply.id");
+        Value *RetCode =
+            loadI32AtConst(B, kReplyRetCodeOffset, Name + ".reply.ret");
+        Value *ReplyCount =
+            loadI32AtConst(B, kReplyCountOffset, Name + ".reply.count");
+
+        Value *MsgOk =
+            B.CreateICmpEQ(MsgRc32, ConstantInt::get(I32, 0), Name + ".msg.ok");
+        Value *IdOk = B.CreateICmpEQ(
+            ReplyId, ConstantInt::get(I32, kTaskInfoReplyId),
+            Name + ".reply.id.ok");
+        Value *RetOk =
+            B.CreateICmpEQ(RetCode, ConstantInt::get(I32, 0), Name + ".ret.ok");
+        Value *CountOk = B.CreateICmpUGE(
+            ReplyCount, ConstantInt::get(I32, kTaskAuditTokenCount),
+            Name + ".count.ok");
+        Value *Ok = B.CreateAnd(MsgOk, IdOk, Name + ".ok.id");
+        Ok = B.CreateAnd(Ok, RetOk, Name + ".ok.ret");
+        Ok = B.CreateAnd(Ok, CountOk, Name + ".ok.count");
+
+        Function *Fn = B.GetInsertBlock()->getParent();
+        BasicBlock *StartBB = B.GetInsertBlock();
+        BasicBlock *CopyBB =
+            BasicBlock::Create(Ctx, (Name + ".copy").str(), Fn);
+        BasicBlock *DoneBB =
+            BasicBlock::Create(Ctx, (Name + ".done").str(), Fn);
+        Value *ReplyFailure = B.CreateSelect(
+            B.CreateICmpNE(RetCode, ConstantInt::get(I32, 0)),
+            RetCode, ConstantInt::getSigned(I32, kMigReplyMismatch),
+            Name + ".reply.failure");
+        Value *FailureRc = B.CreateSelect(
+            B.CreateICmpNE(MsgRc32, ConstantInt::get(I32, 0)),
+            MsgRc32, ReplyFailure, Name + ".failure");
+        B.CreateCondBr(Ok, CopyBB, DoneBB);
+
+        IRBuilder<> CB(CopyBB);
+        for (std::uint32_t I = 0; I < kTaskAuditTokenCount; ++I) {
+            Value *Word = loadI32AtConst(
+                CB, kReplyInfoOffset + I * 4, Name + ".copy.word");
+            Value *Slot = CB.CreateInBoundsGEP(
+                I32, AuditToken, ConstantInt::get(IP, I), Name + ".copy.out");
+            CB.CreateStore(Word, Slot);
+        }
+        CB.CreateBr(DoneBB);
+
+        B.SetInsertPoint(DoneBB);
+        PHINode *Result = B.CreatePHI(I32, 2, Name + ".direct.rc");
+        Result->addIncoming(ConstantInt::get(I32, 0), CopyBB);
+        Result->addIncoming(FailureRc, StartBB);
+        return Result;
+    }
+
+    AllocaInst *Count = B.CreateAlloca(I32, nullptr, Name + ".count");
+    B.CreateStore(ConstantInt::get(I32, kTaskAuditTokenCount), Count);
+    FunctionCallee TaskInfo = M.getOrInsertFunction(
+        "task_info", FunctionType::get(I32, {I32, I32, Ptr, Ptr}, false));
+    return B.CreateCall(TaskInfo,
+                        {B.CreateTruncOrBitCast(Task, I32),
+                         ConstantInt::get(I32, kTaskAuditTokenFlavor),
+                         AuditToken, Count},
+                        Name + ".import");
+}
+
 Value *emitDarwinTaskGetExceptionPorts(
     IRBuilder<> &B, Module &M, const Triple &TT, Value *Task,
     Value *ExceptionMask, Value *Masks, Value *MaskCount, Value *Handlers,

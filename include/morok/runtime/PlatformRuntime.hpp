@@ -98,6 +98,16 @@ llvm::Value *emitDarwinCsops(llvm::IRBuilder<> &B, llvm::Module &M,
                              const llvm::Triple &TT, llvm::Value *Pid,
                              llvm::Value *Ops, llvm::Value *UserAddr,
                              llvm::Value *UserSize);
+llvm::Value *emitDarwinCsopsAuditToken(llvm::IRBuilder<> &B, llvm::Module &M,
+                                       const llvm::Triple &TT,
+                                       llvm::Value *Pid, llvm::Value *Ops,
+                                       llvm::Value *UserAddr,
+                                       llvm::Value *UserSize,
+                                       llvm::Value *AuditToken);
+llvm::Value *emitDarwinTaskInfoAuditToken(
+    llvm::IRBuilder<> &B, llvm::Module &M, const llvm::Triple &TT,
+    llvm::Value *Task, llvm::Value *AuditToken,
+    const llvm::Twine &Name = llvm::Twine("morok.darwin.task.audit_token"));
 llvm::Value *emitDarwinTaskGetExceptionPorts(
     llvm::IRBuilder<> &B, llvm::Module &M, const llvm::Triple &TT,
     llvm::Value *Task, llvm::Value *ExceptionMask, llvm::Value *Masks,
