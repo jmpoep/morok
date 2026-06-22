@@ -15542,6 +15542,10 @@ Function *windowsDebugObjectProbe(Module &M, GlobalVariable *State,
     constexpr std::uint64_t kObjectTypesHeaderBytes = 8;
     constexpr std::uint64_t kObjectTypeInfoFixedBytes = 0x68;
     constexpr std::uint32_t kObjectTypeWalkLimit = 64;
+    constexpr std::uint64_t kHandleInfoBufferBytes = 32768;
+    constexpr std::uint64_t kHandleInfoExHeaderBytes = 16;
+    constexpr std::uint64_t kHandleInfoExEntryBytes = 40;
+    constexpr std::uint32_t kHandleWalkLimit = 64;
     auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
                                 GlobalValue::PrivateLinkage,
                                 "morok.win.dbgobj.probe", &M);
@@ -15564,6 +15568,12 @@ Function *windowsDebugObjectProbe(Module &M, GlobalVariable *State,
     auto *objectBodyBB = BasicBlock::Create(ctx, "object.body", fn);
     auto *objectNextBB = BasicBlock::Create(ctx, "object.next", fn);
     auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+    auto *handleGateBB = BasicBlock::Create(ctx, "handle.gate", fn);
+    auto *handleQueryBB = BasicBlock::Create(ctx, "handle.query", fn);
+    auto *handleLoopBB = BasicBlock::Create(ctx, "handle.loop", fn);
+    auto *handleBodyBB = BasicBlock::Create(ctx, "handle.body", fn);
+    auto *handleNextBB = BasicBlock::Create(ctx, "handle.next", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "done", fn);
 
     IRBuilder<> B(entry);
     AllocaInst *retLen = B.CreateAlloca(i32, nullptr, "morok.win.dbgobj.retlen");
@@ -15575,15 +15585,27 @@ Function *windowsDebugObjectProbe(Module &M, GlobalVariable *State,
         B.CreateAlloca(i32, nullptr, "morok.win.dbgobj.debug.flags.slot");
     AllocaInst *debugObjectCount =
         B.CreateAlloca(i32, nullptr, "morok.win.dbgobj.object.count.slot");
+    AllocaInst *qsiSlot =
+        B.CreateAlloca(ip, nullptr, "morok.win.dbgobj.ntqsi.slot");
+    AllocaInst *handleMixSlot =
+        B.CreateAlloca(i64, nullptr, "morok.win.dbgobj.handle.mix.slot");
+    AllocaInst *handleIpcHits =
+        B.CreateAlloca(i32, nullptr, "morok.win.dbgobj.handle.ipc.hits.slot");
     auto *typesBufTy = ArrayType::get(i8, kObjectTypesBufferBytes);
     AllocaInst *typesBuf =
         B.CreateAlloca(typesBufTy, nullptr, "morok.win.dbgobj.types.buf");
+    auto *handleBufTy = ArrayType::get(i8, kHandleInfoBufferBytes);
+    AllocaInst *handleBuf =
+        B.CreateAlloca(handleBufTy, nullptr, "morok.win.dbgobj.handle.buf");
     B.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
     B.CreateStore(ConstantInt::get(ip, 0), debugPort)->setVolatile(true);
     B.CreateStore(ConstantInt::get(ip, 0), debugObject)->setVolatile(true);
     B.CreateStore(ConstantInt::get(i32, 1), debugFlags)->setVolatile(true);
     B.CreateStore(ConstantInt::get(i32, 0), debugObjectCount)
         ->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), qsiSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), handleMixSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), handleIpcHits)->setVolatile(true);
 
     Value *peb = B.CreateCall(pebReader, {}, "morok.win.dbgobj.peb");
     foldState(B, State, peb, rng.next(), "morok.win.dbgobj.peb.mix");
@@ -15605,8 +15627,14 @@ Function *windowsDebugObjectProbe(Module &M, GlobalVariable *State,
         resolver,
         {ntdll, ConstantInt::get(i64, fnv1aName("NtQueryObject"))},
         "morok.win.dbgobj.ntqo");
+    Value *qsi = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtQuerySystemInformation"))},
+        "morok.win.dbgobj.ntqsi");
+    RB.CreateStore(qsi, qsiSlot)->setVolatile(true);
     foldState(RB, State, qip, rng.next(), "morok.win.dbgobj.ntqip.mix");
     foldState(RB, State, qo, rng.next(), "morok.win.dbgobj.ntqo.mix");
+    foldState(RB, State, qsi, rng.next(), "morok.win.dbgobj.ntqsi.mix");
     RB.CreateCondBr(RB.CreateAnd(RB.CreateICmpNE(ntdll, ConstantInt::get(ip, 0)),
                                  RB.CreateICmpNE(qip, ConstantInt::get(ip, 0)),
                                  "morok.win.dbgobj.ntqip.ready"),
@@ -15853,7 +15881,194 @@ Function *windowsDebugObjectProbe(Module &M, GlobalVariable *State,
         RetB.CreateICmpNE(finalCount, ConstantInt::get(i32, 0),
                           "morok.win.dbgobj.object.debug.count.hit"),
         0xE019A8C35F7B62D4ULL, "morok.win.dbgobj.object.debug.count");
-    RetB.CreateRetVoid();
+    RetB.CreateBr(handleGateBB);
+
+    IRBuilder<> HGB(handleGateBB);
+    Value *qsiFinal =
+        HGB.CreateLoad(ip, qsiSlot, "morok.win.dbgobj.ntqsi.final");
+    cast<LoadInst>(qsiFinal)->setVolatile(true);
+    HGB.CreateCondBr(HGB.CreateICmpNE(qsiFinal, ConstantInt::get(ip, 0),
+                                      "morok.win.dbgobj.handle.qsi.ready"),
+                     handleQueryBB, doneBB);
+
+    IRBuilder<> HB(handleQueryBB);
+    auto *qsiTy = FunctionType::get(i32, {i32, ptr, i32, ptr}, false);
+    Value *qsiPtr =
+        HB.CreateIntToPtr(qsiFinal, ptr, "morok.win.dbgobj.ntqsi.ptr");
+    HB.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
+    storeAt(HB, M, handleBuf, 0ULL, ConstantInt::get(ip, 0),
+            "morok.win.dbgobj.handle.legacy.clear");
+    Value *legacyStatus = HB.CreateCall(
+        qsiTy, qsiPtr,
+        {ConstantInt::get(i32, 0x10), handleBuf,
+         ConstantInt::get(i32, kHandleInfoBufferBytes), retLen},
+        "morok.win.dbgobj.handle.legacy.status");
+    Value *legacyLen =
+        HB.CreateLoad(i32, retLen, "morok.win.dbgobj.handle.legacy.retlen");
+    cast<LoadInst>(legacyLen)->setVolatile(true);
+    foldState(HB, State, legacyStatus, rng.next(),
+              "morok.win.dbgobj.handle.legacy.status.mix");
+    foldState(HB, State, legacyLen, rng.next(),
+              "morok.win.dbgobj.handle.legacy.retlen.mix");
+
+    HB.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
+    storeAt(HB, M, handleBuf, 0ULL, ConstantInt::get(ip, 0),
+            "morok.win.dbgobj.handle.ext.count.clear");
+    storeAt(HB, M, handleBuf, 8, ConstantInt::get(ip, 0),
+            "morok.win.dbgobj.handle.ext.reserved.clear");
+    Value *extendedStatus = HB.CreateCall(
+        qsiTy, qsiPtr,
+        {ConstantInt::get(i32, 0x40), handleBuf,
+         ConstantInt::get(i32, kHandleInfoBufferBytes), retLen},
+        "morok.win.dbgobj.handle.ext.status");
+    Value *extendedLen =
+        HB.CreateLoad(i32, retLen, "morok.win.dbgobj.handle.ext.retlen");
+    cast<LoadInst>(extendedLen)->setVolatile(true);
+    Value *extendedCount =
+        loadAt(HB, M, ip, handleBuf, 0ULL, "morok.win.dbgobj.handle.ext.count");
+    Value *legacyOk = HB.CreateICmpSGE(legacyStatus, ConstantInt::get(i32, 0),
+                                       "morok.win.dbgobj.handle.legacy.ok");
+    Value *extendedOk = HB.CreateICmpSGE(extendedStatus, ConstantInt::get(i32, 0),
+                                         "morok.win.dbgobj.handle.ext.ok");
+    Value *queryDiverged =
+        HB.CreateXor(legacyOk, extendedOk, "morok.win.dbgobj.handle.query.diverged");
+    Value *handleWalkLimit = HB.CreateSelect(
+        HB.CreateICmpULT(extendedCount, ConstantInt::get(ip, kHandleWalkLimit),
+                         "morok.win.dbgobj.handle.count.under.cap"),
+        extendedCount, ConstantInt::get(ip, kHandleWalkLimit),
+        "morok.win.dbgobj.handle.walk.limit");
+    foldState(HB, State, extendedStatus, rng.next(),
+              "morok.win.dbgobj.handle.ext.status.mix");
+    foldState(HB, State, extendedLen, rng.next(),
+              "morok.win.dbgobj.handle.ext.retlen.mix");
+    foldState(HB, State, extendedCount, rng.next(),
+              "morok.win.dbgobj.handle.ext.count.mix");
+    foldFlag(HB, State, queryDiverged, 0x52D1B80C7649A3EFULL,
+             "morok.win.dbgobj.handle.query.diverged");
+    HB.CreateCondBr(
+        HB.CreateAnd(extendedOk,
+                     HB.CreateICmpNE(handleWalkLimit, ConstantInt::get(ip, 0),
+                                     "morok.win.dbgobj.handle.walk.nonempty"),
+                     "morok.win.dbgobj.handle.walk.ready"),
+        handleLoopBB, doneBB);
+
+    IRBuilder<> HLB(handleLoopBB);
+    auto *handleIdx = HLB.CreatePHI(ip, 2, "morok.win.dbgobj.handle.idx");
+    handleIdx->addIncoming(ConstantInt::get(ip, 0), handleQueryBB);
+    HLB.CreateCondBr(HLB.CreateICmpULT(handleIdx, handleWalkLimit,
+                                       "morok.win.dbgobj.handle.idx.ok"),
+                     handleBodyBB, doneBB);
+
+    IRBuilder<> HBody(handleBodyBB);
+    Value *entryOff = HBody.CreateAdd(
+        ConstantInt::get(ip, kHandleInfoExHeaderBytes),
+        HBody.CreateMul(handleIdx, ConstantInt::get(ip, kHandleInfoExEntryBytes),
+                        "morok.win.dbgobj.handle.entry.mul"),
+        "morok.win.dbgobj.handle.entry.off");
+    Value *pidOff =
+        HBody.CreateAdd(entryOff, ConstantInt::get(ip, 8),
+                        "morok.win.dbgobj.handle.pid.off");
+    Value *handleValueOff =
+        HBody.CreateAdd(entryOff, ConstantInt::get(ip, 16),
+                        "morok.win.dbgobj.handle.value.off");
+    Value *accessOff =
+        HBody.CreateAdd(entryOff, ConstantInt::get(ip, 24),
+                        "morok.win.dbgobj.handle.access.off");
+    Value *typeOff =
+        HBody.CreateAdd(entryOff, ConstantInt::get(ip, 30),
+                        "morok.win.dbgobj.handle.type.off");
+    Value *attrsOff =
+        HBody.CreateAdd(entryOff, ConstantInt::get(ip, 32),
+                        "morok.win.dbgobj.handle.attrs.off");
+    Value *objectValue =
+        loadAt(HBody, M, ip, handleBuf, entryOff,
+               "morok.win.dbgobj.handle.object");
+    Value *pidValue =
+        loadAt(HBody, M, ip, handleBuf, pidOff, "morok.win.dbgobj.handle.pid");
+    Value *handleValue =
+        loadAt(HBody, M, ip, handleBuf, handleValueOff,
+               "morok.win.dbgobj.handle.value");
+    Value *accessMask =
+        loadAt(HBody, M, i32, handleBuf, accessOff,
+               "morok.win.dbgobj.handle.access");
+    Value *typeIndex =
+        loadAt(HBody, M, i16, handleBuf, typeOff,
+               "morok.win.dbgobj.handle.type");
+    Value *attrs =
+        loadAt(HBody, M, i32, handleBuf, attrsOff,
+               "morok.win.dbgobj.handle.attrs");
+    Value *accessBits =
+        HBody.CreateAnd(accessMask, ConstantInt::get(i32, 0x001F0003),
+                        "morok.win.dbgobj.handle.ipc.access.bits");
+    Value *ipcCandidate = HBody.CreateAnd(
+        HBody.CreateAnd(HBody.CreateICmpNE(objectValue, ConstantInt::get(ip, 0),
+                                          "morok.win.dbgobj.handle.object.present"),
+                        HBody.CreateICmpNE(typeIndex, ConstantInt::get(i16, 0),
+                                           "morok.win.dbgobj.handle.type.present"),
+                        "morok.win.dbgobj.handle.ipc.object.typed"),
+        HBody.CreateICmpNE(accessBits, ConstantInt::get(i32, 0),
+                           "morok.win.dbgobj.handle.ipc.access.present"),
+        "morok.win.dbgobj.handle.ipc.candidate");
+    Value *oldMix =
+        HBody.CreateLoad(i64, handleMixSlot, "morok.win.dbgobj.handle.mix.old");
+    cast<LoadInst>(oldMix)->setVolatile(true);
+    Value *entryMix = HBody.CreateXor(
+        HBody.CreateXor(objectValue,
+                        HBody.CreateShl(pidValue, ConstantInt::get(ip, 17),
+                                        "morok.win.dbgobj.handle.pid.shift"),
+                        "morok.win.dbgobj.handle.object.pid.mix"),
+        HBody.CreateXor(
+            handleValue,
+            HBody.CreateOr(
+                HBody.CreateShl(HBody.CreateZExt(typeIndex, i64),
+                                ConstantInt::get(i64, 48),
+                                "morok.win.dbgobj.handle.type.shift"),
+                HBody.CreateOr(HBody.CreateZExt(accessMask, i64),
+                               HBody.CreateShl(HBody.CreateZExt(attrs, i64),
+                                               ConstantInt::get(i64, 32),
+                                               "morok.win.dbgobj.handle.attrs.shift"),
+                               "morok.win.dbgobj.handle.access.attrs.mix"),
+                "morok.win.dbgobj.handle.meta.mix"),
+            "morok.win.dbgobj.handle.value.meta.mix"),
+        "morok.win.dbgobj.handle.entry.mix");
+    Value *nextMix = HBody.CreateXor(
+        HBody.CreateMul(oldMix, ConstantInt::get(i64, 0x9E3779B185EBCA87ULL),
+                        "morok.win.dbgobj.handle.mix.mul"),
+        entryMix, "morok.win.dbgobj.handle.mix.next");
+    HBody.CreateStore(nextMix, handleMixSlot)->setVolatile(true);
+    Value *oldHits = HBody.CreateLoad(i32, handleIpcHits,
+                                      "morok.win.dbgobj.handle.ipc.hits.old");
+    cast<LoadInst>(oldHits)->setVolatile(true);
+    Value *nextHits =
+        HBody.CreateAdd(oldHits, HBody.CreateZExt(ipcCandidate, i32),
+                        "morok.win.dbgobj.handle.ipc.hits.next");
+    HBody.CreateStore(nextHits, handleIpcHits)->setVolatile(true);
+    HBody.CreateBr(handleNextBB);
+
+    IRBuilder<> HNB(handleNextBB);
+    Value *nextHandleIdx =
+        HNB.CreateAdd(handleIdx, ConstantInt::get(ip, 1),
+                      "morok.win.dbgobj.handle.next.idx");
+    HNB.CreateBr(handleLoopBB);
+    handleIdx->addIncoming(nextHandleIdx, handleNextBB);
+
+    IRBuilder<> DoneB(doneBB);
+    Value *finalHandleMix =
+        DoneB.CreateLoad(i64, handleMixSlot, "morok.win.dbgobj.handle.walk.hash");
+    cast<LoadInst>(finalHandleMix)->setVolatile(true);
+    Value *finalIpcHits =
+        DoneB.CreateLoad(i32, handleIpcHits, "morok.win.dbgobj.handle.ipc.hits");
+    cast<LoadInst>(finalIpcHits)->setVolatile(true);
+    foldState(DoneB, State, finalHandleMix, rng.next(),
+              "morok.win.dbgobj.handle.walk.hash.mix");
+    foldState(DoneB, State, finalIpcHits, rng.next(),
+              "morok.win.dbgobj.handle.ipc.hits.mix");
+    foldFlag(DoneB, State,
+             DoneB.CreateICmpNE(finalIpcHits, ConstantInt::get(i32, 0),
+                                "morok.win.dbgobj.handle.ipc.telemetry"),
+             0xC6340F2B9E51D478ULL,
+             "morok.win.dbgobj.handle.ipc.telemetry");
+    DoneB.CreateRetVoid();
     return fn;
 }
 

@@ -18015,12 +18015,14 @@ define i32 @main() { ret i32 0 }
     checkSealEnforcement(*M, *Probe);
     CHECK(M->getFunction("NtQueryInformationProcess") == nullptr);
     CHECK(M->getFunction("NtQueryObject") == nullptr);
+    CHECK(M->getFunction("NtQuerySystemInformation") == nullptr);
     CHECK(hasInlineAsmCall(*Peb));
     CHECK(countNamedInstructions(*Ldr, "morok.win.ldr.name.hash") >= 1u);
     CHECK(countNamedInstructions(*WideHash, "morok.win.wide.lower") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.dbgobj.ntdll") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.dbgobj.ntqip") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.dbgobj.ntqo") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.dbgobj.ntqsi") >= 1u);
     CHECK(countNamedInstructions(*Probe,
                                  "morok.win.dbgobj.debug.port.status") >= 1u);
     CHECK(countNamedInstructions(*Probe,
@@ -18045,6 +18047,23 @@ define i32 @main() { ret i32 0 }
           1u);
     CHECK(countNamedInstructions(*Probe,
                                  "morok.win.dbgobj.object.name.end.ok") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.dbgobj.handle.legacy.status") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.dbgobj.handle.ext.status") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.dbgobj.handle.walk.limit") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.dbgobj.handle.entry.mix") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.dbgobj.handle.walk.hash") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.dbgobj.handle.ipc.hits") >= 1u);
+    Instruction *IpcTelemetry =
+        findNamedInstruction(*Probe, "morok.win.dbgobj.handle.ipc.telemetry");
+    REQUIRE(IpcTelemetry != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(IpcTelemetry,
+                                           "morok.seal.fold.anti_debug"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
