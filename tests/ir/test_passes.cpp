@@ -18540,6 +18540,10 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.win.attach.invalid.exception.seen",
                                true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.attach.invalid.exception.armed",
+                               true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.attach.invalid.exception.thread",
+                               true) != nullptr);
     CHECK(M->getGlobalVariable("morok.win.attach.uef.reached", true) !=
           nullptr);
     checkSealEnforcement(*M, *Probe);
@@ -18605,12 +18609,28 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Invalid,
                                  "morok.win.attach.closehandle.invalid") >= 1u);
     CHECK(countNamedInstructions(*Invalid,
+                                 "morok.win.attach.invalid.nt.thread") >= 1u);
+    CHECK(countNamedInstructions(*Invalid,
+                                 "morok.win.attach.invalid.close.thread") >= 1u);
+    CHECK(countNamedInstructions(*Invalid,
                                  "morok.win.attach.invalid.veh.handle") >= 1u);
     CHECK(countNamedInstructions(*Invalid,
                                  "morok.win.attach.invalid.remove.status") >=
           1u);
     CHECK(countNamedInstructions(
               *InvalidVeh, "morok.win.attach.invalid.exception.code") >= 1u);
+    CHECK(countNamedInstructions(
+              *InvalidVeh, "morok.win.attach.invalid.exception.armed") >= 1u);
+    CHECK(countNamedInstructions(
+              *InvalidVeh, "morok.win.attach.invalid.exception.thread") >= 1u);
+    CHECK(countNamedInstructions(
+              *InvalidVeh,
+              "morok.win.attach.invalid.exception.current.thread") >= 1u);
+    CHECK(countNamedInstructions(
+              *InvalidVeh, "morok.win.attach.invalid.exception.thread.match") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *InvalidVeh, "morok.win.attach.invalid.exception.owned") >= 1u);
     CHECK(countNamedInstructions(
               *InvalidVeh, "morok.win.attach.invalid.exception.marker") >= 1u);
     Instruction *InvalidDelivered = findNamedInstruction(

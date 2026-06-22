@@ -17923,6 +17923,47 @@ GlobalVariable *windowsInvalidHandleExceptionSeen(Module &M) {
     return gv;
 }
 
+GlobalVariable *windowsInvalidHandleExceptionArmed(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.win.attach.invalid.exception.armed",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i32, 0),
+        "morok.win.attach.invalid.exception.armed");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *windowsInvalidHandleExceptionThread(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.win.attach.invalid.exception.thread",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *ip = intPtrTy(M);
+    auto *gv = new GlobalVariable(
+        M, ip, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(ip, 0),
+        "morok.win.attach.invalid.exception.thread");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(8));
+    return gv;
+}
+
+Value *windowsCurrentTebThread(IRBuilder<> &B, Module &M, const Twine &Name) {
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(M.getContext());
+    Function *tebReader = windowsTebReader(M);
+    if (!tebReader)
+        return ConstantInt::get(ip, 0);
+
+    Value *teb = B.CreateCall(tebReader, {}, Name + ".teb");
+    Value *tebPtr = B.CreateIntToPtr(teb, ptr, Name + ".teb.ptr");
+    return loadAt(B, M, ip, tebPtr, 0x48ULL, Name);
+}
+
 Function *windowsInvalidHandleExceptionHandler(Module &M) {
     if (Function *existing =
             M.getFunction("morok.win.attach.invalid.exception.handler"))
@@ -17944,6 +17985,7 @@ Function *windowsInvalidHandleExceptionHandler(Module &M) {
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
     auto *readBB = BasicBlock::Create(ctx, "read", fn);
     auto *inspectBB = BasicBlock::Create(ctx, "inspect", fn);
+    auto *ownedBB = BasicBlock::Create(ctx, "owned", fn);
     auto *hitBB = BasicBlock::Create(ctx, "hit", fn);
     auto *searchBB = BasicBlock::Create(ctx, "search", fn);
 
@@ -17968,7 +18010,30 @@ Function *windowsInvalidHandleExceptionHandler(Module &M) {
     IB.CreateCondBr(
         IB.CreateICmpEQ(code, ConstantInt::get(i32, 0xC0000008ULL),
                         "morok.win.attach.invalid.exception.code.match"),
-        hitBB, searchBB);
+        ownedBB, searchBB);
+
+    IRBuilder<> OB(ownedBB);
+    Value *armed =
+        OB.CreateLoad(i32, windowsInvalidHandleExceptionArmed(M),
+                      "morok.win.attach.invalid.exception.armed");
+    cast<LoadInst>(armed)->setVolatile(true);
+    Value *owner =
+        OB.CreateLoad(ip, windowsInvalidHandleExceptionThread(M),
+                      "morok.win.attach.invalid.exception.thread");
+    cast<LoadInst>(owner)->setVolatile(true);
+    Value *current =
+        windowsCurrentTebThread(OB, M,
+                                "morok.win.attach.invalid.exception.current.thread");
+    Value *owned = OB.CreateAnd(
+        OB.CreateAnd(OB.CreateICmpNE(armed, ConstantInt::get(i32, 0),
+                                     "morok.win.attach.invalid.exception.armed.on"),
+                     OB.CreateICmpNE(owner, ConstantInt::get(ip, 0),
+                                     "morok.win.attach.invalid.exception.thread.set"),
+                     "morok.win.attach.invalid.exception.thread.ready"),
+        OB.CreateICmpEQ(owner, current,
+                        "morok.win.attach.invalid.exception.thread.match"),
+        "morok.win.attach.invalid.exception.owned");
+    OB.CreateCondBr(owned, hitBB, searchBB);
 
     IRBuilder<> HB(hitBB);
     Value *recordBits =
@@ -18014,6 +18079,8 @@ Function *windowsInvalidHandleProbeHelper(Module &M) {
     rtlRemove->setName("rtlremoveveh");
     Function *vehHandler = windowsInvalidHandleExceptionHandler(M);
     GlobalVariable *exceptionSeen = windowsInvalidHandleExceptionSeen(M);
+    GlobalVariable *exceptionArmed = windowsInvalidHandleExceptionArmed(M);
+    GlobalVariable *exceptionThread = windowsInvalidHandleExceptionThread(M);
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
     auto *registerBB = BasicBlock::Create(ctx, "register", fn);
@@ -18032,6 +18099,8 @@ Function *windowsInvalidHandleProbeHelper(Module &M) {
     B.CreateStore(ConstantInt::get(i64, 0), mix)->setVolatile(true);
     B.CreateStore(ConstantPointerNull::get(ptr), vehHandle)->setVolatile(true);
     B.CreateStore(ConstantInt::get(i32, 0), exceptionSeen)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), exceptionArmed)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), exceptionThread)->setVolatile(true);
     Value *vehReady = B.CreateAnd(
         B.CreateICmpNE(rtlAdd, ConstantInt::get(ip, 0),
                        "morok.win.attach.invalid.rtladd.ready"),
@@ -18057,10 +18126,17 @@ Function *windowsInvalidHandleProbeHelper(Module &M) {
 
     IRBuilder<> NB(ntBB);
     auto *closeTy = FunctionType::get(i32, {ptr}, false);
+    Value *ntThread =
+        windowsCurrentTebThread(NB, M, "morok.win.attach.invalid.nt.thread");
+    NB.CreateStore(ntThread, exceptionThread)->setVolatile(true);
+    NB.CreateStore(ConstantInt::get(i32, 0x5A17C1A3), exceptionArmed)
+        ->setVolatile(true);
     Value *ntStatus = NB.CreateCall(
         closeTy, NB.CreateIntToPtr(ntClose, ptr, "morok.win.attach.ntclose.ptr"),
         {NB.CreateIntToPtr(ConstantInt::get(ip, 0xDEADDEADULL), ptr)},
         "morok.win.attach.ntclose.invalid");
+    NB.CreateStore(ConstantInt::get(i32, 0), exceptionArmed)->setVolatile(true);
+    NB.CreateStore(ConstantInt::get(ip, 0), exceptionThread)->setVolatile(true);
     NB.CreateStore(NB.CreateZExt(ntStatus, i64), mix)->setVolatile(true);
     NB.CreateBr(closeGateBB);
 
@@ -18073,11 +18149,18 @@ Function *windowsInvalidHandleProbeHelper(Module &M) {
     Value *oldMix =
         CB.CreateLoad(i64, mix, "morok.win.attach.invalid.old");
     cast<LoadInst>(oldMix)->setVolatile(true);
+    Value *closeThread =
+        windowsCurrentTebThread(CB, M, "morok.win.attach.invalid.close.thread");
+    CB.CreateStore(closeThread, exceptionThread)->setVolatile(true);
+    CB.CreateStore(ConstantInt::get(i32, 0x6C2B491D), exceptionArmed)
+        ->setVolatile(true);
     Value *closeResult = CB.CreateCall(
         closeTy,
         CB.CreateIntToPtr(closeHandle, ptr, "morok.win.attach.closehandle.ptr"),
         {CB.CreateIntToPtr(ConstantInt::get(ip, 0xDEADFEEDULL), ptr)},
         "morok.win.attach.closehandle.invalid");
+    CB.CreateStore(ConstantInt::get(i32, 0), exceptionArmed)->setVolatile(true);
+    CB.CreateStore(ConstantInt::get(ip, 0), exceptionThread)->setVolatile(true);
     Value *nextMix = CB.CreateXor(
         oldMix, CB.CreateShl(CB.CreateZExt(closeResult, i64),
                              ConstantInt::get(i64, 32)),
