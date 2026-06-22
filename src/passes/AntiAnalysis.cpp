@@ -16412,6 +16412,73 @@ Function *windowsDirectSyscall11Thunk(Module &M) {
     return fn;
 }
 
+Function *windowsDirectSyscall6Thunk(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.sys.direct6"))
+        return existing;
+    const Triple TT(M.getTargetTriple());
+    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64)
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *fn = Function::Create(
+        FunctionType::get(ip, {i32, ip, ip, ip, ip, ip, ip}, false),
+        GlobalValue::PrivateLinkage, "morok.win.sys.direct6", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    auto *asmTy = FunctionType::get(ip, {i32, ip, ip, ip, ip, ip, ip}, false);
+    InlineAsm *IA = InlineAsm::get(
+        asmTy,
+        "subq $$0x40, %rsp\nmovq $6, 0x28(%rsp)\nmovq $7, 0x30(%rsp)\n"
+        "movq %rcx, %r10\nsyscall\naddq $$0x40, %rsp",
+        "={rax},{eax},{rcx},{rdx},{r8},{r9},r,r,~{r10},~{r11},~{memory},"
+        "~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    SmallVector<Value *, 7> args;
+    for (Argument &A : fn->args())
+        args.push_back(&A);
+    B.CreateRet(B.CreateCall(asmTy, IA, args, "morok.win.sys.direct6.ret"));
+    return fn;
+}
+
+Function *windowsDirectSyscall7Thunk(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.sys.direct7"))
+        return existing;
+    const Triple TT(M.getTargetTriple());
+    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64)
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *fn = Function::Create(
+        FunctionType::get(ip, {i32, ip, ip, ip, ip, ip, ip, ip}, false),
+        GlobalValue::PrivateLinkage, "morok.win.sys.direct7", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    auto *asmTy =
+        FunctionType::get(ip, {i32, ip, ip, ip, ip, ip, ip, ip}, false);
+    InlineAsm *IA = InlineAsm::get(
+        asmTy,
+        "subq $$0x40, %rsp\nmovq $6, 0x28(%rsp)\nmovq $7, 0x30(%rsp)\n"
+        "movq $8, 0x38(%rsp)\nmovq %rcx, %r10\nsyscall\naddq $$0x40, %rsp",
+        "={rax},{eax},{rcx},{rdx},{r8},{r9},r,r,r,~{r10},~{r11},~{memory},"
+        "~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    SmallVector<Value *, 8> args;
+    for (Argument &A : fn->args())
+        args.push_back(&A);
+    B.CreateRet(B.CreateCall(asmTy, IA, args, "morok.win.sys.direct7.ret"));
+    return fn;
+}
+
 Function *windowsIndirectSyscallThunk(Module &M) {
     if (Function *existing = M.getFunction("morok.win.sys.indirect"))
         return existing;
@@ -21152,6 +21219,363 @@ Function *windowsSyscallsProbe(Module &M, GlobalVariable *State,
     return fn;
 }
 
+Function *windowsWriteWatchProbe(Module &M, GlobalVariable *State,
+                                 ir::IRRandom &rng, const Triple &TT) {
+    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
+        intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.win.writewatch.probe"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    constexpr std::uint64_t kRegionBytes = 0x2000;
+    constexpr std::uint32_t kDirtyPageLimit = 8;
+    constexpr std::uint32_t kMemCommit = 0x00001000u;
+    constexpr std::uint32_t kMemReserve = 0x00002000u;
+    constexpr std::uint32_t kMemRelease = 0x00008000u;
+    constexpr std::uint32_t kMemWriteWatch = 0x00200000u;
+    constexpr std::uint32_t kPageReadWrite = 0x04u;
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.writewatch.probe", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    Function *pebReader = windowsPebReader(M);
+    Function *moduleByHash = windowsLdrModuleByHash(M);
+    Function *resolver = windowsPeExportResolver(M);
+    Function *scanner = windowsSyscallStubScanner(M);
+    Function *direct = windowsDirectSyscallThunk(M);
+    Function *direct6 = windowsDirectSyscall6Thunk(M);
+    Function *direct7 = windowsDirectSyscall7Thunk(M);
+    if (!pebReader || !moduleByHash || !resolver || !scanner || !direct ||
+        !direct6 || !direct7)
+        return nullptr;
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *resolveBB = BasicBlock::Create(ctx, "resolve", fn);
+    auto *allocBB = BasicBlock::Create(ctx, "alloc", fn);
+    auto *seedBB = BasicBlock::Create(ctx, "seed", fn);
+    auto *resetBB = BasicBlock::Create(ctx, "reset", fn);
+    auto *queryBB = BasicBlock::Create(ctx, "query", fn);
+    auto *scanLoopBB = BasicBlock::Create(ctx, "scan.loop", fn);
+    auto *scanBodyBB = BasicBlock::Create(ctx, "scan.body", fn);
+    auto *scanNextBB = BasicBlock::Create(ctx, "scan.next", fn);
+    auto *cleanupBB = BasicBlock::Create(ctx, "cleanup", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *baseSlot =
+        B.CreateAlloca(ptr, nullptr, "morok.win.writewatch.base.slot");
+    AllocaInst *sizeSlot =
+        B.CreateAlloca(ip, nullptr, "morok.win.writewatch.size.slot");
+    AllocaInst *freeSizeSlot =
+        B.CreateAlloca(ip, nullptr, "morok.win.writewatch.free.size.slot");
+    AllocaInst *countSlot =
+        B.CreateAlloca(ip, nullptr, "morok.win.writewatch.count.slot");
+    AllocaInst *granularitySlot =
+        B.CreateAlloca(i32, nullptr, "morok.win.writewatch.granularity.slot");
+    AllocaInst *int3Slot =
+        B.CreateAlloca(i8, nullptr, "morok.win.writewatch.int3.slot");
+    auto *dirtyArrayTy = ArrayType::get(ptr, kDirtyPageLimit);
+    AllocaInst *dirtyPages =
+        B.CreateAlloca(dirtyArrayTy, nullptr, "morok.win.writewatch.pages");
+    B.CreateStore(ConstantPointerNull::get(ptr), baseSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, kRegionBytes), sizeSlot)
+        ->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), freeSizeSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, kDirtyPageLimit), countSlot)
+        ->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), granularitySlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i8, 0), int3Slot)->setVolatile(true);
+    Value *peb = B.CreateCall(pebReader, {}, "morok.win.writewatch.peb");
+    foldState(B, State, peb, rng.next(), "morok.win.writewatch.peb.mix");
+    B.CreateCondBr(B.CreateICmpNE(peb, ConstantInt::get(ip, 0),
+                                  "morok.win.writewatch.peb.present"),
+                   resolveBB, retBB);
+
+    IRBuilder<> RB(resolveBB);
+    Value *ntdll = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("ntdll.dll"))},
+        "morok.win.writewatch.ntdll");
+    Value *ntAlloc = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtAllocateVirtualMemory"))},
+        "morok.win.writewatch.ntalloc");
+    Value *ntGet = RB.CreateCall(
+        resolver, {ntdll, ConstantInt::get(i64, fnv1aName("NtGetWriteWatch"))},
+        "morok.win.writewatch.ntget");
+    Value *ntReset = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtResetWriteWatch"))},
+        "morok.win.writewatch.ntreset");
+    Value *ntFree = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtFreeVirtualMemory"))},
+        "morok.win.writewatch.ntfree");
+    Value *allocPack = RB.CreateCall(
+        scanner,
+        {RB.CreateIntToPtr(ntAlloc, ptr, "morok.win.writewatch.ntalloc.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.win.writewatch.ntalloc.pack");
+    Value *getPack = RB.CreateCall(
+        scanner,
+        {RB.CreateIntToPtr(ntGet, ptr, "morok.win.writewatch.ntget.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.win.writewatch.ntget.pack");
+    Value *resetPack = RB.CreateCall(
+        scanner,
+        {RB.CreateIntToPtr(ntReset, ptr, "morok.win.writewatch.ntreset.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.win.writewatch.ntreset.pack");
+    Value *freePack = RB.CreateCall(
+        scanner,
+        {RB.CreateIntToPtr(ntFree, ptr, "morok.win.writewatch.ntfree.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.win.writewatch.ntfree.pack");
+    Value *allocSsn =
+        RB.CreateTrunc(allocPack, i32, "morok.win.writewatch.ntalloc.ssn");
+    Value *getSsn =
+        RB.CreateTrunc(getPack, i32, "morok.win.writewatch.ntget.ssn");
+    Value *resetSsn =
+        RB.CreateTrunc(resetPack, i32, "morok.win.writewatch.ntreset.ssn");
+    Value *freeSsn =
+        RB.CreateTrunc(freePack, i32, "morok.win.writewatch.ntfree.ssn");
+    foldState(RB, State, ntdll, rng.next(), "morok.win.writewatch.ntdll.mix");
+    foldState(RB, State, allocPack, rng.next(),
+              "morok.win.writewatch.ntalloc.pack.mix");
+    foldState(RB, State, getPack, rng.next(),
+              "morok.win.writewatch.ntget.pack.mix");
+    foldState(RB, State, resetPack, rng.next(),
+              "morok.win.writewatch.ntreset.pack.mix");
+    Value *exportsReady = RB.CreateAnd(
+        RB.CreateAnd(RB.CreateICmpNE(ntAlloc, ConstantInt::get(ip, 0)),
+                     RB.CreateICmpNE(ntGet, ConstantInt::get(ip, 0)),
+                     "morok.win.writewatch.nt.export.alloc.get"),
+        RB.CreateAnd(RB.CreateICmpNE(ntReset, ConstantInt::get(ip, 0)),
+                     RB.CreateICmpNE(ntFree, ConstantInt::get(ip, 0)),
+                     "morok.win.writewatch.nt.export.reset.free"),
+        "morok.win.writewatch.nt.exports.ready");
+    Value *syscallsReady = RB.CreateAnd(
+        RB.CreateAnd(RB.CreateICmpNE(allocSsn, ConstantInt::get(i32, 0)),
+                     RB.CreateICmpNE(getSsn, ConstantInt::get(i32, 0)),
+                     "morok.win.writewatch.nt.ssn.alloc.get"),
+        RB.CreateAnd(RB.CreateICmpNE(resetSsn, ConstantInt::get(i32, 0)),
+                     RB.CreateICmpNE(freeSsn, ConstantInt::get(i32, 0)),
+                     "morok.win.writewatch.nt.ssn.reset.free"),
+        "morok.win.writewatch.nt.syscalls.ready");
+    Value *ready =
+        RB.CreateAnd(RB.CreateICmpNE(ntdll, ConstantInt::get(ip, 0)),
+                     RB.CreateAnd(exportsReady, syscallsReady,
+                                  "morok.win.writewatch.nt.ready.bits"),
+                     "morok.win.writewatch.ready");
+    foldFlag(RB, State, RB.CreateNot(ready, "morok.win.writewatch.unavailable"),
+             0x78C46A2B9D10F3E5ULL, "morok.win.writewatch.unavailable");
+    RB.CreateCondBr(ready, allocBB, retBB);
+
+    IRBuilder<> AB(allocBB);
+    Value *baseSlotIp =
+        AB.CreatePtrToInt(baseSlot, ip, "morok.win.writewatch.base.slot.ip");
+    Value *sizeSlotIp =
+        AB.CreatePtrToInt(sizeSlot, ip, "morok.win.writewatch.size.slot.ip");
+    Value *allocType =
+        ConstantInt::get(ip, kMemCommit | kMemReserve | kMemWriteWatch);
+    Value *allocProtect = ConstantInt::get(ip, kPageReadWrite);
+    auto *direct6Ty = direct6->getFunctionType();
+    Value *allocStatus = AB.CreateCall(
+        direct6Ty, direct6,
+        {allocSsn, ConstantInt::getSigned(ip, -1), baseSlotIp,
+         ConstantInt::get(ip, 0), sizeSlotIp, allocType, allocProtect},
+        "morok.win.writewatch.ntalloc.status");
+    Value *allocStatus32 = AB.CreateTrunc(
+        allocStatus, i32, "morok.win.writewatch.ntalloc.status.i32");
+    Value *basePtr = AB.CreateLoad(ptr, baseSlot, "morok.win.writewatch.base");
+    cast<LoadInst>(basePtr)->setVolatile(true);
+    Value *allocOk = AB.CreateICmpSGE(allocStatus32, ConstantInt::get(i32, 0),
+                                      "morok.win.writewatch.ntalloc.ok");
+    Value *baseOk = AB.CreateICmpNE(basePtr, ConstantPointerNull::get(ptr),
+                                    "morok.win.writewatch.base.ok");
+    Value *allocReady =
+        AB.CreateAnd(allocOk, baseOk, "morok.win.writewatch.alloc.ready");
+    foldState(AB, State, allocStatus, rng.next(),
+              "morok.win.writewatch.ntalloc.status.mix");
+    foldState(AB, State, basePtr, rng.next(), "morok.win.writewatch.base.mix");
+    foldFlag(AB, State,
+             AB.CreateNot(allocReady, "morok.win.writewatch.ntalloc.weak"),
+             0xA72E58D1C4096B3FULL, "morok.win.writewatch.ntalloc.weak");
+    AB.CreateCondBr(allocReady, seedBB, retBB);
+
+    IRBuilder<> SB(seedBB);
+    storeAt(SB, M, basePtr, 0ULL, ConstantInt::get(i64, rng.next() | 1ULL),
+            "morok.win.writewatch.seed.0");
+    storeAt(SB, M, basePtr, 16, ConstantInt::get(i64, rng.next() | 1ULL),
+            "morok.win.writewatch.seed.1");
+    storeAt(SB, M, basePtr, 0x1000, ConstantInt::get(i64, rng.next() | 1ULL),
+            "morok.win.writewatch.seed.2");
+    SB.CreateBr(resetBB);
+
+    IRBuilder<> ResetB(resetBB);
+    Value *baseIp =
+        ResetB.CreatePtrToInt(basePtr, ip, "morok.win.writewatch.base.ip");
+    Value *regionSize =
+        ResetB.CreateLoad(ip, sizeSlot, "morok.win.writewatch.size");
+    cast<LoadInst>(regionSize)->setVolatile(true);
+    auto *directTy = direct->getFunctionType();
+    Value *resetStatus =
+        ResetB.CreateCall(directTy, direct,
+                          {resetSsn, ConstantInt::getSigned(ip, -1), baseIp,
+                           regionSize, ConstantInt::get(ip, 0)},
+                          "morok.win.writewatch.ntreset.status");
+    Value *resetStatus32 = ResetB.CreateTrunc(
+        resetStatus, i32, "morok.win.writewatch.ntreset.status.i32");
+    Value *resetOk =
+        ResetB.CreateICmpSGE(resetStatus32, ConstantInt::get(i32, 0),
+                             "morok.win.writewatch.ntreset.ok");
+    foldState(ResetB, State, resetStatus, rng.next(),
+              "morok.win.writewatch.ntreset.status.mix");
+    foldFlag(ResetB, State,
+             ResetB.CreateNot(resetOk, "morok.win.writewatch.ntreset.weak"),
+             0x3E40B9D2C1576A8FULL, "morok.win.writewatch.ntreset.weak");
+    ResetB.CreateCondBr(resetOk, queryBB, cleanupBB);
+
+    IRBuilder<> QB(queryBB);
+    QB.CreateStore(ConstantInt::get(ip, kDirtyPageLimit), countSlot)
+        ->setVolatile(true);
+    QB.CreateStore(ConstantInt::get(i32, 0), granularitySlot)
+        ->setVolatile(true);
+    Value *dirtyPtr =
+        QB.CreateInBoundsGEP(dirtyArrayTy, dirtyPages,
+                             {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+                             "morok.win.writewatch.pages.ptr");
+    Value *dirtyPtrIp =
+        QB.CreatePtrToInt(dirtyPtr, ip, "morok.win.writewatch.pages.ip");
+    Value *countSlotIp =
+        QB.CreatePtrToInt(countSlot, ip, "morok.win.writewatch.count.slot.ip");
+    Value *granularityIp = QB.CreatePtrToInt(
+        granularitySlot, ip, "morok.win.writewatch.granularity.slot.ip");
+    auto *direct7Ty = direct7->getFunctionType();
+    Value *getStatus = QB.CreateCall(
+        direct7Ty, direct7,
+        {getSsn, ConstantInt::getSigned(ip, -1), ConstantInt::get(ip, 0),
+         baseIp, regionSize, dirtyPtrIp, countSlotIp, granularityIp},
+        "morok.win.writewatch.ntget.status");
+    Value *getStatus32 =
+        QB.CreateTrunc(getStatus, i32, "morok.win.writewatch.ntget.status.i32");
+    Value *dirtyCount =
+        QB.CreateLoad(ip, countSlot, "morok.win.writewatch.dirty.count");
+    cast<LoadInst>(dirtyCount)->setVolatile(true);
+    Value *granularity =
+        QB.CreateLoad(i32, granularitySlot, "morok.win.writewatch.granularity");
+    cast<LoadInst>(granularity)->setVolatile(true);
+    Value *getOk = QB.CreateICmpSGE(getStatus32, ConstantInt::get(i32, 0),
+                                    "morok.win.writewatch.ntget.ok");
+    Value *dirtyAny =
+        QB.CreateAnd(getOk,
+                     QB.CreateICmpNE(dirtyCount, ConstantInt::get(ip, 0),
+                                     "morok.win.writewatch.dirty.nonzero"),
+                     "morok.win.writewatch.dirty.any");
+    foldState(QB, State, getStatus, rng.next(),
+              "morok.win.writewatch.ntget.status.mix");
+    foldState(QB, State, dirtyCount, rng.next(),
+              "morok.win.writewatch.dirty.count.mix");
+    foldState(QB, State, granularity, rng.next(),
+              "morok.win.writewatch.granularity.mix");
+    foldFlag(QB, State, QB.CreateNot(getOk, "morok.win.writewatch.ntget.weak"),
+             0xD64B20F198A7C53EULL, "morok.win.writewatch.ntget.weak");
+    foldEnforcedFlag(QB, State, dirtyAny, 0x59E1A7C42D30B68FULL,
+                     "morok.win.writewatch.dirty");
+    QB.CreateCondBr(dirtyAny, scanLoopBB, cleanupBB);
+
+    IRBuilder<> SLB(scanLoopBB);
+    auto *scanIdx = SLB.CreatePHI(ip, 2, "morok.win.writewatch.scan.idx");
+    scanIdx->addIncoming(ConstantInt::get(ip, 0), queryBB);
+    Value *scanLimit = SLB.CreateSelect(
+        SLB.CreateICmpULT(dirtyCount, ConstantInt::get(ip, kDirtyPageLimit),
+                          "morok.win.writewatch.scan.count.under.limit"),
+        dirtyCount, ConstantInt::get(ip, kDirtyPageLimit),
+        "morok.win.writewatch.scan.limit");
+    SLB.CreateCondBr(SLB.CreateICmpULT(scanIdx, scanLimit,
+                                       "morok.win.writewatch.scan.idx.live"),
+                     scanBodyBB, cleanupBB);
+
+    IRBuilder<> ScanB(scanBodyBB);
+    Value *pageSlot = ScanB.CreateInBoundsGEP(
+        dirtyArrayTy, dirtyPages, {ConstantInt::get(ip, 0), scanIdx},
+        "morok.win.writewatch.page.slot");
+    Value *page = ScanB.CreateLoad(ptr, pageSlot, "morok.win.writewatch.page");
+    cast<LoadInst>(page)->setVolatile(true);
+    Value *b0 =
+        loadAt(ScanB, M, i8, page, 0ULL, "morok.win.writewatch.page.b0");
+    Value *b1 = loadAt(ScanB, M, i8, page, 1, "morok.win.writewatch.page.b1");
+    Value *b2 = loadAt(ScanB, M, i8, page, 2, "morok.win.writewatch.page.b2");
+    Value *b3 = loadAt(ScanB, M, i8, page, 3, "morok.win.writewatch.page.b3");
+    Value *b4 = loadAt(ScanB, M, i8, page, 4, "morok.win.writewatch.page.b4");
+    Value *b5 = loadAt(ScanB, M, i8, page, 5, "morok.win.writewatch.page.b5");
+    Value *b6 = loadAt(ScanB, M, i8, page, 6, "morok.win.writewatch.page.b6");
+    Value *b7 = loadAt(ScanB, M, i8, page, 7, "morok.win.writewatch.page.b7");
+    Value *cc = ConstantInt::get(i8, 0xCC);
+    Value *int3Here = ScanB.CreateOr(
+        ScanB.CreateOr(ScanB.CreateICmpEQ(b0, cc), ScanB.CreateICmpEQ(b1, cc),
+                       "morok.win.writewatch.int3.01"),
+        ScanB.CreateOr(
+            ScanB.CreateOr(ScanB.CreateICmpEQ(b2, cc),
+                           ScanB.CreateICmpEQ(b3, cc),
+                           "morok.win.writewatch.int3.23"),
+            ScanB.CreateOr(ScanB.CreateOr(ScanB.CreateICmpEQ(b4, cc),
+                                          ScanB.CreateICmpEQ(b5, cc),
+                                          "morok.win.writewatch.int3.45"),
+                           ScanB.CreateOr(ScanB.CreateICmpEQ(b6, cc),
+                                          ScanB.CreateICmpEQ(b7, cc),
+                                          "morok.win.writewatch.int3.67"),
+                           "morok.win.writewatch.int3.4567"),
+            "morok.win.writewatch.int3.234567"),
+        "morok.win.writewatch.int3.hit");
+    Value *oldInt3 =
+        ScanB.CreateLoad(i8, int3Slot, "morok.win.writewatch.int3.old");
+    cast<LoadInst>(oldInt3)->setVolatile(true);
+    Value *nextInt3 =
+        ScanB.CreateSelect(int3Here, ConstantInt::get(i8, 1), oldInt3,
+                           "morok.win.writewatch.int3.next");
+    ScanB.CreateStore(nextInt3, int3Slot)->setVolatile(true);
+    ScanB.CreateBr(scanNextBB);
+
+    IRBuilder<> SNB(scanNextBB);
+    Value *nextScan = SNB.CreateAdd(scanIdx, ConstantInt::get(ip, 1),
+                                    "morok.win.writewatch.scan.next");
+    SNB.CreateBr(scanLoopBB);
+    scanIdx->addIncoming(nextScan, scanNextBB);
+
+    IRBuilder<> CB(cleanupBB);
+    Value *int3Final =
+        CB.CreateLoad(i8, int3Slot, "morok.win.writewatch.int3.final");
+    cast<LoadInst>(int3Final)->setVolatile(true);
+    foldFlag(CB, State,
+             CB.CreateICmpNE(int3Final, ConstantInt::get(i8, 0),
+                             "morok.win.writewatch.int3.final.hit"),
+             0x9471C3BE620AD58FULL, "morok.win.writewatch.int3");
+    CB.CreateStore(ConstantInt::get(ip, 0), freeSizeSlot)->setVolatile(true);
+    Value *freeSizeIp = CB.CreatePtrToInt(
+        freeSizeSlot, ip, "morok.win.writewatch.free.size.slot.ip");
+    Value *freeStatus =
+        CB.CreateCall(directTy, direct,
+                      {freeSsn, ConstantInt::getSigned(ip, -1), baseSlotIp,
+                       freeSizeIp, ConstantInt::get(ip, kMemRelease)},
+                      "morok.win.writewatch.ntfree.status");
+    foldState(CB, State, freeStatus, rng.next(),
+              "morok.win.writewatch.ntfree.status.mix");
+    CB.CreateBr(retBB);
+
+    IRBuilder<> RetB(retBB);
+    RetB.CreateRetVoid();
+    return fn;
+}
+
 void initWindowsDebugContext(IRBuilder<> &B, Module &M, AllocaInst *Ctx,
                              const Twine &Name) {
     constexpr std::uint64_t kContextBytes = 1232;
@@ -23237,6 +23661,8 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
         foldFlag(B, state, changed, 0x73B5D02E6C49A18FULL,
                  "morok.antihook.dbi.smc.changed");
     }
+    if (Function *writeWatch = windowsWriteWatchProbe(M, state, rng, tt))
+        B.CreateCall(writeWatch);
     if (Function *mprotectSmc = linuxMprotectSmcProbe(M, state, rng, tt)) {
         Value *diff =
             B.CreateCall(mprotectSmc, {}, "morok.antihook.mprotect.diff");

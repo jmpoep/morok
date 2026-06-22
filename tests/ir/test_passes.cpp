@@ -17253,6 +17253,12 @@ entry:
     REQUIRE(Fpu != nullptr);
     Function *Smc = M->getFunction("morok.antihook.dbi.smc");
     REQUIRE(Smc != nullptr);
+    Function *WriteWatch = M->getFunction("morok.win.writewatch.probe");
+    REQUIRE(WriteWatch != nullptr);
+    Function *Direct6 = M->getFunction("morok.win.sys.direct6");
+    REQUIRE(Direct6 != nullptr);
+    Function *Direct7 = M->getFunction("morok.win.sys.direct7");
+    REQUIRE(Direct7 != nullptr);
     Function *NegativeTiming = M->getFunction("morok.negative.timing");
     REQUIRE(NegativeTiming != nullptr);
     Function *Ctor = M->getFunction("morok.antihook");
@@ -17267,9 +17273,17 @@ entry:
     CHECK(M->getFunction("clock_gettime") == nullptr);
     CHECK(M->getFunction("dlsym") == nullptr);
     CHECK(M->getFunction("exit") == nullptr);
+    CHECK(M->getFunction("NtAllocateVirtualMemory") == nullptr);
+    CHECK(M->getFunction("NtGetWriteWatch") == nullptr);
+    CHECK(M->getFunction("NtResetWriteWatch") == nullptr);
+    CHECK(M->getFunction("GetWriteWatch") == nullptr);
+    CHECK(M->getFunction("ResetWriteWatch") == nullptr);
+    CHECK(M->getFunction("VirtualAlloc") == nullptr);
     CHECK(hasInlineAsmCall(*Sandbox));
     CHECK(hasInlineAsmCall(*Emu));
     CHECK(hasInlineAsmCall(*Fpu));
+    CHECK(hasInlineAsmCall(*Direct6));
+    CHECK(hasInlineAsmCall(*Direct7));
     CHECK(Emu->hasFnAttribute(Attribute::NoRedZone));
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
@@ -17317,6 +17331,36 @@ entry:
     CHECK(countNamedInstructions(*Smc, "morok.antihook.dbi.smc.trip") >= 1u);
     checkSmcCoherencyProbe(*Smc);
     checkWindowsSmcThreadRaceProbe(*M, *Smc);
+    CHECK(countNamedInstructions(*WriteWatch,
+                                 "morok.win.writewatch.ntalloc.pack") >= 1u);
+    CHECK(countNamedInstructions(*WriteWatch,
+                                 "morok.win.writewatch.ntget.pack") >= 1u);
+    CHECK(countNamedInstructions(*WriteWatch,
+                                 "morok.win.writewatch.ntreset.pack") >= 1u);
+    CHECK(countNamedInstructions(*WriteWatch,
+                                 "morok.win.writewatch.ntalloc.status") >= 1u);
+    CHECK(countNamedInstructions(*WriteWatch,
+                                 "morok.win.writewatch.ntreset.status") >= 1u);
+    CHECK(countNamedInstructions(*WriteWatch,
+                                 "morok.win.writewatch.ntget.status") >= 1u);
+    CHECK(countNamedInstructions(*WriteWatch,
+                                 "morok.win.writewatch.dirty.count") >= 1u);
+    CHECK(countNamedInstructions(*WriteWatch,
+                                 "morok.win.writewatch.dirty.any") >= 1u);
+    CHECK(countNamedInstructions(*WriteWatch,
+                                 "morok.win.writewatch.int3.hit") >= 1u);
+    CHECK(countNamedInstructions(*WriteWatch,
+                                 "morok.win.writewatch.ntfree.status") >= 1u);
+    Instruction *WriteWatchDirty =
+        findNamedInstruction(*WriteWatch, "morok.win.writewatch.dirty.any");
+    REQUIRE(WriteWatchDirty != nullptr);
+    CHECK(valueFeedsNamedInstruction(WriteWatchDirty,
+                                     "morok.seal.fold.anti_debug"));
+    Instruction *WriteWatchUnavailable =
+        findNamedInstruction(*WriteWatch, "morok.win.writewatch.unavailable");
+    REQUIRE(WriteWatchUnavailable != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(WriteWatchUnavailable,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*NegativeTiming,
                                  "morok.negative.timing.slow") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.negative.modules.extra") >= 1u);
