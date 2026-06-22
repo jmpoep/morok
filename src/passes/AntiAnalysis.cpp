@@ -14349,6 +14349,7 @@ Function *windowsPebHeapDebugProbe(Module &M, GlobalVariable *State,
     LLVMContext &ctx = M.getContext();
     auto *i8 = Type::getInt8Ty(ctx);
     auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
     auto *ip = intPtrTy(M);
     auto *ptr = PointerType::getUnqual(ctx);
     auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
@@ -14357,8 +14358,24 @@ Function *windowsPebHeapDebugProbe(Module &M, GlobalVariable *State,
     fn->addFnAttr(Attribute::NoInline);
     fn->setDSOLocal(true);
 
+    Function *apiAbsent = M.getFunction("morok.win.pebheap.isdebug.absent");
+    if (!apiAbsent) {
+        apiAbsent =
+            Function::Create(FunctionType::get(i32, false),
+                             GlobalValue::PrivateLinkage,
+                             "morok.win.pebheap.isdebug.absent", &M);
+        apiAbsent->addFnAttr(Attribute::NoInline);
+        apiAbsent->setDSOLocal(true);
+        auto *absentEntry = BasicBlock::Create(ctx, "entry", apiAbsent);
+        IRBuilder<> AB(absentEntry);
+        AB.CreateRet(ConstantInt::get(i32, 0));
+    }
+
     Function *pebReader = windowsPebReader(M);
-    if (!pebReader)
+    Function *tebReader = windowsTebReader(M);
+    Function *moduleByHash = windowsLdrModuleByHash(M);
+    Function *resolver = windowsPeExportResolver(M);
+    if (!pebReader || !tebReader || !moduleByHash || !resolver)
         return nullptr;
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
@@ -14375,24 +14392,136 @@ Function *windowsPebHeapDebugProbe(Module &M, GlobalVariable *State,
 
     IRBuilder<> PB(readPebBB);
     Value *pebPtr = PB.CreateIntToPtr(peb, ptr, "morok.win.pebheap.peb.ptr");
+    Value *teb = PB.CreateCall(tebReader, {}, "morok.win.pebheap.teb");
+    Value *tebPtr = PB.CreateIntToPtr(teb, ptr, "morok.win.pebheap.teb.ptr");
+    Value *pebFromTeb =
+        loadAt(PB, M, ip, tebPtr, 0x60, "morok.win.pebheap.teb.peb");
+    Value *pebInline =
+        emitWindowsGsRead(PB, M, 0x60, "morok.win.pebheap.peb.inline");
+    Value *pebFromTebPtr =
+        PB.CreateIntToPtr(pebFromTeb, ptr, "morok.win.pebheap.teb.peb.ptr");
+    Value *pebInlinePtr =
+        PB.CreateIntToPtr(pebInline, ptr, "morok.win.pebheap.inline.peb.ptr");
     Value *beingDebugged =
         loadAt(PB, M, i8, pebPtr, 0x02, "morok.win.pebheap.being.debugged");
+    Value *beingDebuggedTeb = loadAt(PB, M, i8, pebFromTebPtr, 0x02,
+                                     "morok.win.pebheap.being.debugged.teb");
+    Value *beingDebuggedInline =
+        loadAt(PB, M, i8, pebInlinePtr, 0x02,
+               "morok.win.pebheap.being.debugged.inline");
     Value *ntGlobalFlag =
         loadAt(PB, M, i32, pebPtr, 0xBC, "morok.win.pebheap.nt.global.flag");
     Value *processHeap =
         loadAt(PB, M, ip, pebPtr, 0x30, "morok.win.pebheap.process.heap");
+    Value *kernelbase = PB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("kernelbase.dll"))},
+        "morok.win.pebheap.kernelbase");
+    Value *kernel32 = PB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("kernel32.dll"))},
+        "morok.win.pebheap.kernel32");
+    Value *kernelbaseIsDebugger = PB.CreateCall(
+        resolver,
+        {kernelbase, ConstantInt::get(i64, fnv1aName("IsDebuggerPresent"))},
+        "morok.win.pebheap.isdebug.kernelbase");
+    Value *kernel32IsDebugger = PB.CreateCall(
+        resolver,
+        {kernel32, ConstantInt::get(i64, fnv1aName("IsDebuggerPresent"))},
+        "morok.win.pebheap.isdebug.kernel32");
+    Value *isDebuggerPresent = PB.CreateSelect(
+        PB.CreateICmpNE(kernelbaseIsDebugger, ConstantInt::get(ip, 0),
+                        "morok.win.pebheap.isdebug.kernelbase.ready"),
+        kernelbaseIsDebugger, kernel32IsDebugger,
+        "morok.win.pebheap.isdebuggerpresent");
     foldState(PB, State, beingDebugged, rng.next(),
               "morok.win.pebheap.being.debugged.mix");
+    foldState(PB, State, beingDebuggedTeb, rng.next(),
+              "morok.win.pebheap.being.debugged.teb.mix");
+    foldState(PB, State, beingDebuggedInline, rng.next(),
+              "morok.win.pebheap.being.debugged.inline.mix");
+    foldState(PB, State, teb, rng.next(), "morok.win.pebheap.teb.mix");
+    foldState(PB, State, pebFromTeb, rng.next(),
+              "morok.win.pebheap.teb.peb.mix");
+    foldState(PB, State, pebInline, rng.next(),
+              "morok.win.pebheap.inline.peb.mix");
+    foldState(PB, State, kernelbase, rng.next(),
+              "morok.win.pebheap.kernelbase.mix");
+    foldState(PB, State, kernel32, rng.next(),
+              "morok.win.pebheap.kernel32.mix");
+    foldState(PB, State, isDebuggerPresent, rng.next(),
+              "morok.win.pebheap.isdebuggerpresent.mix");
     foldState(PB, State, ntGlobalFlag, rng.next(),
               "morok.win.pebheap.nt.global.flag.mix");
     foldState(PB, State, processHeap, rng.next(),
               "morok.win.pebheap.process.heap.mix");
-    foldEnforcedFlag(PB, State,
-                     PB.CreateICmpNE(
-                         beingDebugged, ConstantInt::get(i8, 0),
-                         "morok.win.pebheap.being.debugged.hit"),
-                     0xBAE7D1C05A16E903ULL,
+    Value *pebPathMismatch =
+        PB.CreateOr(PB.CreateICmpNE(peb, pebFromTeb,
+                                    "morok.win.pebheap.peb.teb.mismatch"),
+                    PB.CreateICmpNE(peb, pebInline,
+                                    "morok.win.pebheap.peb.inline.mismatch"),
+                    "morok.win.pebheap.peb.path.mismatch");
+    Value *raw0 = PB.CreateZExt(PB.CreateICmpNE(beingDebugged,
+                                                ConstantInt::get(i8, 0),
+                                                "morok.win.pebheap.raw0"),
+                                i32, "morok.win.pebheap.raw0.bit");
+    Value *raw1 =
+        PB.CreateZExt(PB.CreateICmpNE(beingDebuggedTeb,
+                                      ConstantInt::get(i8, 0),
+                                      "morok.win.pebheap.raw1"),
+                      i32, "morok.win.pebheap.raw1.bit");
+    Value *raw2 =
+        PB.CreateZExt(PB.CreateICmpNE(beingDebuggedInline,
+                                      ConstantInt::get(i8, 0),
+                                      "morok.win.pebheap.raw2"),
+                      i32, "morok.win.pebheap.raw2.bit");
+    Value *rawVotes =
+        PB.CreateAdd(PB.CreateAdd(raw0, raw1, "morok.win.pebheap.raw.votes01"),
+                     raw2, "morok.win.pebheap.raw.votes");
+    Value *rawMajority =
+        PB.CreateICmpUGE(rawVotes, ConstantInt::get(i32, 2),
+                         "morok.win.pebheap.being.debugged.majority");
+    Value *rawDisagree = PB.CreateOr(
+        PB.CreateICmpNE(beingDebugged, beingDebuggedTeb,
+                        "morok.win.pebheap.raw.teb.disagree"),
+        PB.CreateICmpNE(beingDebugged, beingDebuggedInline,
+                        "morok.win.pebheap.raw.inline.disagree"),
+        "morok.win.pebheap.raw.disagree");
+    foldState(PB, State, rawVotes, rng.next(),
+              "morok.win.pebheap.raw.votes.mix");
+    foldEnforcedFlag(PB, State, rawMajority, 0xBAE7D1C05A16E903ULL,
                      "morok.win.pebheap.being.debugged");
+    foldEnforcedFlag(PB, State, rawDisagree, 0x7C124EA9D6305B81ULL,
+                     "morok.win.pebheap.being.debugged.coherence");
+    foldEnforcedFlag(PB, State, pebPathMismatch, 0x14EB9C7362D508AFULL,
+                     "morok.win.pebheap.peb.path");
+    Value *apiReady = PB.CreateICmpNE(
+        isDebuggerPresent, ConstantInt::get(ip, 0),
+        "morok.win.pebheap.isdebuggerpresent.ready");
+    auto *isDebuggerTy = FunctionType::get(i32, false);
+    Value *apiTarget = PB.CreateSelect(
+        apiReady, isDebuggerPresent,
+        PB.CreatePtrToInt(apiAbsent, ip,
+                          "morok.win.pebheap.isdebuggerpresent.absent.ip"),
+        "morok.win.pebheap.isdebuggerpresent.target");
+    Value *apiResult = PB.CreateCall(
+        isDebuggerTy,
+        PB.CreateIntToPtr(apiTarget, ptr,
+                          "morok.win.pebheap.isdebuggerpresent.ptr"),
+        {}, "morok.win.pebheap.isdebuggerpresent.result");
+    Value *apiHit = PB.CreateICmpNE(apiResult, ConstantInt::get(i32, 0),
+                                    "morok.win.pebheap.isdebuggerpresent.hit");
+    Value *apiDiverged = PB.CreateAnd(
+        apiReady, PB.CreateXor(apiHit, rawMajority,
+                               "morok.win.pebheap.api.raw.xor"),
+        "morok.win.pebheap.api.raw.diverged");
+    foldState(PB, State, apiResult, rng.next(),
+              "morok.win.pebheap.isdebuggerpresent.result.mix");
+    foldFlag(PB, State, PB.CreateNot(apiReady),
+             0xC9E48215B6A70D3FULL,
+             "morok.win.pebheap.isdebuggerpresent.missing");
+    foldEnforcedFlag(PB, State, apiDiverged, 0x38D5A6F190C27B4EULL,
+                     "morok.win.pebheap.api.raw");
     Value *ntDebugBits =
         PB.CreateAnd(ntGlobalFlag, ConstantInt::get(i32, 0x70),
                      "morok.win.pebheap.nt.global.flag.bits");

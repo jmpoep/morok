@@ -17784,15 +17784,50 @@ define i32 @main() { ret i32 0 }
     Function *Ctor = M->getFunction("morok.win.pebheap");
     Function *Probe = M->getFunction("morok.win.pebheap.probe");
     Function *Peb = M->getFunction("morok.win.peb");
+    Function *Teb = M->getFunction("morok.win.teb");
+    Function *Ldr = M->getFunction("morok.win.ldr.module");
+    Function *Resolve = M->getFunction("morok.win.pe.resolve");
     REQUIRE(Ctor != nullptr);
     REQUIRE(Probe != nullptr);
     REQUIRE(Peb != nullptr);
+    REQUIRE(Teb != nullptr);
+    REQUIRE(Ldr != nullptr);
+    REQUIRE(Resolve != nullptr);
     CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
     checkSealEnforcement(*M, *Probe);
     CHECK(hasInlineAsmCall(*Peb));
+    CHECK(hasInlineAsmCall(*Teb));
+    CHECK(M->getFunction("IsDebuggerPresent") == nullptr);
     CHECK(countNamedInstructions(*Probe, "morok.win.pebheap.peb") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.pebheap.teb") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.pebheap.teb.peb") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.pebheap.peb.inline") >=
+          1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.pebheap.being.debugged") >=
           1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.pebheap.being.debugged.teb") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.pebheap.being.debugged.inline") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.pebheap.being.debugged.majority") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.pebheap.raw.votes") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.pebheap.raw.disagree") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.pebheap.peb.path.mismatch") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.pebheap.isdebug.kernelbase") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.pebheap.isdebug.kernel32") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.pebheap.isdebuggerpresent") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.pebheap.isdebuggerpresent.result") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.pebheap.api.raw.diverged") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.pebheap.nt.global.flag") >=
           1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.pebheap.process.heap") >=
@@ -17802,6 +17837,20 @@ define i32 @main() { ret i32 0 }
                                  "morok.win.pebheap.heap.force.flags") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.pebheap.heap.composite") >=
           1u);
+    Instruction *Majority =
+        findNamedInstruction(*Probe, "morok.win.pebheap.being.debugged.majority");
+    REQUIRE(Majority != nullptr);
+    CHECK(valueFeedsNamedInstruction(Majority, "morok.seal.fold.anti_debug"));
+    Instruction *RawDisagree =
+        findNamedInstruction(*Probe, "morok.win.pebheap.raw.disagree");
+    REQUIRE(RawDisagree != nullptr);
+    CHECK(valueFeedsNamedInstruction(RawDisagree,
+                                     "morok.seal.fold.anti_debug"));
+    Instruction *ApiDiverged =
+        findNamedInstruction(*Probe, "morok.win.pebheap.api.raw.diverged");
+    REQUIRE(ApiDiverged != nullptr);
+    CHECK(valueFeedsNamedInstruction(ApiDiverged,
+                                     "morok.seal.fold.anti_debug"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
