@@ -18795,6 +18795,16 @@ define i32 @main() { ret i32 0 }
     REQUIRE(WindowHit != nullptr);
     CHECK_FALSE(valueFeedsNamedInstruction(WindowHit,
                                            "morok.seal.fold.anti_debug"));
+    // #222: the strict debugger-class verdict (WinDbgFrameClass/OLLYDBG only,
+    // NULL on a clean run) must be re-enforced into the consumed seal, while
+    // the Qt-class + caption windowHit above stays telemetry (Qt classes
+    // resolve on clean Qt-host apps, so enforcing them would corrupt clean
+    // binaries).
+    Instruction *StrictClassHit = findNamedInstruction(
+        *Probe, "morok.win.kdbg.window.strict.class.final.hit");
+    REQUIRE(StrictClassHit != nullptr);
+    CHECK(valueFeedsNamedInstruction(StrictClassHit,
+                                     "morok.seal.fold.anti_debug"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

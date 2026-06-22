@@ -18818,10 +18818,17 @@ Function *windowsKernelDebuggerProbe(Module &M, GlobalVariable *State,
         RB.CreateAlloca(windowCtxTy, nullptr, "morok.win.kdbg.window.ctx");
     AllocaInst *windowClassHit =
         RB.CreateAlloca(i32, nullptr, "morok.win.kdbg.window.class.slot");
+    // Strict debugger-class hit (WinDbgFrameClass/OLLYDBG only). These classes
+    // are NULL on a clean run, so this flag can be enforced into the seal —
+    // unlike the generic Qt classes also folded into windowClassHit (#222).
+    AllocaInst *windowStrictClassHit = RB.CreateAlloca(
+        i32, nullptr, "morok.win.kdbg.window.strict.class.slot");
     RB.CreateMemSet(windowCtx, ConstantInt::get(i8, 0),
                     ConstantInt::get(ip, kWindowEnumContextBytes),
                     MaybeAlign(1));
     RB.CreateStore(ConstantInt::get(i32, 0), windowClassHit)
+        ->setVolatile(true);
+    RB.CreateStore(ConstantInt::get(i32, 0), windowStrictClassHit)
         ->setVolatile(true);
     Value *ntdll = RB.CreateCall(
         moduleByHash,
@@ -18950,6 +18957,15 @@ Function *windowsKernelDebuggerProbe(Module &M, GlobalVariable *State,
         "morok.win.kdbg.window.class.hit");
     WB.CreateStore(WB.CreateZExt(classHit, i32), windowClassHit)
         ->setVolatile(true);
+    // Only the true debugger window classes (WinDbgFrameClass=w0, OLLYDBG=w1)
+    // are NULL on a clean run; the Qt classes (w2/w3) legitimately resolve in
+    // Qt host apps, so the enforced verdict must exclude them (#222).
+    Value *strictClassHit = WB.CreateOr(
+        WB.CreateICmpNE(w0, ConstantPointerNull::get(ptr)),
+        WB.CreateICmpNE(w1, ConstantPointerNull::get(ptr)),
+        "morok.win.kdbg.window.strict.class.hit");
+    WB.CreateStore(WB.CreateZExt(strictClassHit, i32), windowStrictClassHit)
+        ->setVolatile(true);
     WB.CreateBr(windowEnumGateBB);
 
     IRBuilder<> EG(windowEnumGateBB);
@@ -19009,6 +19025,19 @@ Function *windowsKernelDebuggerProbe(Module &M, GlobalVariable *State,
         "morok.win.kdbg.window.hit");
     foldFlag(FB, State, windowHit, 0xC52F6B9038D41EA7ULL,
              "morok.win.kdbg.window");
+    // Re-enforce the strict debugger-class verdict (WinDbgFrameClass/OLLYDBG)
+    // into the consumed anti_debug seal — these are zero-on-clean, so a real
+    // WinDbg/OllyDbg window again trips the seal (it regressed to telemetry-only
+    // when caption enumeration was added; #222). The Qt-class + caption verdict
+    // stays telemetry above to avoid corrupting clean Qt-host binaries.
+    Value *finalStrictClassWord = FB.CreateLoad(
+        i32, windowStrictClassHit, "morok.win.kdbg.window.strict.class.word");
+    cast<LoadInst>(finalStrictClassWord)->setVolatile(true);
+    Value *strictClassFinalHit =
+        FB.CreateICmpNE(finalStrictClassWord, ConstantInt::get(i32, 0),
+                        "morok.win.kdbg.window.strict.class.final.hit");
+    foldEnforcedFlag(FB, State, strictClassFinalHit, 0x9D3FA1C70E62B584ULL,
+                     "morok.win.kdbg.window.class");
     FB.CreateBr(retBB);
 
     IRBuilder<> RetB(retBB);
