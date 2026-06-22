@@ -1243,6 +1243,17 @@ bool inlineConstantFormatCalls(Module &M) {
     StringMap<Function *> ScanHelperCache;
     unsigned Counter = 0;
 
+    auto emitFormatCountReturn = [&](IRBuilder<> &B, Value *Count) {
+        Value *TooLarge = B.CreateICmpUGT(
+            Count, ConstantInt::get(I64, 0x7fffffffULL),
+            "morok.fmt.ret.overflow");
+        Value *Trunc = B.CreateTrunc(Count, I32, "morok.fmt.ret.trunc");
+        Value *Ret = B.CreateSelect(
+            TooLarge, ConstantInt::getSigned(I32, -1), Trunc,
+            "morok.fmt.ret");
+        B.CreateRet(Ret);
+    };
+
     auto getBufferHelper = [&](const std::string &Fmt,
                                const std::vector<Seg> &Segs) -> Function * {
         auto It = HelperCache.find(Fmt);
@@ -1438,7 +1449,10 @@ bool inlineConstantFormatCalls(Module &M) {
         Value *Dest =
             B.CreateSelect(SizeNZ, B.CreateGEP(I8, Buf, {P}), Scratch);
         B.CreateStore(ConstantInt::get(I8, 0), Dest);
-        B.CreateRet(B.CreateTrunc(C, I32));
+        // POSIX snprintf-family calls fail with a negative result when the
+        // would-have-written count cannot be represented as int.  Preserve that
+        // signal so caller truncation checks cannot be bypassed by i32 wrap.
+        emitFormatCountReturn(B, C);
 
         HelperCache[Fmt] = Fn;
         return Fn;
@@ -1631,7 +1645,7 @@ bool inlineConstantFormatCalls(Module &M) {
         }
 
         Value *C = B.CreateLoad(I64, Cnt);
-        B.CreateRet(B.CreateTrunc(C, I32));
+        emitFormatCountReturn(B, C);
 
         PrintHelperCache[Key] = Fn;
         return Fn;

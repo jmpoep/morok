@@ -532,6 +532,36 @@ bool callToPrecedes(Function &F, StringRef first, StringRef second) {
     return false;
 }
 
+bool hasFormatCountOverflowReturnGuard(Function &F) {
+    for (Instruction &I : instructions(F)) {
+        auto *Ret = dyn_cast<ReturnInst>(&I);
+        if (!Ret || !Ret->getReturnValue())
+            continue;
+        auto *Sel = dyn_cast<SelectInst>(Ret->getReturnValue());
+        if (!Sel)
+            continue;
+        auto *Cmp = dyn_cast<ICmpInst>(Sel->getCondition());
+        if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_UGT)
+            continue;
+
+        bool comparesIntMax = false;
+        for (Value *Op : Cmp->operands())
+            if (auto *CI = dyn_cast<ConstantInt>(Op))
+                if (CI->getZExtValue() == 0x7fffffffu)
+                    comparesIntMax = true;
+        if (!comparesIntMax)
+            continue;
+
+        auto *OverflowRet = dyn_cast<ConstantInt>(Sel->getTrueValue());
+        if (!OverflowRet || OverflowRet->getSExtValue() != -1)
+            continue;
+        if (!isa<TruncInst>(Sel->getFalseValue()))
+            continue;
+        return true;
+    }
+    return false;
+}
+
 std::size_t countCallsThroughOperand(Function &F, const Value *Target) {
     std::size_t n = 0;
     for (Instruction &I : instructions(F))
@@ -13923,6 +13953,37 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("format boundary lowering preserves snprintf count overflow") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@fmt = private constant [3 x i8] c"%s\00"
+
+declare i32 @snprintf(ptr, i64, ptr, ...)
+
+define i32 @canon(ptr %buf, i64 %size, ptr %input) {
+entry:
+  %n = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 %size, ptr @fmt, ptr %input)
+  ret i32 %n
+}
+)ir");
+    REQUIRE(M);
+    CHECK(morok::passes::inlineConstantFormatCalls(*M));
+
+    Function *Canon = M->getFunction("canon");
+    REQUIRE(Canon);
+    CHECK(countCallsTo(*Canon, "snprintf") == 0u);
+    CHECK(countFunctions(*M, "morok.fmt.") == 1u);
+
+    Function *Helper = nullptr;
+    for (Function &F : *M)
+        if (F.getName().starts_with("morok.fmt."))
+            Helper = &F;
+    REQUIRE(Helper);
+    CHECK(hasFormatCountOverflowReturnGuard(*Helper));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("format boundary lowering removes recovered trace snprintf shapes") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -14017,6 +14078,13 @@ entry:
     CHECK(countCallsTo(*Emit, "printf") == 0u);
     CHECK(countCallsTo(*Emit, "fprintf") == 0u);
     CHECK(countFunctions(*M, "morok.print.") == 2u);
+    unsigned GuardedPrintHelpers = 0;
+    for (Function &F : *M)
+        if (F.getName().starts_with("morok.print.")) {
+            CHECK(hasFormatCountOverflowReturnGuard(F));
+            ++GuardedPrintHelpers;
+        }
+    CHECK(GuardedPrintHelpers == 2u);
 
     auto engine = morok::core::Xoshiro256pp::fromSeed(6104);
     morok::ir::IRRandom rng(engine);
