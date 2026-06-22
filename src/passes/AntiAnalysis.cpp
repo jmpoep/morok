@@ -2331,6 +2331,8 @@ void emitLinuxWatcherStart(IRBuilder<> &B, Module &M, Function *WatchFn) {
 
 Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
                          const Triple &TT);
+Function *windowsTextChecksumProbe(Module &M, GlobalVariable *State,
+                                   ir::IRRandom &rng, const Triple &TT);
 Function *windowsHardwareBreakpointProbe(Module &M, GlobalVariable *State,
                                          ir::IRRandom &rng, const Triple &TT);
 
@@ -12015,10 +12017,13 @@ GlobalVariable *windowsVehHandle(Module &M) {
 
 Value *emitWindowsGsRead(IRBuilder<> &B, Module &M, std::uint32_t Offset,
                          const Twine &Name) {
+    const Triple TT(M.getTargetTriple());
     auto *ip = intPtrTy(M);
     auto *asmTy = FunctionType::get(ip, false);
     const char *slot = Offset == 0x30 ? "0x30" : "0x60";
-    std::string asmText = std::string("movq %gs:") + slot + ", $0";
+    const bool x86 = TT.getArch() == Triple::x86;
+    std::string asmText =
+        std::string(x86 ? "movl %fs:" : "movq %gs:") + slot + ", $0";
     InlineAsm *IA =
         InlineAsm::get(asmTy, asmText, "=r,~{dirflag},~{fpsr},~{flags}",
                        /*hasSideEffects=*/true);
@@ -12049,7 +12054,9 @@ Function *windowsPebReader(Module &M) {
     if (Function *existing = M.getFunction("morok.win.peb"))
         return existing;
     const Triple TT(M.getTargetTriple());
-    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64)
+    const bool x86 = TT.getArch() == Triple::x86;
+    const bool x64 = TT.getArch() == Triple::x86_64;
+    if (!TT.isOSWindows() || (!x86 && !x64))
         return nullptr;
 
     LLVMContext &ctx = M.getContext();
@@ -12061,7 +12068,8 @@ Function *windowsPebReader(Module &M) {
     fn->setDSOLocal(true);
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
     IRBuilder<> B(entry);
-    B.CreateRet(emitWindowsGsRead(B, M, 0x60, "morok.win.peb.gs"));
+    B.CreateRet(emitWindowsGsRead(B, M, x86 ? 0x30 : 0x60,
+                                  "morok.win.peb.seg"));
     return fn;
 }
 
@@ -12216,6 +12224,14 @@ Function *windowsLdrModuleByHash(Module &M) {
     if (Function *existing = M.getFunction("morok.win.ldr.module"))
         return existing;
 
+    const Triple TT(M.getTargetTriple());
+    const bool x86 = TT.getArch() == Triple::x86;
+    const unsigned pebLdrOff = x86 ? 0x0c : 0x18;
+    const unsigned memListOff = x86 ? 0x14 : 0x20;
+    const unsigned memLinksOff = x86 ? 0x08 : 0x10;
+    const unsigned dllBaseOff = x86 ? 0x18 : 0x30;
+    const unsigned nameBytesOff = x86 ? 0x2c : 0x58;
+    const unsigned nameBufferOff = x86 ? 0x30 : 0x60;
     LLVMContext &ctx = M.getContext();
     auto *i16 = Type::getInt16Ty(ctx);
     auto *i32 = Type::getInt32Ty(ctx);
@@ -12240,10 +12256,10 @@ Function *windowsLdrModuleByHash(Module &M) {
 
     IRBuilder<> B(entry);
     Value *pebPtr = B.CreateIntToPtr(peb, ptr, "morok.win.ldr.peb.ptr");
-    Value *ldr = loadAt(B, M, ip, pebPtr, 0x18, "morok.win.ldr.peb.ldr");
+    Value *ldr = loadAt(B, M, ip, pebPtr, pebLdrOff, "morok.win.ldr.peb.ldr");
     Value *hasLdr = B.CreateICmpNE(ldr, ConstantInt::get(ip, 0),
                                    "morok.win.ldr.present");
-    Value *head = B.CreateAdd(ldr, ConstantInt::get(ip, 0x20),
+    Value *head = B.CreateAdd(ldr, ConstantInt::get(ip, memListOff),
                               "morok.win.ldr.mem.head");
     Value *headPtr = B.CreateIntToPtr(head, ptr, "morok.win.ldr.head.ptr");
     Value *first = loadAt(B, M, ip, headPtr, 0ULL, "morok.win.ldr.first");
@@ -12271,16 +12287,18 @@ Function *windowsLdrModuleByHash(Module &M) {
 
     IRBuilder<> BB(bodyBB);
     Value *entryBase =
-        BB.CreateSub(cursor, ConstantInt::get(ip, 0x10),
+        BB.CreateSub(cursor, ConstantInt::get(ip, memLinksOff),
                      "morok.win.ldr.entry.base");
     Value *entryPtr =
         BB.CreateIntToPtr(entryBase, ptr, "morok.win.ldr.entry.ptr");
-    Value *dllBase = loadAt(BB, M, ip, entryPtr, 0x30,
+    Value *dllBase = loadAt(BB, M, ip, entryPtr, dllBaseOff,
                             "morok.win.ldr.dll.base");
     Value *nameBytes =
-        loadAt(BB, M, i16, entryPtr, 0x58, "morok.win.ldr.name.bytes");
+        loadAt(BB, M, i16, entryPtr, nameBytesOff,
+               "morok.win.ldr.name.bytes");
     Value *nameBuffer =
-        loadAt(BB, M, ip, entryPtr, 0x60, "morok.win.ldr.name.buffer");
+        loadAt(BB, M, ip, entryPtr, nameBufferOff,
+               "morok.win.ldr.name.buffer");
     Function *hashFn = windowsWideNameHash(M);
     Value *nameHash = BB.CreateCall(
         hashFn, {BB.CreateIntToPtr(nameBuffer, ptr, "morok.win.ldr.name.ptr"),
@@ -15526,6 +15544,578 @@ WindowsDebugRegisterSample loadWindowsDebugRegisters(IRBuilder<> &B, Module &M,
     return {dr0, dr1, dr2, dr3, dr6, dr7, signal};
 }
 
+Function *windowsMappedTextDiffHelper(Module &M, const Triple &TT) {
+    const bool x86 = TT.getArch() == Triple::x86;
+    const bool x64 = TT.getArch() == Triple::x86_64;
+    if (!TT.isOSWindows() || (!x86 && !x64))
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.win.textchk.clean"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, {ip, ip, ip}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.textchk.clean", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *peb = fn->getArg(0);
+    peb->setName("peb");
+    Argument *liveText = fn->getArg(1);
+    liveText->setName("live_text");
+    Argument *liveSize = fn->getArg(2);
+    liveSize->setName("live_size");
+
+    Function *moduleByHash = windowsLdrModuleByHash(M);
+    Function *resolver = windowsPeExportResolver(M);
+    Function *textSection = windowsPeTextSection(M);
+    if (!moduleByHash || !resolver || !textSection)
+        return nullptr;
+
+    const unsigned processParamsOff = x86 ? 0x10 : 0x20;
+    const unsigned imagePathOff = x86 ? 0x38 : 0x60;
+    const unsigned unicodeBufferOff = x86 ? 0x04 : 0x08;
+    constexpr std::uint64_t kMaxTextScan = 0x01000000ULL;
+    constexpr std::uint32_t kGenericRead = 0x80000000u;
+    constexpr std::uint32_t kShareAll = 0x00000007u;
+    constexpr std::uint32_t kOpenExisting = 3u;
+    constexpr std::uint32_t kFileAttributeNormal = 0x00000080u;
+    constexpr std::uint32_t kPageReadonlyImage = 0x01000002u;
+    constexpr std::uint32_t kFileMapRead = 0x00000004u;
+    auto setWinApiCallConv = [&](CallInst *CI) {
+        if (x86)
+            CI->setCallingConv(CallingConv::X86_StdCall);
+    };
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *resolveBB = BasicBlock::Create(ctx, "resolve", fn);
+    auto *openBB = BasicBlock::Create(ctx, "open", fn);
+    auto *mapBB = BasicBlock::Create(ctx, "map", fn);
+    auto *viewBB = BasicBlock::Create(ctx, "view", fn);
+    auto *textBB = BasicBlock::Create(ctx, "text", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "cmp.loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "cmp.body", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "cmp.done", fn);
+    auto *cleanupViewBB = BasicBlock::Create(ctx, "cleanup.view", fn);
+    auto *cleanupMapBB = BasicBlock::Create(ctx, "cleanup.map", fn);
+    auto *cleanupFileBB = BasicBlock::Create(ctx, "cleanup.file", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *fileSlot = B.CreateAlloca(ip, nullptr,
+                                          "morok.win.textchk.clean.file");
+    AllocaInst *mapSlot = B.CreateAlloca(ip, nullptr,
+                                         "morok.win.textchk.clean.map");
+    AllocaInst *viewSlot = B.CreateAlloca(ip, nullptr,
+                                          "morok.win.textchk.clean.view");
+    AllocaInst *resultSlot = B.CreateAlloca(i64, nullptr,
+                                            "morok.win.textchk.clean.result");
+    B.CreateStore(ConstantInt::getSigned(ip, -1), fileSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), mapSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), viewSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), resultSlot)->setVolatile(true);
+    Value *liveReady = B.CreateAnd(
+        B.CreateICmpNE(peb, ConstantInt::get(ip, 0),
+                       "morok.win.textchk.clean.peb.present"),
+        B.CreateAnd(B.CreateICmpNE(liveText, ConstantInt::get(ip, 0),
+                                   "morok.win.textchk.clean.live.present"),
+                    B.CreateICmpNE(liveSize, ConstantInt::get(ip, 0),
+                                   "morok.win.textchk.clean.size.present"),
+                    "morok.win.textchk.clean.live.ready"),
+        "morok.win.textchk.clean.entry.ready");
+    B.CreateCondBr(liveReady, resolveBB, retBB);
+
+    IRBuilder<> RB(resolveBB);
+    Value *pebPtr = RB.CreateIntToPtr(peb, ptr,
+                                      "morok.win.textchk.clean.peb.ptr");
+    Value *params = loadAt(RB, M, ip, pebPtr, processParamsOff,
+                           "morok.win.textchk.clean.params");
+    Value *paramsPresent =
+        RB.CreateICmpNE(params, ConstantInt::get(ip, 0),
+                        "morok.win.textchk.clean.params.present");
+    Value *safeParams = RB.CreateSelect(
+        paramsPresent, params, peb, "morok.win.textchk.clean.params.safe");
+    Value *paramsPtr = RB.CreateIntToPtr(safeParams, ptr,
+                                         "morok.win.textchk.clean.params.ptr");
+    Value *pathBytes = loadAt(RB, M, i16, paramsPtr, imagePathOff,
+                              "morok.win.textchk.clean.path.bytes");
+    Value *pathBuffer = loadAt(RB, M, ip, paramsPtr,
+                               imagePathOff + unicodeBufferOff,
+                               "morok.win.textchk.clean.path.buffer");
+    Value *kernelbase = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("kernelbase.dll"))},
+        "morok.win.textchk.clean.kernelbase");
+    Value *kernel32 = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("kernel32.dll"))},
+        "morok.win.textchk.clean.kernel32");
+    auto resolveApi = [&](StringRef Api, const Twine &Name) -> Value * {
+        Value *fromBase =
+            RB.CreateCall(resolver,
+                          {kernelbase, ConstantInt::get(i64, fnv1aName(Api))},
+                          Name + ".kernelbase");
+        Value *from32 =
+            RB.CreateCall(resolver,
+                          {kernel32, ConstantInt::get(i64, fnv1aName(Api))},
+                          Name + ".kernel32");
+        return RB.CreateSelect(RB.CreateICmpNE(fromBase, ConstantInt::get(ip, 0),
+                                               Name + ".kernelbase.ready"),
+                               fromBase, from32, Name);
+    };
+    Value *createFile =
+        resolveApi("CreateFileW", "morok.win.textchk.clean.createfile");
+    Value *createMapping =
+        resolveApi("CreateFileMappingW",
+                   "morok.win.textchk.clean.createfilemapping");
+    Value *mapView =
+        resolveApi("MapViewOfFile", "morok.win.textchk.clean.mapview");
+    Value *unmapView =
+        resolveApi("UnmapViewOfFile", "morok.win.textchk.clean.unmapview");
+    Value *closeHandle =
+        resolveApi("CloseHandle", "morok.win.textchk.clean.closehandle");
+    Value *pathReady = RB.CreateAnd(
+        paramsPresent,
+        RB.CreateAnd(RB.CreateICmpNE(pathBuffer, ConstantInt::get(ip, 0),
+                                     "morok.win.textchk.clean.path.present"),
+                     RB.CreateICmpNE(pathBytes, ConstantInt::get(i16, 0),
+                                     "morok.win.textchk.clean.path.nonzero"),
+                     "morok.win.textchk.clean.path.ready"),
+        "morok.win.textchk.clean.process.ready");
+    Value *apisReady = RB.CreateAnd(
+        RB.CreateAnd(RB.CreateICmpNE(createFile, ConstantInt::get(ip, 0)),
+                     RB.CreateICmpNE(createMapping, ConstantInt::get(ip, 0)),
+                     "morok.win.textchk.clean.open.apis"),
+        RB.CreateAnd(RB.CreateICmpNE(mapView, ConstantInt::get(ip, 0)),
+                     RB.CreateAnd(
+                         RB.CreateICmpNE(unmapView, ConstantInt::get(ip, 0)),
+                         RB.CreateICmpNE(closeHandle, ConstantInt::get(ip, 0)),
+                         "morok.win.textchk.clean.close.apis"),
+                     "morok.win.textchk.clean.map.apis"),
+        "morok.win.textchk.clean.apis.ready");
+    RB.CreateCondBr(RB.CreateAnd(pathReady, apisReady,
+                                 "morok.win.textchk.clean.ready"),
+                    openBB, retBB);
+
+    IRBuilder<> OB(openBB);
+    auto *createFileTy =
+        FunctionType::get(ip, {ptr, i32, i32, ptr, i32, i32, ip}, false);
+    auto *file = OB.CreateCall(
+        createFileTy,
+        OB.CreateIntToPtr(createFile, ptr,
+                          "morok.win.textchk.clean.createfile.ptr"),
+        {OB.CreateIntToPtr(pathBuffer, ptr,
+                           "morok.win.textchk.clean.path.ptr"),
+         ConstantInt::get(i32, kGenericRead), ConstantInt::get(i32, kShareAll),
+         ConstantPointerNull::get(ptr), ConstantInt::get(i32, kOpenExisting),
+         ConstantInt::get(i32, kFileAttributeNormal),
+         ConstantInt::get(ip, 0)},
+        "morok.win.textchk.clean.file.handle");
+    setWinApiCallConv(file);
+    OB.CreateStore(file, fileSlot)->setVolatile(true);
+    Value *fileOk = OB.CreateAnd(
+        OB.CreateICmpNE(file, ConstantInt::getSigned(ip, -1),
+                        "morok.win.textchk.clean.file.not.invalid"),
+        OB.CreateICmpNE(file, ConstantInt::get(ip, 0),
+                        "morok.win.textchk.clean.file.nonzero"),
+        "morok.win.textchk.clean.file.ok");
+    OB.CreateCondBr(fileOk, mapBB, cleanupFileBB);
+
+    IRBuilder<> MB(mapBB);
+    auto *mappingTy = FunctionType::get(ip, {ip, ptr, i32, i32, i32, ptr},
+                                        false);
+    auto *mapping = MB.CreateCall(
+        mappingTy,
+        MB.CreateIntToPtr(createMapping, ptr,
+                          "morok.win.textchk.clean.createfilemapping.ptr"),
+        {file, ConstantPointerNull::get(ptr),
+         ConstantInt::get(i32, kPageReadonlyImage), ConstantInt::get(i32, 0),
+         ConstantInt::get(i32, 0), ConstantPointerNull::get(ptr)},
+        "morok.win.textchk.clean.map.handle");
+    setWinApiCallConv(mapping);
+    MB.CreateStore(mapping, mapSlot)->setVolatile(true);
+    MB.CreateCondBr(MB.CreateICmpNE(mapping, ConstantInt::get(ip, 0),
+                                    "morok.win.textchk.clean.map.ok"),
+                    viewBB, cleanupMapBB);
+
+    IRBuilder<> VB(viewBB);
+    auto *mapViewTy = FunctionType::get(ip, {ip, i32, i32, i32, ip}, false);
+    auto *view = VB.CreateCall(
+        mapViewTy,
+        VB.CreateIntToPtr(mapView, ptr,
+                          "morok.win.textchk.clean.mapview.ptr"),
+        {mapping, ConstantInt::get(i32, kFileMapRead), ConstantInt::get(i32, 0),
+         ConstantInt::get(i32, 0), ConstantInt::get(ip, 0)},
+        "morok.win.textchk.clean.view.base");
+    setWinApiCallConv(view);
+    VB.CreateStore(view, viewSlot)->setVolatile(true);
+    VB.CreateCondBr(VB.CreateICmpNE(view, ConstantInt::get(ip, 0),
+                                    "morok.win.textchk.clean.view.ok"),
+                    textBB, cleanupViewBB);
+
+    IRBuilder<> TB(textBB);
+    Value *cleanPack =
+        TB.CreateCall(textSection, {view}, "morok.win.textchk.clean.pack");
+    Value *cleanRva32 =
+        TB.CreateTrunc(cleanPack, i32, "morok.win.textchk.clean.rva32");
+    Value *cleanSize32 =
+        TB.CreateTrunc(TB.CreateLShr(cleanPack, ConstantInt::get(i64, 32),
+                                     "morok.win.textchk.clean.size.shift"),
+                       i32, "morok.win.textchk.clean.size32");
+    Value *cleanText = TB.CreateAdd(
+        view, TB.CreateZExt(cleanRva32, ip, "morok.win.textchk.clean.rva"),
+        "morok.win.textchk.clean.text.base");
+    Value *cleanSize =
+        TB.CreateZExt(cleanSize32, ip, "morok.win.textchk.clean.size");
+    Value *smallSize = TB.CreateSelect(
+        TB.CreateICmpULT(liveSize, cleanSize,
+                         "morok.win.textchk.clean.live.smaller"),
+        liveSize, cleanSize, "morok.win.textchk.clean.size.min");
+    Value *limit = TB.CreateSelect(
+        TB.CreateICmpULT(smallSize, ConstantInt::get(ip, kMaxTextScan),
+                         "morok.win.textchk.clean.size.under.cap"),
+        smallSize, ConstantInt::get(ip, kMaxTextScan),
+        "morok.win.textchk.clean.limit");
+    Value *textReady = TB.CreateAnd(
+        TB.CreateICmpNE(cleanPack, ConstantInt::get(i64, 0),
+                        "morok.win.textchk.clean.pack.present"),
+        TB.CreateICmpNE(limit, ConstantInt::get(ip, 0),
+                        "morok.win.textchk.clean.limit.nonzero"),
+        "morok.win.textchk.clean.text.ready");
+    TB.CreateCondBr(textReady, loopBB, cleanupViewBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *idx = LB.CreatePHI(ip, 2, "morok.win.textchk.clean.idx");
+    auto *diffCount =
+        LB.CreatePHI(i32, 2, "morok.win.textchk.clean.diff.count");
+    idx->addIncoming(ConstantInt::get(ip, 0), textBB);
+    diffCount->addIncoming(ConstantInt::get(i32, 0), textBB);
+    LB.CreateCondBr(
+        LB.CreateICmpULT(idx, limit, "morok.win.textchk.clean.cmp.idx"),
+        bodyBB, doneBB);
+
+    IRBuilder<> CB(bodyBB);
+    Value *livePtr =
+        CB.CreateIntToPtr(liveText, ptr, "morok.win.textchk.clean.live.ptr");
+    Value *cleanPtr =
+        CB.CreateIntToPtr(cleanText, ptr, "morok.win.textchk.clean.text.ptr");
+    auto *liveByte =
+        CB.CreateLoad(i8, gepI8(CB, M, livePtr, idx,
+                                "morok.win.textchk.clean.live.byte.ptr"),
+                      "morok.win.textchk.clean.live.byte");
+    liveByte->setVolatile(true);
+    liveByte->setAlignment(Align(1));
+    auto *cleanByte =
+        CB.CreateLoad(i8, gepI8(CB, M, cleanPtr, idx,
+                                "morok.win.textchk.clean.byte.ptr"),
+                      "morok.win.textchk.clean.byte");
+    cleanByte->setVolatile(true);
+    cleanByte->setAlignment(Align(1));
+    Value *different =
+        CB.CreateICmpNE(liveByte, cleanByte,
+                        "morok.win.textchk.clean.byte.diff");
+    Value *nextDiff =
+        CB.CreateAdd(diffCount,
+                     CB.CreateZExt(different, i32,
+                                   "morok.win.textchk.clean.diff.wide"),
+                     "morok.win.textchk.clean.diff.next");
+    Value *nextIdx =
+        CB.CreateAdd(idx, ConstantInt::get(ip, 1),
+                     "morok.win.textchk.clean.next");
+    CB.CreateBr(loopBB);
+    idx->addIncoming(nextIdx, bodyBB);
+    diffCount->addIncoming(nextDiff, bodyBB);
+
+    IRBuilder<> DB(doneBB);
+    Value *limit32 = DB.CreateTrunc(limit, i32,
+                                    "morok.win.textchk.clean.limit32");
+    Value *packed = DB.CreateOr(
+        DB.CreateZExt(diffCount, i64, "morok.win.textchk.clean.diff64"),
+        DB.CreateShl(DB.CreateZExt(limit32, i64,
+                                   "morok.win.textchk.clean.limit64"),
+                     ConstantInt::get(i64, 32)),
+        "morok.win.textchk.clean.result.pack");
+    DB.CreateStore(packed, resultSlot)->setVolatile(true);
+    DB.CreateBr(cleanupViewBB);
+
+    IRBuilder<> UVB(cleanupViewBB);
+    auto *viewLoaded =
+        UVB.CreateLoad(ip, viewSlot, "morok.win.textchk.clean.view.loaded");
+    viewLoaded->setVolatile(true);
+    auto *unmapTy = FunctionType::get(i32, {ptr}, false);
+    auto *unmapBB = BasicBlock::Create(ctx, "unmap", fn);
+    UVB.CreateCondBr(UVB.CreateICmpNE(viewLoaded, ConstantInt::get(ip, 0),
+                                      "morok.win.textchk.clean.view.mapped"),
+                     unmapBB, cleanupMapBB);
+
+    IRBuilder<> UMB(unmapBB);
+    auto *unmapStatus = UMB.CreateCall(
+        unmapTy,
+        UMB.CreateIntToPtr(unmapView, ptr,
+                           "morok.win.textchk.clean.unmapview.ptr"),
+        {UMB.CreateIntToPtr(viewLoaded, ptr,
+                            "morok.win.textchk.clean.view.ptr")},
+        "morok.win.textchk.clean.unmap.status");
+    setWinApiCallConv(unmapStatus);
+    UMB.CreateBr(cleanupMapBB);
+
+    IRBuilder<> CMB(cleanupMapBB);
+    auto *mapLoaded =
+        CMB.CreateLoad(ip, mapSlot, "morok.win.textchk.clean.map.loaded");
+    mapLoaded->setVolatile(true);
+    auto *closeTy = FunctionType::get(i32, {ip}, false);
+    auto *closeMapBB = BasicBlock::Create(ctx, "close.map", fn);
+    CMB.CreateCondBr(CMB.CreateICmpNE(mapLoaded, ConstantInt::get(ip, 0),
+                                      "morok.win.textchk.clean.map.open"),
+                     closeMapBB, cleanupFileBB);
+
+    IRBuilder<> CMH(closeMapBB);
+    auto *closeMap = CMH.CreateCall(
+        closeTy,
+        CMH.CreateIntToPtr(closeHandle, ptr,
+                           "morok.win.textchk.clean.close.map.ptr"),
+        {mapLoaded}, "morok.win.textchk.clean.close.map");
+    setWinApiCallConv(closeMap);
+    CMH.CreateBr(cleanupFileBB);
+
+    IRBuilder<> CFB(cleanupFileBB);
+    auto *fileLoaded =
+        CFB.CreateLoad(ip, fileSlot, "morok.win.textchk.clean.file.loaded");
+    fileLoaded->setVolatile(true);
+    Value *fileOpen = CFB.CreateAnd(
+        CFB.CreateICmpNE(fileLoaded, ConstantInt::getSigned(ip, -1),
+                         "morok.win.textchk.clean.file.loaded.valid"),
+        CFB.CreateICmpNE(fileLoaded, ConstantInt::get(ip, 0),
+                         "morok.win.textchk.clean.file.loaded.nonzero"),
+        "morok.win.textchk.clean.file.open");
+    auto *closeFileBB = BasicBlock::Create(ctx, "close.file", fn);
+    CFB.CreateCondBr(fileOpen, closeFileBB, retBB);
+
+    IRBuilder<> CFH(closeFileBB);
+    auto *closeFile = CFH.CreateCall(
+        closeTy,
+        CFH.CreateIntToPtr(closeHandle, ptr,
+                           "morok.win.textchk.clean.close.file.ptr"),
+        {fileLoaded}, "morok.win.textchk.clean.close.file");
+    setWinApiCallConv(closeFile);
+    CFH.CreateBr(retBB);
+
+    IRBuilder<> RetB(retBB);
+    auto *result =
+        RetB.CreateLoad(i64, resultSlot, "morok.win.textchk.clean.result.load");
+    result->setVolatile(true);
+    RetB.CreateRet(result);
+    return fn;
+}
+
+Function *windowsTextChecksumProbe(Module &M, GlobalVariable *State,
+                                   ir::IRRandom &rng, const Triple &TT) {
+    const bool x86 = TT.getArch() == Triple::x86;
+    const bool x64 = TT.getArch() == Triple::x86_64;
+    if (!TT.isOSWindows() || (!x86 && !x64))
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antidbg.win.textchk"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), {i64},
+                                                  false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antidbg.win.textchk", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *tag = fn->getArg(0);
+    tag->setName("tag");
+
+    Function *pebReader = windowsPebReader(M);
+    Function *textSection = windowsPeTextSection(M);
+    Function *cleanDiff = windowsMappedTextDiffHelper(M, TT);
+    if (!pebReader || !textSection || !cleanDiff)
+        return nullptr;
+
+    const std::uint64_t hashSaltA = rng.next() | 1ULL;
+    const std::uint64_t hashSaltB = rng.next() | 1ULL;
+    const std::uint64_t hashSaltC = rng.next() | 1ULL;
+    const std::uint64_t seedA = rng.next();
+    const std::uint64_t seedB = rng.next();
+    constexpr std::uint64_t kMaxTextScan = 0x01000000ULL;
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *sectionBB = BasicBlock::Create(ctx, "section", fn);
+    auto *parseBB = BasicBlock::Create(ctx, "parse", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "scan.loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "scan.body", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "scan.done", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    Value *peb = B.CreateCall(pebReader, {}, "morok.win.textchk.peb");
+    foldState(B, State, tag, rng.next(), "morok.win.textchk.tag.mix");
+    foldState(B, State, peb, rng.next(), "morok.win.textchk.peb.mix");
+    B.CreateCondBr(B.CreateICmpNE(peb, ConstantInt::get(ip, 0),
+                                  "morok.win.textchk.peb.present"),
+                   sectionBB, retBB);
+
+    IRBuilder<> SB(sectionBB);
+    Value *pebPtr =
+        SB.CreateIntToPtr(peb, ptr, "morok.win.textchk.peb.ptr");
+    Value *imageBase =
+        loadAt(SB, M, ip, pebPtr, x86 ? 0x08 : 0x10,
+               "morok.win.textchk.image.base");
+    foldState(SB, State, imageBase, rng.next(),
+              "morok.win.textchk.image.base.mix");
+    SB.CreateCondBr(SB.CreateICmpNE(imageBase, ConstantInt::get(ip, 0),
+                                    "morok.win.textchk.image.present"),
+                    parseBB, retBB);
+
+    IRBuilder<> PB(parseBB);
+    Value *pack = PB.CreateCall(textSection, {imageBase},
+                                "morok.win.textchk.section.pack");
+    Value *rva32 = PB.CreateTrunc(pack, i32, "morok.win.textchk.rva32");
+    Value *size32 =
+        PB.CreateTrunc(PB.CreateLShr(pack, ConstantInt::get(i64, 32),
+                                     "morok.win.textchk.size.shift"),
+                       i32, "morok.win.textchk.size32");
+    Value *rva = PB.CreateZExt(rva32, ip, "morok.win.textchk.rva");
+    Value *rawSize = PB.CreateZExt(size32, ip, "morok.win.textchk.size.raw");
+    Value *size = PB.CreateSelect(
+        PB.CreateICmpULT(rawSize, ConstantInt::get(ip, kMaxTextScan),
+                         "morok.win.textchk.size.under.cap"),
+        rawSize, ConstantInt::get(ip, kMaxTextScan),
+        "morok.win.textchk.size");
+    Value *textBase = PB.CreateAdd(imageBase, rva, "morok.win.textchk.text.base");
+    Value *textPtr =
+        PB.CreateIntToPtr(textBase, ptr, "morok.win.textchk.text.ptr");
+    Value *hashSeedA =
+        PB.CreateXor(tag, ConstantInt::get(i64, seedA),
+                     "morok.win.textchk.seed.a");
+    Value *hashSeedB =
+        PB.CreateAdd(PB.CreateXor(pack, tag, "morok.win.textchk.seed.b.xor"),
+                     ConstantInt::get(i64, seedB),
+                     "morok.win.textchk.seed.b");
+    foldState(PB, State, pack, rng.next(),
+              "morok.win.textchk.section.pack.mix");
+    Value *ready = PB.CreateAnd(
+        PB.CreateICmpNE(pack, ConstantInt::get(i64, 0),
+                        "morok.win.textchk.section.present"),
+        PB.CreateICmpNE(size, ConstantInt::get(ip, 0),
+                        "morok.win.textchk.size.nonzero"),
+        "morok.win.textchk.ready");
+    PB.CreateCondBr(ready, loopBB, retBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *idx = LB.CreatePHI(ip, 2, "morok.win.textchk.idx");
+    auto *hashA = LB.CreatePHI(i64, 2, "morok.win.textchk.hash.a");
+    auto *hashB = LB.CreatePHI(i64, 2, "morok.win.textchk.hash.b");
+    auto *int3Count = LB.CreatePHI(i32, 2, "morok.win.textchk.int3.count");
+    idx->addIncoming(ConstantInt::get(ip, 0), parseBB);
+    hashA->addIncoming(hashSeedA, parseBB);
+    hashB->addIncoming(hashSeedB, parseBB);
+    int3Count->addIncoming(ConstantInt::get(i32, 0), parseBB);
+    LB.CreateCondBr(LB.CreateICmpULT(idx, size, "morok.win.textchk.scan.idx"),
+                    bodyBB, doneBB);
+
+    IRBuilder<> TB(bodyBB);
+    Value *bytePtr = gepI8(TB, M, textPtr, idx, "morok.win.textchk.byte.ptr");
+    auto *byte = TB.CreateLoad(i8, bytePtr, "morok.win.textchk.byte");
+    byte->setVolatile(true);
+    byte->setAlignment(Align(1));
+    Value *wide = TB.CreateZExt(byte, i64, "morok.win.textchk.byte.wide");
+    Value *idx64 = TB.CreateZExtOrTrunc(idx, i64, "morok.win.textchk.idx64");
+    Value *idxTapA =
+        TB.CreateMul(idx64, ConstantInt::get(i64, hashSaltA),
+                     "morok.win.textchk.hash.a.idx");
+    Value *tapA = TB.CreateAdd(wide, idxTapA, "morok.win.textchk.hash.a.tap");
+    Value *mixA = TB.CreateXor(hashA, tapA, "morok.win.textchk.hash.a.xor");
+    Value *rotA = TB.CreateOr(
+        TB.CreateShl(mixA, ConstantInt::get(i64, 9),
+                     "morok.win.textchk.hash.a.shl"),
+        TB.CreateLShr(mixA, ConstantInt::get(i64, 55),
+                      "morok.win.textchk.hash.a.lshr"),
+        "morok.win.textchk.hash.a.rot");
+    Value *nextHashA = TB.CreateAdd(
+        TB.CreateMul(rotA, ConstantInt::get(i64, hashSaltB),
+                     "morok.win.textchk.hash.a.mul"),
+        ConstantInt::get(i64, hashSaltC), "morok.win.textchk.hash.a.next");
+    Value *shiftedByte = TB.CreateShl(
+        wide, ConstantInt::get(i64, 17), "morok.win.textchk.hash.b.byte");
+    Value *tapB = TB.CreateXor(shiftedByte, idx64,
+                               "morok.win.textchk.hash.b.tap");
+    Value *mixB = TB.CreateAdd(hashB, tapB, "morok.win.textchk.hash.b.add");
+    Value *nextHashB = TB.CreateXor(
+        TB.CreateMul(mixB, ConstantInt::get(i64, hashSaltC),
+                     "morok.win.textchk.hash.b.mul"),
+        TB.CreateLShr(hashB, ConstantInt::get(i64, 23),
+                      "morok.win.textchk.hash.b.feedback"),
+        "morok.win.textchk.hash.b.next");
+    Value *int3 =
+        TB.CreateICmpEQ(byte, ConstantInt::get(i8, 0xCC),
+                        "morok.win.textchk.int3.byte");
+    Value *nextInt3 =
+        TB.CreateAdd(int3Count,
+                     TB.CreateZExt(int3, i32, "morok.win.textchk.int3.wide"),
+                     "morok.win.textchk.int3.count.next");
+    Value *nextIdx =
+        TB.CreateAdd(idx, ConstantInt::get(ip, 1), "morok.win.textchk.next");
+    TB.CreateBr(loopBB);
+    idx->addIncoming(nextIdx, bodyBB);
+    hashA->addIncoming(nextHashA, bodyBB);
+    hashB->addIncoming(nextHashB, bodyBB);
+    int3Count->addIncoming(nextInt3, bodyBB);
+
+    IRBuilder<> DB(doneBB);
+    Value *rotB = DB.CreateOr(
+        DB.CreateShl(hashB, ConstantInt::get(i64, 21),
+                     "morok.win.textchk.hash.b.final.shl"),
+        DB.CreateLShr(hashB, ConstantInt::get(i64, 43),
+                      "morok.win.textchk.hash.b.final.lshr"),
+        "morok.win.textchk.hash.b.final.rot");
+    Value *hashFinal =
+        DB.CreateXor(hashA, rotB, "morok.win.textchk.hash.final");
+    Value *cleanResult = DB.CreateCall(
+        cleanDiff->getFunctionType(), cleanDiff, {peb, textBase, size},
+        "morok.win.textchk.clean.diff");
+    Value *cleanDiff32 =
+        DB.CreateTrunc(cleanResult, i32, "morok.win.textchk.clean.diff32");
+    Value *cleanCompared32 = DB.CreateTrunc(
+        DB.CreateLShr(cleanResult, ConstantInt::get(i64, 32),
+                      "morok.win.textchk.clean.compared.shift"),
+        i32, "morok.win.textchk.clean.compared32");
+    Value *cleanMismatch =
+        DB.CreateAnd(DB.CreateICmpNE(cleanDiff32, ConstantInt::get(i32, 0),
+                                     "morok.win.textchk.clean.mismatch.raw"),
+                     DB.CreateICmpNE(cleanCompared32, ConstantInt::get(i32, 0),
+                                     "morok.win.textchk.clean.compared"),
+                     "morok.win.textchk.clean.mismatch");
+    Value *int3Seen =
+        DB.CreateICmpNE(int3Count, ConstantInt::get(i32, 0),
+                        "morok.win.textchk.int3.seen");
+    foldState(DB, State, hashFinal, rng.next(), "morok.win.textchk.hash.mix");
+    foldState(DB, State, cleanResult, rng.next(),
+              "morok.win.textchk.clean.diff.mix");
+    foldFlag(DB, State, cleanMismatch, 0x376ED8A1C4295B0FULL,
+             "morok.win.textchk.clean");
+    foldState(DB, State, int3Count, rng.next(),
+              "morok.win.textchk.int3.count.mix");
+    foldEnforcedFlag(DB, State, int3Seen, 0x58CB4E1A93D627B5ULL,
+                     "morok.win.textchk.int3");
+    DB.CreateBr(retBB);
+
+    IRBuilder<> RB(retBB);
+    RB.CreateRetVoid();
+    return fn;
+}
+
 Function *windowsHardwareBreakpointProbe(Module &M, GlobalVariable *State,
                                          ir::IRRandom &rng, const Triple &TT) {
     if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
@@ -16094,6 +16684,9 @@ Function *windowsProcessMitigationsProbe(Module &M, GlobalVariable *State,
 void emitWindowsAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
                           ir::IRRandom &rng, const Triple &TT) {
     IRBuilder<> B(&Ctor->getEntryBlock());
+    if (Function *text = windowsTextChecksumProbe(M, State, rng, TT))
+        B.CreateCall(text->getFunctionType(), text,
+                     {ConstantInt::get(B.getInt64Ty(), rng.next())});
     if (Function *dr = windowsHardwareBreakpointProbe(M, State, rng, TT))
         B.CreateCall(dr->getFunctionType(), dr,
                      {ConstantInt::get(B.getInt64Ty(), rng.next())});

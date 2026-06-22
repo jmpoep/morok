@@ -17188,30 +17188,40 @@ entry:
 
     Function *Ctor = M->getFunction("morok.antidbg");
     Function *Probe = M->getFunction("morok.antidbg.probe");
+    Function *WinText = M->getFunction("morok.antidbg.win.textchk");
     Function *WinDr = M->getFunction("morok.antidbg.win.dr");
     Function *Work = M->getFunction("work");
     Function *Main = M->getFunction("main");
     Function *Peb = M->getFunction("morok.win.peb");
+    Function *PeText = M->getFunction("morok.win.pe.text");
+    Function *CleanText = M->getFunction("morok.win.textchk.clean");
     Function *Ldr = M->getFunction("morok.win.ldr.module");
     Function *Resolve = M->getFunction("morok.win.pe.resolve");
     Function *Scan = M->getFunction("morok.win.sys.scan");
     Function *Direct = M->getFunction("morok.win.sys.direct");
     REQUIRE(Ctor != nullptr);
     REQUIRE(Probe != nullptr);
+    REQUIRE(WinText != nullptr);
     REQUIRE(WinDr != nullptr);
     REQUIRE(Work != nullptr);
     REQUIRE(Main != nullptr);
     REQUIRE(Peb != nullptr);
+    REQUIRE(PeText != nullptr);
+    REQUIRE(CleanText != nullptr);
     REQUIRE(Ldr != nullptr);
     REQUIRE(Resolve != nullptr);
     REQUIRE(Scan != nullptr);
     REQUIRE(Direct != nullptr);
+    CHECK(WinText->arg_size() == 1u);
     CHECK(WinDr->arg_size() == 1u);
     CHECK(M->getGlobalVariable("morok.antidbg.state", true) != nullptr);
+    checkSealEnforcement(*M, *WinText);
     checkSealEnforcement(*M, *WinDr);
     CHECK(hasInlineAsmCall(*Peb));
     CHECK(hasInlineAsmCall(*Direct));
+    CHECK(countCallsTo(*Ctor, "morok.antidbg.win.textchk") >= 1u);
     CHECK(countCallsTo(*Ctor, "morok.antidbg.win.dr") >= 1u);
+    CHECK(countCallsTo(*Probe, "morok.antidbg.win.textchk") == 0u);
     CHECK(countCallsTo(*Probe, "morok.antidbg.win.dr") >= 1u);
     const std::size_t userProbeSites =
         countCallsTo(*Work, "morok.antidbg.probe") +
@@ -17222,6 +17232,45 @@ entry:
     CHECK(M->getFunction("SetThreadContext") == nullptr);
     CHECK(M->getFunction("NtGetContextThread") == nullptr);
     CHECK(M->getFunction("NtSetContextThread") == nullptr);
+    CHECK(M->getFunction("CreateFileW") == nullptr);
+    CHECK(M->getFunction("CreateFileMappingW") == nullptr);
+    CHECK(M->getFunction("MapViewOfFile") == nullptr);
+    CHECK(M->getFunction("UnmapViewOfFile") == nullptr);
+    CHECK(M->getFunction("CloseHandle") == nullptr);
+    CHECK(countCallsTo(*WinText, "morok.win.textchk.clean") >= 1u);
+    CHECK(countNamedInstructions(*WinText, "morok.win.textchk.peb") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.image.base") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.section.pack") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.text.base") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.scan.idx") >= 1u);
+    CHECK(countNamedInstructions(*WinText, "morok.win.textchk.byte") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.hash.final") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.clean.mismatch") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.int3.seen") >= 1u);
+    CHECK(countNamedInstructions(*PeText,
+                                 "morok.win.pe.text.execute.flag") >= 1u);
+    CHECK(countNamedInstructions(*PeText, "morok.win.pe.text.pack") >= 1u);
+    CHECK(countNamedInstructions(*CleanText,
+                                 "morok.win.textchk.clean.createfile") >= 1u);
+    CHECK(countNamedInstructions(*CleanText,
+                                 "morok.win.textchk.clean.mapview") >= 1u);
+    CHECK(countNamedInstructions(*CleanText,
+                                 "morok.win.textchk.clean.pack") >= 1u);
+    CHECK(countNamedInstructions(*CleanText,
+                                 "morok.win.textchk.clean.byte.diff") >= 1u);
+    CHECK(countNamedInstructions(*CleanText,
+                                 "morok.win.textchk.clean.result.pack") >= 1u);
+    Instruction *Int3Seen =
+        findNamedInstruction(*WinText, "morok.win.textchk.int3.seen");
+    REQUIRE(Int3Seen != nullptr);
+    CHECK(valueFeedsNamedInstruction(Int3Seen, "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*WinDr, "morok.win.dr.ntdll") >= 1u);
     CHECK(countNamedInstructions(*WinDr,
                                  "morok.win.dr.ntgetcontextthread") >= 1u);
@@ -17246,6 +17295,64 @@ entry:
     Instruction *Active = findNamedInstruction(*WinDr, "morok.win.dr.active");
     REQUIRE(Active != nullptr);
     CHECK(valueFeedsNamedInstruction(Active, "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("antiDebuggingModule emits i686 Windows text checksum probe") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "i686-pc-windows-msvc"
+define i32 @main() {
+entry:
+  ret i32 7
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8824);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::antiDebuggingModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.antidbg");
+    Function *Probe = M->getFunction("morok.antidbg.probe");
+    Function *WinText = M->getFunction("morok.antidbg.win.textchk");
+    Function *Peb = M->getFunction("morok.win.peb");
+    Function *PeText = M->getFunction("morok.win.pe.text");
+    Function *CleanText = M->getFunction("morok.win.textchk.clean");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Probe != nullptr);
+    REQUIRE(WinText != nullptr);
+    REQUIRE(Peb != nullptr);
+    REQUIRE(PeText != nullptr);
+    REQUIRE(CleanText != nullptr);
+    CHECK(M->getFunction("morok.antidbg.win.dr") == nullptr);
+    CHECK(M->getFunction("CreateFileW") == nullptr);
+    CHECK(M->getFunction("CreateFileMappingW") == nullptr);
+    CHECK(M->getFunction("MapViewOfFile") == nullptr);
+    CHECK(WinText->arg_size() == 1u);
+    CHECK(hasInlineAsmCall(*Peb));
+    CHECK(countCallsTo(*Ctor, "morok.antidbg.win.textchk") >= 1u);
+    CHECK(countCallsTo(*Probe, "morok.antidbg.win.textchk") == 0u);
+    CHECK(countCallsTo(*WinText, "morok.win.textchk.clean") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.image.base") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.section.pack") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.hash.final") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.clean.mismatch") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.int3.seen") >= 1u);
+    CHECK(countNamedInstructions(*PeText, "morok.win.pe.text.pack") >= 1u);
+    CHECK(countNamedInstructions(*CleanText,
+                                 "morok.win.textchk.clean.path.buffer") >= 1u);
+    CHECK(countNamedInstructions(*CleanText,
+                                 "morok.win.textchk.clean.result.pack") >= 1u);
+    checkSealEnforcement(*M, *WinText);
+    Instruction *Int3Seen =
+        findNamedInstruction(*WinText, "morok.win.textchk.int3.seen");
+    REQUIRE(Int3Seen != nullptr);
+    CHECK(valueFeedsNamedInstruction(Int3Seen, "morok.seal.fold.anti_debug"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
