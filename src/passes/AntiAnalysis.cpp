@@ -134,6 +134,46 @@ IntegerType *intPtrTy(Module &M) {
     return IntegerType::get(M.getContext(), bits);
 }
 
+GlobalVariable *guardWindowsTlsTargetOnce(Module &M, Function *Target,
+                                          const Twine &Prefix) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    std::string name = (Prefix + ".once").str();
+    if (auto *existing = M.getGlobalVariable(name, /*AllowInternal=*/true))
+        return existing;
+
+    auto *guard = new GlobalVariable(M, i32, /*isConstant=*/false,
+                                     GlobalValue::PrivateLinkage,
+                                     ConstantInt::get(i32, 0), name);
+    guard->setAlignment(Align(4));
+    guard->setDSOLocal(true);
+
+    BasicBlock *oldEntry = &Target->getEntryBlock();
+    auto *guardBB =
+        BasicBlock::Create(ctx, (Prefix + ".once.entry").str(), Target, oldEntry);
+    auto *runBB =
+        BasicBlock::Create(ctx, (Prefix + ".once.run").str(), Target, oldEntry);
+    auto *skipBB =
+        BasicBlock::Create(ctx, (Prefix + ".once.skip").str(), Target, oldEntry);
+
+    IRBuilder<> B(guardBB);
+    auto *cmpxchg = B.CreateAtomicCmpXchg(
+        guard, ConstantInt::get(i32, 0), ConstantInt::get(i32, 1), Align(4),
+        AtomicOrdering::AcquireRelease, AtomicOrdering::Acquire);
+    cmpxchg->setVolatile(true);
+    Value *old = B.CreateExtractValue(cmpxchg, 0, Prefix + ".once.old");
+    Value *first = B.CreateICmpEQ(old, ConstantInt::get(i32, 0),
+                                  Prefix + ".once.first");
+    B.CreateCondBr(first, runBB, skipBB);
+
+    IRBuilder<> RB(runBB);
+    RB.CreateBr(oldEntry);
+
+    IRBuilder<> SB(skipBB);
+    SB.CreateRetVoid();
+    return guard;
+}
+
 bool registerWindowsTlsCallbacks(Module &M, Function *Target, StringRef Stem,
                                  ir::IRRandom &rng, unsigned Count = 4) {
     const Triple TT(M.getTargetTriple());
@@ -154,8 +194,10 @@ bool registerWindowsTlsCallbacks(Module &M, Function *Target, StringRef Stem,
     std::string prefix = (Twine("morok.win.tls.") + Stem).str();
     if (M.getGlobalVariable(prefix + ".0", /*AllowInternal=*/true))
         return false;
+    GlobalVariable *onceGuard = guardWindowsTlsTargetOnce(M, Target, prefix);
 
     SmallVector<GlobalValue *, 24> retained;
+    retained.push_back(onceGuard);
     for (unsigned i = 0; i < Count; ++i) {
         std::string cbName = (Twine(prefix) + ".cb." + Twine(i)).str();
         Function *cb = Function::Create(cbTy, GlobalValue::InternalLinkage,
@@ -166,11 +208,20 @@ bool registerWindowsTlsCallbacks(Module &M, Function *Target, StringRef Stem,
             cb->setCallingConv(CallingConv::X86_StdCall);
         auto argIt = cb->arg_begin();
         (&*argIt++)->setName("image_base");
-        (&*argIt++)->setName("reason");
+        Argument *reason = &*argIt++;
+        reason->setName("reason");
         (&*argIt++)->setName("reserved");
 
         auto *entry = BasicBlock::Create(ctx, "entry", cb);
+        auto *callBB = BasicBlock::Create(ctx, "process.attach", cb);
+        auto *retBB = BasicBlock::Create(ctx, "ret", cb);
         IRBuilder<> B(entry);
+        Value *processAttach =
+            B.CreateICmpEQ(reason, ConstantInt::get(i32, 1),
+                           (Twine(prefix) + ".reason.process_attach").str());
+        B.CreateCondBr(processAttach, callBB, retBB);
+
+        IRBuilder<> CB(callBB);
         std::uint64_t key = rng.next() | 1ULL;
         auto *keyGv = new GlobalVariable(
             M, ip, /*isConstant=*/false, GlobalValue::PrivateLinkage,
@@ -179,54 +230,57 @@ bool registerWindowsTlsCallbacks(Module &M, Function *Target, StringRef Stem,
         keyGv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
         keyGv->setAlignment(Align(ip->getBitWidth() / 8));
         Value *loadedKey =
-            B.CreateLoad(ip, keyGv, (Twine(prefix) + ".key.load").str());
+            CB.CreateLoad(ip, keyGv, (Twine(prefix) + ".key.load").str());
         cast<LoadInst>(loadedKey)->setVolatile(true);
         std::uint64_t salt = rng.next() | 1ULL;
         Value *targetIp =
-            B.CreatePtrToInt(Target, ip, (Twine(prefix) + ".target.ip").str());
+            CB.CreatePtrToInt(Target, ip, (Twine(prefix) + ".target.ip").str());
         Value *encoded = nullptr;
         Value *decoded = nullptr;
         switch ((rng.next() ^ i) & 3ULL) {
         case 0:
-            encoded = B.CreateXor(targetIp, ConstantInt::get(ip, key),
-                                  (Twine(prefix) + ".target.encoded").str());
-            decoded = B.CreateXor(encoded, loadedKey,
-                                  (Twine(prefix) + ".target.decoded").str());
+            encoded = CB.CreateXor(targetIp, ConstantInt::get(ip, key),
+                                   (Twine(prefix) + ".target.encoded").str());
+            decoded = CB.CreateXor(encoded, loadedKey,
+                                   (Twine(prefix) + ".target.decoded").str());
             break;
         case 1:
-            encoded = B.CreateXor(
-                B.CreateAdd(targetIp, ConstantInt::get(ip, key)),
+            encoded = CB.CreateXor(
+                CB.CreateAdd(targetIp, ConstantInt::get(ip, key)),
                 ConstantInt::get(ip, salt),
                 (Twine(prefix) + ".target.encoded").str());
-            decoded = B.CreateSub(
-                B.CreateXor(encoded, ConstantInt::get(ip, salt)),
+            decoded = CB.CreateSub(
+                CB.CreateXor(encoded, ConstantInt::get(ip, salt)),
                 loadedKey, (Twine(prefix) + ".target.decoded").str());
             break;
         case 2:
-            encoded = B.CreateSub(
-                B.CreateXor(targetIp, ConstantInt::get(ip, salt)),
+            encoded = CB.CreateSub(
+                CB.CreateXor(targetIp, ConstantInt::get(ip, salt)),
                 ConstantInt::get(ip, key),
                 (Twine(prefix) + ".target.encoded").str());
-            decoded = B.CreateXor(
-                B.CreateAdd(encoded, loadedKey),
+            decoded = CB.CreateXor(
+                CB.CreateAdd(encoded, loadedKey),
                 ConstantInt::get(ip, salt),
                 (Twine(prefix) + ".target.decoded").str());
             break;
         default:
-            encoded = B.CreateXor(
-                B.CreateAdd(targetIp, ConstantInt::get(ip, salt)),
+            encoded = CB.CreateXor(
+                CB.CreateAdd(targetIp, ConstantInt::get(ip, salt)),
                 ConstantInt::get(ip, key),
                 (Twine(prefix) + ".target.encoded").str());
-            decoded = B.CreateSub(
-                B.CreateXor(encoded, loadedKey),
+            decoded = CB.CreateSub(
+                CB.CreateXor(encoded, loadedKey),
                 ConstantInt::get(ip, salt),
                 (Twine(prefix) + ".target.decoded").str());
             break;
         }
         Value *callee =
-            B.CreateIntToPtr(decoded, ptr, (Twine(prefix) + ".callee").str());
-        B.CreateCall(Target->getFunctionType(), callee, {});
-        B.CreateRetVoid();
+            CB.CreateIntToPtr(decoded, ptr, (Twine(prefix) + ".callee").str());
+        CB.CreateCall(Target->getFunctionType(), callee, {});
+        CB.CreateBr(retBB);
+
+        IRBuilder<> RB(retBB);
+        RB.CreateRetVoid();
 
         auto *slot = new GlobalVariable(
             M, ptr, /*isConstant=*/true, GlobalValue::InternalLinkage, cb,

@@ -643,9 +643,24 @@ void checkWindowsTlsCallbacks(Module &M, StringRef Stem, StringRef CtorName,
 
     Function *Ctor = M.getFunction(CtorName);
     REQUIRE(Ctor != nullptr);
+    GlobalVariable *Once = M.getGlobalVariable(Prefix + ".once", true);
+    REQUIRE(Once != nullptr);
+    CHECK(Once->getValueType()->isIntegerTy(32));
+    CHECK(Once->getAlignment() == 4u);
     GlobalVariable *CompilerUsed = M.getGlobalVariable("llvm.compiler.used");
     REQUIRE(CompilerUsed != nullptr);
     REQUIRE(CompilerUsed->hasInitializer());
+    CHECK(constantReferencesGlobal(CompilerUsed->getInitializer(), Once));
+
+    bool HasOnceCmpxchg = false;
+    for (Instruction &Inst : instructions(*Ctor)) {
+        auto *Cmpxchg = dyn_cast<AtomicCmpXchgInst>(&Inst);
+        if (Cmpxchg &&
+            pointerReferencesGlobal(Cmpxchg->getPointerOperand(), Once))
+            HasOnceCmpxchg = true;
+    }
+    CHECK(HasOnceCmpxchg);
+    CHECK(countNamedInstructions(*Ctor, Prefix + ".once.first") >= 1u);
 
     for (unsigned I = 0; I < 4; ++I) {
         std::string Suffix = std::to_string(I);
@@ -667,6 +682,14 @@ void checkWindowsTlsCallbacks(Module &M, StringRef Stem, StringRef CtorName,
         CHECK(constantReferencesGlobal(Slot->getInitializer(), Cb));
         CHECK(Cb->arg_size() == 3u);
         CHECK(Cb->getCallingConv() == ExpectedConv);
+        CHECK(countNamedInstructions(*Cb, Prefix + ".reason.process_attach") ==
+              1u);
+        auto *EntryBr = dyn_cast<BranchInst>(Cb->getEntryBlock().getTerminator());
+        REQUIRE(EntryBr != nullptr);
+        REQUIRE(EntryBr->isConditional());
+        REQUIRE(EntryBr->getCondition() != nullptr);
+        CHECK(EntryBr->getCondition()->getName().starts_with(
+            Prefix + ".reason.process_attach"));
         CHECK(countNamedInstructions(*Cb, Prefix + ".key.load") >= 1u);
         CHECK(countNamedInstructions(*Cb, Prefix + ".target.decoded") >= 1u);
         CHECK(countNamedInstructions(*Cb, Prefix + ".callee") >= 1u);
