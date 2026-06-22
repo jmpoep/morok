@@ -11979,7 +11979,7 @@ TEST_CASE("dispatcherlessRoutingFunction caps route lowering") {
 TEST_CASE("microcodeStressFunction emits sparse aliased jump-table stress") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
-target triple = "x86_64-unknown-linux-gnu"
+target triple = "x86_64-apple-macosx13.0.0"
 
 define i32 @microstress(i32 %a, i32 %b) {
 entry:
@@ -12095,6 +12095,50 @@ join:
     }
     CHECK(hasAsmBait);
     CHECK(hasAsmDesyncBait);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("microcodeStressFunction skips Linux x86 backend-unstable target") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+
+define i32 @mixed_density(i32 %x) {
+entry:
+  switch i32 %x, label %default [
+    i32 0, label %c0
+    i32 1, label %c1
+    i32 7, label %c7
+    i32 100, label %c100
+    i32 1000, label %c1000
+  ]
+c0:
+  ret i32 1000
+c1:
+  ret i32 1001
+c7:
+  ret i32 1007
+c100:
+  ret i32 2000
+c1000:
+  ret i32 3000
+default:
+  ret i32 0
+}
+)ir");
+    Function *F = M->getFunction("mixed_density");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(4242);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::microcodeStressFunction(
+        *F,
+        {/*probability=*/100, /*max_sites=*/1, /*table_entries=*/16,
+         /*decoy_blocks=*/4, /*alias_stores=*/2},
+        rng));
+    CHECK(countNamedAllocas(*F, "morok.micro.scratch") == 0u);
+    CHECK(countGlobals(*M, "morok.micro.table") == 0u);
+    CHECK(M->getFunction("morok.micro.analysis.bait") == nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

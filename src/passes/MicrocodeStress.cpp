@@ -53,6 +53,14 @@ bool isGeneratedFunction(const Function &F) {
     return F.getName().starts_with("morok.");
 }
 
+bool isLinuxX86_64Target(const Function &F) {
+    const Module *M = F.getParent();
+    if (!M)
+        return false;
+    const Triple TT(M->getTargetTriple());
+    return TT.getArch() == Triple::x86_64 && TT.isOSLinux();
+}
+
 bool isGeneratedBlock(const BasicBlock &BB) {
     return BB.getName().starts_with("morok.micro");
 }
@@ -477,9 +485,13 @@ void shuffleBlocks(std::vector<BasicBlock *> &Blocks, ir::IRRandom &rng) {
 
 bool microcodeStressFunction(Function &F, const MicrocodeStressParams &params,
                              ir::IRRandom &rng) {
-    if (F.isDeclaration() || isGeneratedFunction(F) || params.probability == 0 ||
-        params.max_sites == 0 || params.table_entries == 0 ||
-        params.decoy_blocks == 0)
+    // LLVM 23's Linux x86_64 backend currently aborts when this pass's
+    // blockaddress/indirectbr stress is combined with optimized switch-heavy
+    // user functions (cf_switch_sparse::mixed_density in the portable sweep).
+    // Do not emit a transform the target backend cannot reliably lower.
+    if (F.isDeclaration() || isGeneratedFunction(F) || isLinuxX86_64Target(F) ||
+        params.probability == 0 || params.max_sites == 0 ||
+        params.table_entries == 0 || params.decoy_blocks == 0)
         return false;
 
     std::vector<BasicBlock *> Blocks;
