@@ -21,6 +21,7 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <initializer_list>
 
@@ -33,6 +34,7 @@ namespace {
 constexpr StringLiteral kCtorName = "morok.tracer.attest";
 constexpr StringLiteral kShareName = "morok.tracer.share";
 constexpr std::uint32_t kMaxShares = 4;
+constexpr std::uint32_t kRepairSites = 3;
 constexpr std::uint32_t kAttachRetries = 16;
 
 enum LinuxX64Syscall : std::uint32_t {
@@ -202,8 +204,8 @@ void emitChildExit(IRBuilder<> &B, Module &M) {
 
 void emitShareRound(Module &M, Function &Ctor, IRBuilder<> &B,
                     Function *ShareHelper, GlobalVariable *AntiBuddyPid,
-                    bool BindToRuntimeSeal, std::uint32_t Index,
-                    std::uint64_t FoldSalt) {
+                    bool BindToRuntimeSeal, bool EnableRepair,
+                    std::uint32_t Index, std::uint64_t FoldSalt) {
     LLVMContext &Ctx = M.getContext();
     auto *I32 = Type::getInt32Ty(Ctx);
     auto *I64 = Type::getInt64Ty(Ctx);
@@ -226,6 +228,30 @@ void emitShareRound(Module &M, Function &Ctor, IRBuilder<> &B,
     auto *FallbackStore = B.CreateStore(Fallback, Slot);
     FallbackStore->setVolatile(true);
     FallbackStore->setAlignment(Align(8));
+    std::array<AllocaInst *, kRepairSites> RepairSlots{};
+    if (EnableRepair) {
+        for (std::uint32_t I = 0; I < kRepairSites; ++I) {
+            AllocaInst *Repair =
+                B.CreateAlloca(I64, nullptr, "morok.tracer.repair.slot");
+            RepairSlots[I] = Repair;
+            Value *RepairSeed =
+                B.CreatePtrToInt(Repair, I64, "morok.tracer.repair.fail.slot");
+            RepairSeed = B.CreateXor(
+                RepairSeed,
+                ConstantInt::get(I64, FoldSalt ^ (0xA7u + I * 0x31u)),
+                "morok.tracer.repair.fail.seed");
+            Value *RepairFallback =
+                mix64(B, RepairSeed,
+                      0xC6BC279692B5CC83ULL ^ (I * 0x9E3779B97F4A7C15ULL),
+                      "morok.tracer.repair.fail.mix");
+            RepairFallback = B.CreateOr(
+                RepairFallback, ConstantInt::get(I64, 1),
+                "morok.tracer.repair.fail.nonzero");
+            auto *RepairStore = B.CreateStore(RepairFallback, Repair);
+            RepairStore->setVolatile(true);
+            RepairStore->setAlignment(Align(8));
+        }
+    }
 
     Value *Pid = emitLinuxSyscall(B, M, SysFork, {}, "morok.tracer.fork");
     BasicBlock *ChildBB = BasicBlock::Create(Ctx, "morok.tracer.child", &Ctor);
@@ -252,6 +278,21 @@ void emitShareRound(Module &M, Function &Ctor, IRBuilder<> &B,
                            ChildB.CreateZExtOrTrunc(Self, I64), SlotAddr,
                            ConstantInt::get(I64, Index)},
                           "morok.tracer.child.share");
+    std::array<Value *, kRepairSites> ChildRepairAddrs{};
+    std::array<Value *, kRepairSites> ChildRepairWords{};
+    if (EnableRepair) {
+        for (std::uint32_t I = 0; I < kRepairSites; ++I) {
+            ChildRepairAddrs[I] =
+                ChildB.CreatePtrToInt(RepairSlots[I], I64,
+                                      "morok.tracer.repair.child.slot");
+            ChildRepairWords[I] = ChildB.CreateCall(
+                ShareHelper->getFunctionType(), ShareHelper,
+                {ChildB.CreateZExtOrTrunc(Parent, I64),
+                 ChildB.CreateZExtOrTrunc(Self, I64), ChildRepairAddrs[I],
+                 ConstantInt::get(I64, Index * 17u + I + 0x51u)},
+                "morok.tracer.repair.child.word");
+        }
+    }
     BasicBlock *AttachBB =
         BasicBlock::Create(Ctx, "morok.tracer.attach", &Ctor);
     BasicBlock *AttachedBB =
@@ -302,6 +343,15 @@ void emitShareRound(Module &M, Function &Ctor, IRBuilder<> &B,
     Value *WordIP = AttachedB.CreateZExtOrTrunc(Word, IP);
     emitPtrace(AttachedB, M, PtracePokeData, Parent, SlotAddr, WordIP,
                "morok.tracer.poke");
+    if (EnableRepair) {
+        for (std::uint32_t I = 0; I < kRepairSites; ++I) {
+            Value *RepairIP =
+                AttachedB.CreateZExtOrTrunc(ChildRepairWords[I], IP);
+            emitPtrace(AttachedB, M, PtracePokeData, Parent,
+                       ChildRepairAddrs[I], RepairIP,
+                       "morok.tracer.repair.poke");
+        }
+    }
     emitPtrace(AttachedB, M, PtraceDetach, Parent, ConstantInt::get(IP, 0),
                ConstantInt::get(IP, 0), "morok.tracer.detach");
     AttachedB.CreateBr(ChildExitBB);
@@ -343,23 +393,50 @@ void emitShareRound(Module &M, Function &Ctor, IRBuilder<> &B,
                          "morok.tracer.expected");
     Value *WordDiff =
         FoldB.CreateXor(Loaded, Expected, "morok.tracer.word.diff");
+    Value *CombinedDiff = WordDiff;
+    if (EnableRepair) {
+        for (std::uint32_t I = 0; I < kRepairSites; ++I) {
+            auto *RepairLoaded =
+                FoldB.CreateLoad(I64, RepairSlots[I],
+                                 "morok.tracer.repair.word");
+            RepairLoaded->setVolatile(true);
+            RepairLoaded->setAlignment(Align(8));
+            Value *RepairAddr =
+                FoldB.CreatePtrToInt(RepairSlots[I], I64,
+                                     "morok.tracer.repair.parent.slot");
+            Value *ExpectedRepair = FoldB.CreateCall(
+                ShareHelper->getFunctionType(), ShareHelper,
+                {FoldB.CreateZExtOrTrunc(ParentSelf, I64),
+                 FoldB.CreateZExtOrTrunc(Pid, I64), RepairAddr,
+                 ConstantInt::get(I64, Index * 17u + I + 0x51u)},
+                "morok.tracer.repair.expected");
+            Value *RepairDiff =
+                FoldB.CreateXor(RepairLoaded, ExpectedRepair,
+                                "morok.tracer.repair.word.diff");
+            Value *Weighted = FoldB.CreateMul(
+                RepairDiff,
+                ConstantInt::get(I64, (0xD1B54A32D192ED03ULL +
+                                       I * 0x9E3779B97F4A7C15ULL) |
+                                          1ULL),
+                "morok.tracer.repair.weighted.diff");
+            CombinedDiff =
+                FoldB.CreateXor(CombinedDiff, Weighted,
+                                "morok.tracer.repair.combined.diff");
+        }
+    }
     Value *Mismatch = FoldB.CreateICmpNE(
-        WordDiff, ConstantInt::get(I64, 0), "morok.tracer.word.bad");
-    // Zero-on-clean (#97): fold the DIFF between the delivered share and the
-    // expected share into the tracer seal, NOT the raw delivered word.  On a
-    // clean attach the child pokes exactly the expected (non-zero) share, so the
-    // diff is zero and foldWord leaves the tracer channel at its S0 baseline —
-    // keeping the VM keystream and self-checksum consumers (encoded against the
-    // clean zero-delta state) correct.  Folding the always-non-zero raw word
-    // moved the seal off S0 on every clean run and corrupted untampered VM
-    // bytecode / checksum constants.  Tamper (a debugger steals the trace, so
-    // the child cannot poke the expected share) makes the diff non-zero, the
-    // seal diverges, and seal-dependent code fails closed.
+        CombinedDiff, ConstantInt::get(I64, 0), "morok.tracer.word.bad");
+    // Zero-on-clean (#97): fold the DIFF between delivered and expected words
+    // into the tracer seal, NOT raw delivered words. On a clean attach the child
+    // pokes exactly the expected non-zero words, so the combined diff is zero
+    // and foldWord leaves the tracer channel at its S0 baseline. Tamper makes
+    // the diff non-zero, the seal diverges, and seal-dependent code fails
+    // closed.
     // The bind_to_runtime_seal opt-out must also leave any pre-existing seal
     // channels alone, because another pass may have created them already.
     if (BindToRuntimeSeal) {
-        runtime_seal::foldWord(FoldB, runtime_seal::kTracerChannel, WordDiff,
-                               FoldSalt, "morok.tracer.seal");
+        runtime_seal::foldWord(FoldB, runtime_seal::kTracerChannel,
+                               CombinedDiff, FoldSalt, "morok.tracer.seal");
         runtime_seal::foldFlag(FoldB, runtime_seal::kAntiDebugChannel, Mismatch,
                                FoldSalt ^ 0x8A6F0E4D27D5C139ULL,
                                "morok.tracer.antidbg");
@@ -394,9 +471,11 @@ bool tracerAttestationModule(Module &M, const TracerAttestationParams &Params,
 
     IRBuilder<> B(&Ctor->getEntryBlock());
     const std::uint32_t ShareCount = std::min(Params.shares, kMaxShares);
+    const bool EnableRepair = ShareCount >= kMaxShares;
     for (std::uint32_t I = 0; I < ShareCount; ++I)
         emitShareRound(M, *Ctor, B, ShareHelper, AntiBuddyPid,
-                       Params.bind_to_runtime_seal, I, Rng.next());
+                       Params.bind_to_runtime_seal, EnableRepair, I,
+                       Rng.next());
     B.CreateRetVoid();
     appendToGlobalCtors(M, Ctor, 0);
     return true;

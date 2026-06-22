@@ -10900,6 +10900,7 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.expected") == 2u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.seal.next") == 2u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.antidbg.next") == 2u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.poke") == 0u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.fail.nonzero") == 2u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.child.fail.nonzero") ==
           2u);
@@ -10933,6 +10934,54 @@ entry:
         CHECK(I.getNumUses() >= 2u);
     }
     CHECK(diffXors == 2u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("tracerAttestationModule emits max-share repair loop") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() {
+entry:
+  ret i32 0
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(97109);
+    morok::ir::IRRandom rng(engine);
+
+    morok::passes::TracerAttestationParams params;
+    params.shares = 4;
+    CHECK(morok::passes::tracerAttestationModule(*M, params, rng));
+
+    Function *Ctor = M->getFunction("morok.tracer.attest");
+    Function *Share = M->getFunction("morok.tracer.share");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Share != nullptr);
+    CHECK(countCallsTo(*Ctor, "morok.tracer.share") == 32u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.fork") == 4u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.poke") == 4u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.poke") == 12u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.child.word") ==
+          12u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.expected") == 12u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.word.diff") ==
+          12u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.weighted.diff") ==
+          12u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.combined.diff") ==
+          12u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.seal.next") == 4u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.antidbg.next") == 4u);
+
+    std::size_t repairDiffs = 0;
+    for (Instruction &I : instructions(*Ctor)) {
+        if (!I.getName().starts_with("morok.tracer.repair.word.diff"))
+            continue;
+        ++repairDiffs;
+        CHECK(valueFeedsNamedInstruction(&I,
+                                         "morok.tracer.repair.weighted.diff"));
+    }
+    CHECK(repairDiffs == 12u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
