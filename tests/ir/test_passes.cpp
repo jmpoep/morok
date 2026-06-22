@@ -14260,6 +14260,78 @@ TEST_CASE("stringEncryptModule keeps load-scoped decryptors out of loops") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE(
+    "stringEncryptModule uses function scope for mixed loop and direct loads") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("mixed-loop-load-string", ctx);
+    M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+    const std::string MixedText(128, 'm');
+    GlobalVariable *Text = makePrivateString(*M, "mixed.loop.str", MixedText);
+
+    auto *I8 = Type::getInt8Ty(ctx);
+    auto *I32 = Type::getInt32Ty(ctx);
+    auto *I64 = Type::getInt64Ty(ctx);
+    Function *Marker =
+        Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                         GlobalValue::ExternalLinkage, "marker", *M);
+    FunctionType *FT = FunctionType::get(I32, {I64}, false);
+    Function *Scan =
+        Function::Create(FT, GlobalValue::ExternalLinkage, "mixed_scan", *M);
+    Argument *Limit = Scan->getArg(0);
+    Limit->setName("n");
+
+    BasicBlock *Entry = BasicBlock::Create(ctx, "entry", Scan);
+    BasicBlock *Body = BasicBlock::Create(ctx, "body", Scan);
+    BasicBlock *Exit = BasicBlock::Create(ctx, "exit", Scan);
+    IRBuilder<> B(Entry);
+    B.CreateBr(Body);
+
+    B.SetInsertPoint(Body);
+    PHINode *I = B.CreatePHI(I64, 2, "i");
+    PHINode *Sum = B.CreatePHI(I32, 2, "sum");
+    I->addIncoming(B.getInt64(0), Entry);
+    Sum->addIncoming(B.getInt32(0), Entry);
+    Value *LoopPtr = B.CreateInBoundsGEP(Text->getValueType(), Text,
+                                         {B.getInt64(0), I}, "loop.p");
+    Value *LoopByte = B.CreateLoad(I8, LoopPtr, "loop.c");
+    Value *LoopWide = B.CreateZExt(LoopByte, I32, "loop.cz");
+    Value *NextSum = B.CreateAdd(Sum, LoopWide, "sum.next");
+    Value *Next = B.CreateAdd(I, B.getInt64(1), "next");
+    I->addIncoming(Next, Body);
+    Sum->addIncoming(NextSum, Body);
+    B.CreateCondBr(B.CreateICmpULT(Next, Limit, "more"), Body, Exit);
+
+    B.SetInsertPoint(Exit);
+    Value *TailPtr = B.CreateInBoundsGEP(Text->getValueType(), Text,
+                                         {B.getInt64(0), B.getInt64(0)},
+                                         "tail.p");
+    Value *TailByte = B.CreateLoad(I8, TailPtr, "tail.c");
+    B.CreateCall(Marker->getFunctionType(), Marker, {});
+    Value *TailWide = B.CreateZExt(TailByte, I32, "tail.cz");
+    B.CreateRet(B.CreateXor(NextSum, TailWide, "mixed.out"));
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6117);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
+
+    Function *Use = M->getFunction("mixed_scan");
+    REQUIRE(Use);
+    BasicBlock *LoopBody = nullptr;
+    for (BasicBlock &BB : *Use)
+        if (BB.getName() == "body")
+            LoopBody = &BB;
+    REQUIRE(LoopBody);
+    CHECK(countCallsTo(*Use, "morok.strdec") == 1u);
+    CHECK(countCallsTo(*Use, "morok.strrel") == 1u);
+    CHECK(countCallsTo(*LoopBody, "morok.strdec") == 0u);
+    CHECK(countCallsTo(*LoopBody, "morok.strrel") == 0u);
+    CHECK(callToPrecedes(*Use, "marker", "morok.strrel"));
+    CHECK_FALSE(callToPrecedes(*Use, "morok.strrel", "marker"));
+    CHECK_FALSE(hasReadableByteString(*M, MixedText));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("stringEncryptModule avoids load-scoped decryptors for large loads") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("large-load-string", ctx);

@@ -539,6 +539,7 @@ struct LoopScopePlan {
 bool collectLoadLoopScopes(ArrayRef<LoadInst *> Loads, LoopScopePlan &Plan,
                            bool &SawLoopLoad) {
     SawLoopLoad = false;
+    bool SawNonLoopLoad = false;
     SmallPtrSet<BasicBlock *, 16> SeenPreheaders;
     SmallPtrSet<BasicBlock *, 16> SeenExits;
     SmallPtrSet<Function *, 8> Checked;
@@ -557,8 +558,12 @@ bool collectLoadLoopScopes(ArrayRef<LoadInst *> Loads, LoopScopePlan &Plan,
                 CandidateLI->getFunction() != F)
                 continue;
             Loop *L = LI.getLoopFor(CandidateLI->getParent());
-            if (!L)
+            if (!L) {
+                // Mixed loop/non-loop sites need the caller's function-scope
+                // fallback; keep scanning so SawLoopLoad remains accurate.
+                SawNonLoopLoad = true;
                 continue;
+            }
             SawLoopLoad = true;
             while (Loop *Parent = L->getParentLoop())
                 L = Parent;
@@ -592,7 +597,7 @@ bool collectLoadLoopScopes(ArrayRef<LoadInst *> Loads, LoopScopePlan &Plan,
                     Plan.exits.push_back(Exit);
         }
     }
-    return true;
+    return !SawNonLoopLoad;
 }
 
 bool hasMustTailReturn(const SmallPtrSetImpl<Function *> &Funcs) {
