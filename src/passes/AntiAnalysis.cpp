@@ -9799,22 +9799,66 @@ Value *bufferHasLinuxAnonymousExecMap(IRBuilder<> &B, Module &M,
                          MB.CreateOr(isChar(p3, 'p'), isChar(p3, 's')))),
         Name + ".perms");
     Value *seenSlash = ConstantInt::getFalse(ctx);
+    Value *seenBracket = ConstantInt::getFalse(ctx);
+    Value *seenPathNonSpace = ConstantInt::getFalse(ctx);
     Value *seenNewline = ConstantInt::getFalse(ctx);
+    Value *inToken = ConstantInt::getFalse(ctx);
+    Value *fieldCount = ConstantInt::get(i8, 0);
+    // /proc/self/maps pathnames start after offset/dev/inode. Bracketed
+    // kernel pseudo-maps like [vdso] are named mappings, not anonymous JIT
+    // scratch pages.
     for (std::uint64_t off = 5; off < 86; ++off) {
         Value *ch = loadAt(MB, M, i8, Buf,
                            MB.CreateAdd(idx, ConstantInt::get(ip, off)),
                            Name + ".path.ch");
         Value *beforeNl = MB.CreateNot(seenNewline);
+        Value *isNl = isChar(ch, '\n');
+        Value *isSpace =
+            MB.CreateOr(isChar(ch, ' '), isChar(ch, '\t'), Name + ".path.ws");
+        Value *terminator =
+            MB.CreateOr(isSpace, isNl, Name + ".path.terminator");
+        Value *dataChar =
+            MB.CreateAnd(beforeNl, MB.CreateNot(terminator), Name + ".path.data");
+        Value *pathField = MB.CreateAnd(
+            beforeNl,
+            MB.CreateICmpUGE(fieldCount, ConstantInt::get(i8, 3),
+                             Name + ".path.field"),
+            Name + ".path.field.ready");
+        Value *pathChar =
+            MB.CreateAnd(pathField, dataChar, Name + ".path.nonspace");
         seenSlash =
-            MB.CreateOr(seenSlash, MB.CreateAnd(beforeNl, isChar(ch, '/')),
+            MB.CreateOr(seenSlash, MB.CreateAnd(pathChar, isChar(ch, '/')),
                         Name + ".path.slash");
+        seenBracket =
+            MB.CreateOr(seenBracket, MB.CreateAnd(pathChar, isChar(ch, '[')),
+                        Name + ".path.bracket");
+        seenPathNonSpace =
+            MB.CreateOr(seenPathNonSpace, pathChar, Name + ".path.any");
+        Value *tokenEnd = MB.CreateAnd(
+            MB.CreateAnd(beforeNl, inToken, Name + ".path.token.live"),
+            terminator, Name + ".path.token.end");
+        Value *tokenStart = MB.CreateAnd(
+            MB.CreateAnd(beforeNl, MB.CreateNot(inToken),
+                         Name + ".path.token.idle"),
+            dataChar, Name + ".path.token.start");
+        fieldCount = MB.CreateAdd(fieldCount, MB.CreateZExt(tokenEnd, i8),
+                                  Name + ".path.field.count");
+        inToken =
+            MB.CreateOr(MB.CreateAnd(inToken, MB.CreateNot(tokenEnd),
+                                     Name + ".path.token.keep"),
+                        tokenStart, Name + ".path.token");
         seenNewline =
-            MB.CreateOr(seenNewline, isChar(ch, '\n'), Name + ".path.nl");
+            MB.CreateOr(seenNewline, isNl, Name + ".path.nl");
     }
+    Value *pathClear = MB.CreateAnd(
+        MB.CreateAnd(MB.CreateNot(seenSlash), MB.CreateNot(seenBracket),
+                     Name + ".path.pseudo.clear"),
+        MB.CreateNot(seenPathNonSpace, Name + ".path.empty"),
+        Name + ".path.clear");
     Value *anonExec = MB.CreateAnd(
         permWindow,
         MB.CreateAnd(MB.CreateAnd(isChar(p2, 'x'), isChar(p3, 'p')),
-                     MB.CreateNot(seenSlash)),
+                     pathClear),
         Name + ".anon.exec");
     MB.CreateCondBr(anonExec, hitBB, nextBB);
 

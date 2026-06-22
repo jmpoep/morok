@@ -16711,6 +16711,17 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Dbi,
                                  "morok.antihook.dbi.jit.maps.anon") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.jit.maps.anon.path.bracket") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.jit.maps.anon.path.nonspace") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.jit.maps.anon.path.field") >= 1u);
+    Instruction *AnonPathEmpty = findNamedInstruction(
+        *Dbi, "morok.antihook.dbi.jit.maps.anon.path.empty");
+    REQUIRE(AnonPathEmpty != nullptr);
+    CHECK(valueFeedsNamedInstruction(
+        AnonPathEmpty, "morok.antihook.dbi.jit.maps.anon.anon.exec"));
     CHECK(countNamedInstructions(*Dbi,
                                  "morok.antihook.dbi.jit.diff.shift") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.thread.sig") >= 1u);
