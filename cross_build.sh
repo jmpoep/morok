@@ -55,6 +55,7 @@ BUILD_LINUX=1
 BUILD_MACOS=1
 STRIP_BINARIES=1
 CLEAN_OUT=0
+CHECK_CLEAN_DIR=0
 
 LINUX_TARGET="${LINUX_TARGET:-x86_64-linux-musl}"
 LINUX_CC="${LINUX_CC:-}"
@@ -134,6 +135,40 @@ root_path() {
   esac
 }
 
+canonical_path() {
+  need_tool "$PYTHON"
+  "$PYTHON" - "$1" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+}
+
+validate_clean_out_dir() {
+  local base out
+  base="$(canonical_path "$BUILD_DIR")" ||
+    die "could not canonicalize BUILD_DIR: '$BUILD_DIR'"
+  out="$(canonical_path "$OUT_DIR")" ||
+    die "could not canonicalize OUT_DIR: '$OUT_DIR'"
+
+  [ -n "$base" ] || die "refusing to --clean empty BUILD_DIR"
+  [ "$base" != "/" ] || die "refusing to --clean with root BUILD_DIR"
+  [ -n "$out" ] || die "refusing to --clean empty OUT_DIR"
+  [ "$out" != "/" ] || die "refusing to --clean root OUT_DIR"
+  [ "$out" != "$base" ] ||
+    die "refusing to --clean build directory itself: '$OUT_DIR'"
+
+  case "$out" in
+    "$base"/*) ;;
+    *)
+      die "refusing to --clean unsafe OUT_DIR: '$OUT_DIR' resolves to '$out' outside '$base'"
+      ;;
+  esac
+
+  OUT_DIR="$out"
+}
+
 # Build the derived static-link config: the chosen preset/config with
 # function_call_obfuscate forced off (dlsym-based FCO cannot work in a static
 # binary).  A pre-existing [passes.function_call_obfuscate] table in the source
@@ -193,6 +228,9 @@ while [ "$#" -gt 0 ]; do
     # Test hook: print the resolved Morok seed and exit (see
     # tests/e2e/cross_build_seed.sh).
     --emit-seed) printf '%s\n' "$SEED"; exit 0 ;;
+    # Test hook: validate and print the canonical --clean target without
+    # deleting it (see tests/e2e/cross_build_clean.sh).
+    --check-clean-dir) CHECK_CLEAN_DIR=1; shift ;;
     --) shift; break ;;
     -*)
       die "unknown option: $1"
@@ -206,9 +244,18 @@ done
 
 [ "$BUILD_LINUX" -eq 1 ] || [ "$BUILD_MACOS" -eq 1 ] || die "nothing to build"
 
+BUILD_DIR="$(root_path "$BUILD_DIR")"
 SRC="$(root_path "$SRC")"
 OUT_DIR="$(root_path "$OUT_DIR")"
 PLUGIN="$(root_path "$PLUGIN")"
+
+if [ "$CHECK_CLEAN_DIR" -eq 1 ]; then
+  [ "$CLEAN_OUT" -eq 1 ] || die "--check-clean-dir requires --clean"
+  validate_clean_out_dir
+  printf '%s\n' "$OUT_DIR"
+  exit 0
+fi
+
 [ -f "$SRC" ] || die "source not found: $SRC"
 
 if [ ! -f "$PLUGIN" ] && [ -f "$BUILD_DIR/CMakeCache.txt" ]; then
@@ -235,13 +282,13 @@ need_tool "$COMPILER"
 # Stale artifacts from a previous run persist in OUT_DIR (this script only
 # mkdir -p's it), and the release audit scans the whole directory — so a binary
 # left over from a different flag set (e.g. a static build before --dynamic) can
-# fail the bundle.  --clean wipes OUT_DIR first.  Guard against an empty or root
-# path so a misconfigured OUT_DIR can never `rm -rf /`.
+# fail the bundle.  --clean wipes OUT_DIR first, but only after resolving it to
+# a strict descendant of BUILD_DIR so '.', '..', symlink escapes, $HOME, and
+# arbitrary absolute paths never reach rm -rf.
 if [ "$CLEAN_OUT" -eq 1 ]; then
-  case "$OUT_DIR" in
-    "" | "/" ) die "refusing to --clean unsafe OUT_DIR: '$OUT_DIR'" ;;
-    * ) echo ">> cleaning $OUT_DIR"; rm -rf "$OUT_DIR" ;;
-  esac
+  validate_clean_out_dir
+  echo ">> cleaning $OUT_DIR"
+  rm -rf "$OUT_DIR"
 fi
 
 mkdir -p "$OUT_DIR"
