@@ -571,16 +571,16 @@ Value *emitDarwinTaskGetExceptionPorts(
             StructType::get(Ctx, {I32, I32, I32, I32, I32, I32});
         auto *NdrTy = ArrayType::get(I8, 8);
         auto *ReqTy = StructType::get(Ctx, {HeaderTy, NdrTy, I32});
-        auto *PortDescTy = StructType::get(Ctx, {I32, I32, I32});
-        auto *PortDescArrayTy = ArrayType::get(PortDescTy, 32);
-        auto *I32ArrayTy = ArrayType::get(I32, 32);
-        auto *ReplyTy =
-            StructType::get(Ctx, {HeaderTy, I32, PortDescArrayTy, NdrTy, I32,
-                                  I32ArrayTy, I32ArrayTy, I32ArrayTy});
         auto *MsgTy = ArrayType::get(I8, 816);
 
+        constexpr std::uint32_t kMaxExceptionPorts = 32;
         constexpr std::uint32_t kRequestSize = 36;
         constexpr std::uint32_t kMessageBufferSize = 816;
+        constexpr std::uint32_t kReplyDescriptorCountOffset = 24;
+        constexpr std::uint32_t kReplyDescriptorsOffset = 28;
+        constexpr std::uint32_t kMachPortDescriptorSize = 12;
+        constexpr std::uint32_t kNdrSize = 8;
+        constexpr std::uint32_t kI32Size = 4;
         constexpr std::uint32_t kTaskGetExceptionPortsId = 3414;
         constexpr std::uint32_t kTaskGetExceptionPortsReplyId = 3514;
         constexpr std::uint32_t kMachMsgBitsCopySendMakeSendOnce =
@@ -592,6 +592,24 @@ Value *emitDarwinTaskGetExceptionPorts(
             B.CreateAlloca(MsgTy, nullptr, Name + ".mig.message");
         B.CreateMemSet(Msg, ConstantInt::get(I8, 0),
                        ConstantInt::get(IP, kMessageBufferSize), MaybeAlign(4));
+        auto gepI8 = [&](IRBuilder<> &Builder, Value *Offset,
+                         const Twine &GepName) -> Value * {
+            return Builder.CreateInBoundsGEP(I8, Msg, Offset, GepName);
+        };
+        auto gepI8Const = [&](IRBuilder<> &Builder, std::uint32_t Offset,
+                              const Twine &GepName) -> Value * {
+            return gepI8(Builder, ConstantInt::get(IP, Offset), GepName);
+        };
+        auto loadI32At = [&](IRBuilder<> &Builder, Value *Offset,
+                             const Twine &LoadName) -> LoadInst * {
+            Value *Ptr = gepI8(Builder, Offset, LoadName + ".ptr");
+            return Builder.CreateAlignedLoad(I32, Ptr, Align(4), LoadName);
+        };
+        auto loadI32AtConst = [&](IRBuilder<> &Builder, std::uint32_t Offset,
+                                  const Twine &LoadName) -> LoadInst * {
+            Value *Ptr = gepI8Const(Builder, Offset, LoadName + ".ptr");
+            return Builder.CreateAlignedLoad(I32, Ptr, Align(4), LoadName);
+        };
 
         Value *ReplyPort =
             emitDarwinMachTrap0(B, M, TT, -26, Name + ".reply_port");
@@ -664,18 +682,15 @@ Value *emitDarwinTaskGetExceptionPorts(
         }
         Value *MsgRc32 = B.CreateTruncOrBitCast(MsgRc, I32, Name + ".rc");
 
-        Value *ReplyHeader = B.CreateStructGEP(ReplyTy, Msg, 0);
-        Value *ReplyBits = B.CreateLoad(
-            I32, B.CreateStructGEP(HeaderTy, ReplyHeader, 0),
-            Name + ".reply.bits");
-        Value *ReplyId = B.CreateLoad(
-            I32, B.CreateStructGEP(HeaderTy, ReplyHeader, 5),
-            Name + ".reply.id");
-        Value *DescriptorCount = B.CreateLoad(
-            I32, B.CreateStructGEP(ReplyTy, Msg, 1),
-            Name + ".reply.descriptors");
-        Value *ReplyCount = B.CreateLoad(I32, B.CreateStructGEP(ReplyTy, Msg, 4),
-                                         Name + ".reply.count");
+        Value *ReplyBits =
+            B.CreateLoad(I32, B.CreateStructGEP(HeaderTy, Msg, 0),
+                         Name + ".reply.bits");
+        Value *ReplyId =
+            B.CreateLoad(I32, B.CreateStructGEP(HeaderTy, Msg, 5),
+                         Name + ".reply.id");
+        Value *DescriptorCount =
+            loadI32AtConst(B, kReplyDescriptorCountOffset,
+                           Name + ".reply.descriptors");
 
         Value *MsgOk =
             B.CreateICmpEQ(MsgRc32, ConstantInt::get(I32, 0), Name + ".msg.ok");
@@ -687,71 +702,128 @@ Value *emitDarwinTaskGetExceptionPorts(
             B.CreateAnd(ReplyBits, ConstantInt::get(I32, kMachMsgBitsComplex),
                         Name + ".reply.complex.bit"),
             ConstantInt::get(I32, 0), Name + ".reply.complex.ok");
-        Value *CountBounded = B.CreateICmpULE(
-            ReplyCount, ConstantInt::get(I32, 32), Name + ".reply.count.ok");
-        Value *DescriptorCountOk = B.CreateICmpEQ(
-            DescriptorCount, ReplyCount, Name + ".reply.descriptors.ok");
+        Value *CountBounded =
+            B.CreateICmpULE(DescriptorCount,
+                            ConstantInt::get(I32, kMaxExceptionPorts),
+                            Name + ".reply.descriptor_count.ok");
         Value *Ok = B.CreateAnd(MsgOk, IdOk, Name + ".ok.id");
         Ok = B.CreateAnd(Ok, ComplexOk, Name + ".ok.complex");
         Ok = B.CreateAnd(Ok, CountBounded, Name + ".ok.count");
-        Ok = B.CreateAnd(Ok, DescriptorCountOk, Name + ".ok.descriptors");
 
         Function *Fn = B.GetInsertBlock()->getParent();
         BasicBlock *StartBB = B.GetInsertBlock();
-        BasicBlock *CopyBB =
-            BasicBlock::Create(Ctx, (Name + ".copy").str(), Fn);
+        BasicBlock *ValidateBB =
+            BasicBlock::Create(Ctx, (Name + ".validate").str(), Fn);
+        BasicBlock *CopyInitBB =
+            BasicBlock::Create(Ctx, (Name + ".copy.init").str(), Fn);
+        BasicBlock *CopyLoopBB =
+            BasicBlock::Create(Ctx, (Name + ".copy.loop").str(), Fn);
+        BasicBlock *CopyBodyBB =
+            BasicBlock::Create(Ctx, (Name + ".copy.body").str(), Fn);
+        BasicBlock *CopyDoneBB =
+            BasicBlock::Create(Ctx, (Name + ".copy.done").str(), Fn);
         BasicBlock *DoneBB =
             BasicBlock::Create(Ctx, (Name + ".done").str(), Fn);
         Value *FailureRc = B.CreateSelect(
             B.CreateICmpNE(MsgRc32, ConstantInt::get(I32, 0)),
             MsgRc32, ConstantInt::getSigned(I32, kMigReplyMismatch),
             Name + ".failure");
-        B.CreateCondBr(Ok, CopyBB, DoneBB);
+        B.CreateCondBr(Ok, ValidateBB, DoneBB);
 
-        IRBuilder<> CB(CopyBB);
-        CB.CreateStore(ReplyCount, MaskCount);
-        for (std::uint32_t I = 0; I < 32; ++I) {
-            Value *Zero = ConstantInt::get(IP, 0);
-            Value *Idx = ConstantInt::get(IP, I);
-            Value *OutIdx[] = {Zero, Idx};
+        IRBuilder<> VB(ValidateBB);
+        Value *DescriptorCountIP = VB.CreateZExtOrTrunc(
+            DescriptorCount, IP, Name + ".reply.descriptors.ip");
+        Value *DescriptorBytes = VB.CreateMul(
+            DescriptorCountIP,
+            ConstantInt::get(IP, kMachPortDescriptorSize),
+            Name + ".reply.descriptor.bytes");
+        Value *NdrOffset =
+            VB.CreateAdd(ConstantInt::get(IP, kReplyDescriptorsOffset),
+                         DescriptorBytes, Name + ".reply.ndr.offset");
+        Value *ReplyCountOffset =
+            VB.CreateAdd(NdrOffset, ConstantInt::get(IP, kNdrSize),
+                         Name + ".reply.count.offset");
+        Value *ReplyCount =
+            loadI32At(VB, ReplyCountOffset, Name + ".reply.count.dynamic");
+        Value *CountMatches = VB.CreateICmpEQ(
+            ReplyCount, DescriptorCount, Name + ".reply.count.match");
+        Value *ArrayBytes =
+            VB.CreateMul(DescriptorCountIP, ConstantInt::get(IP, kI32Size),
+                         Name + ".reply.array.bytes");
+        Value *MasksOffset =
+            VB.CreateAdd(ReplyCountOffset, ConstantInt::get(IP, kI32Size),
+                         Name + ".reply.masks.offset");
+        Value *BehaviorsOffset =
+            VB.CreateAdd(MasksOffset, ArrayBytes,
+                         Name + ".reply.behaviors.offset");
+        Value *FlavorsOffset =
+            VB.CreateAdd(BehaviorsOffset, ArrayBytes,
+                         Name + ".reply.flavors.offset");
+        VB.CreateCondBr(CountMatches, CopyInitBB, DoneBB);
 
-            Value *Mask = CB.CreateLoad(
-                I32, CB.CreateInBoundsGEP(I32ArrayTy,
-                                          CB.CreateStructGEP(ReplyTy, Msg, 5),
-                                          OutIdx),
-                Name + ".copy.mask");
-            CB.CreateStore(Mask, CB.CreateInBoundsGEP(I32ArrayTy, Masks, OutIdx));
+        IRBuilder<> IB(CopyInitBB);
+        IB.CreateStore(DescriptorCount, MaskCount);
+        IB.CreateBr(CopyLoopBB);
 
-            Value *Desc = CB.CreateInBoundsGEP(
-                PortDescArrayTy, CB.CreateStructGEP(ReplyTy, Msg, 2), OutIdx);
-            Value *Handler = CB.CreateLoad(
-                I32, CB.CreateStructGEP(PortDescTy, Desc, 0),
-                Name + ".copy.handler");
-            CB.CreateStore(Handler,
-                           CB.CreateInBoundsGEP(I32ArrayTy, Handlers, OutIdx));
+        IRBuilder<> LB(CopyLoopBB);
+        PHINode *Index = LB.CreatePHI(I32, 2, Name + ".copy.index");
+        Index->addIncoming(ConstantInt::get(I32, 0), CopyInitBB);
+        Value *More = LB.CreateICmpULT(Index, DescriptorCount,
+                                       Name + ".copy.more");
+        LB.CreateCondBr(More, CopyBodyBB, CopyDoneBB);
 
-            Value *Behavior = CB.CreateLoad(
-                I32, CB.CreateInBoundsGEP(I32ArrayTy,
-                                          CB.CreateStructGEP(ReplyTy, Msg, 6),
-                                          OutIdx),
-                Name + ".copy.behavior");
-            CB.CreateStore(
-                Behavior, CB.CreateInBoundsGEP(I32ArrayTy, Behaviors, OutIdx));
+        IRBuilder<> CB(CopyBodyBB);
+        Value *IndexIP =
+            CB.CreateZExtOrTrunc(Index, IP, Name + ".copy.index.ip");
+        Value *EntryBytes =
+            CB.CreateMul(IndexIP, ConstantInt::get(IP, kI32Size),
+                         Name + ".copy.entry.bytes");
+        Value *DescBytes =
+            CB.CreateMul(IndexIP,
+                         ConstantInt::get(IP, kMachPortDescriptorSize),
+                         Name + ".copy.descriptor.bytes");
+        Value *HandlerOffset =
+            CB.CreateAdd(ConstantInt::get(IP, kReplyDescriptorsOffset),
+                         DescBytes, Name + ".copy.handler.offset");
+        Value *MaskOffset =
+            CB.CreateAdd(MasksOffset, EntryBytes, Name + ".copy.mask.offset");
+        Value *BehaviorOffset = CB.CreateAdd(
+            BehaviorsOffset, EntryBytes, Name + ".copy.behavior.offset");
+        Value *FlavorOffset =
+            CB.CreateAdd(FlavorsOffset, EntryBytes, Name + ".copy.flavor.offset");
 
-            Value *Flavor = CB.CreateLoad(
-                I32, CB.CreateInBoundsGEP(I32ArrayTy,
-                                          CB.CreateStructGEP(ReplyTy, Msg, 7),
-                                          OutIdx),
-                Name + ".copy.flavor");
-            CB.CreateStore(Flavor,
-                           CB.CreateInBoundsGEP(I32ArrayTy, Flavors, OutIdx));
-        }
-        CB.CreateBr(DoneBB);
+        Value *Mask = loadI32At(CB, MaskOffset, Name + ".copy.mask");
+        CB.CreateStore(Mask, CB.CreateInBoundsGEP(I32, Masks, IndexIP,
+                                                  Name + ".copy.mask.out"));
+
+        Value *Handler = loadI32At(CB, HandlerOffset, Name + ".copy.handler");
+        CB.CreateStore(Handler, CB.CreateInBoundsGEP(I32, Handlers, IndexIP,
+                                                     Name + ".copy.handler.out"));
+
+        Value *Behavior =
+            loadI32At(CB, BehaviorOffset, Name + ".copy.behavior");
+        CB.CreateStore(
+            Behavior,
+            CB.CreateInBoundsGEP(I32, Behaviors, IndexIP,
+                                 Name + ".copy.behavior.out"));
+
+        Value *Flavor = loadI32At(CB, FlavorOffset, Name + ".copy.flavor");
+        CB.CreateStore(Flavor, CB.CreateInBoundsGEP(I32, Flavors, IndexIP,
+                                                    Name + ".copy.flavor.out"));
+
+        Value *Next = CB.CreateAdd(Index, ConstantInt::get(I32, 1),
+                                   Name + ".copy.next");
+        Index->addIncoming(Next, CopyBodyBB);
+        CB.CreateBr(CopyLoopBB);
+
+        IRBuilder<> DB(CopyDoneBB);
+        DB.CreateBr(DoneBB);
 
         B.SetInsertPoint(DoneBB);
-        PHINode *Result = B.CreatePHI(I32, 2, Name + ".direct.rc");
-        Result->addIncoming(ConstantInt::get(I32, 0), CopyBB);
+        PHINode *Result = B.CreatePHI(I32, 3, Name + ".direct.rc");
+        Result->addIncoming(ConstantInt::get(I32, 0), CopyDoneBB);
         Result->addIncoming(FailureRc, StartBB);
+        Result->addIncoming(FailureRc, ValidateBB);
         return Result;
     }
 

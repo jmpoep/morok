@@ -281,6 +281,41 @@ void checkDarwinCsopsExceptionCoherence(Function &F) {
     CHECK(valueFeedsNamedInstruction(Coherent, "morok.seal.fold.anti_debug"));
 }
 
+void checkDarwinExceptionPortVariableReplyParser(Function &F, StringRef Prefix) {
+    auto requireNamed = [&](StringRef Suffix) -> Instruction * {
+        std::string Name = (Twine(Prefix) + Suffix).str();
+        Instruction *I = findNamedInstruction(F, Name);
+        REQUIRE(I != nullptr);
+        return I;
+    };
+    auto checkMissing = [&](StringRef Suffix) {
+        std::string Name = (Twine(Prefix) + Suffix).str();
+        CHECK(findNamedInstruction(F, Name) == nullptr);
+    };
+    auto feeds = [&](Instruction *Root, StringRef Suffix) {
+        std::string Name = (Twine(Prefix) + Suffix).str();
+        CHECK(valueFeedsNamedInstruction(Root, Name));
+    };
+
+    Instruction *DescriptorCount = requireNamed(".reply.descriptors");
+    requireNamed(".reply.descriptor_count.ok");
+    requireNamed(".reply.count.offset");
+    requireNamed(".reply.count.dynamic");
+    requireNamed(".reply.count.match");
+    requireNamed(".copy.index");
+    requireNamed(".copy.more");
+    requireNamed(".copy.handler.offset");
+    requireNamed(".copy.mask.offset");
+    requireNamed(".copy.behavior.offset");
+    requireNamed(".copy.flavor.offset");
+
+    feeds(DescriptorCount, ".reply.count.offset");
+    feeds(DescriptorCount, ".reply.masks.offset");
+    feeds(DescriptorCount, ".reply.behaviors.offset");
+    feeds(DescriptorCount, ".reply.flavors.offset");
+    checkMissing(".reply.descriptors.ok");
+}
+
 void checkGateScoring(Function &F) {
     CHECK(countNamedInstructions(F, "morok.gate.hard.score") >= 1u);
     CHECK(countNamedInstructions(F, "morok.gate.soft.score") >= 1u);
@@ -1377,6 +1412,7 @@ TEST_CASE("PlatformRuntime emits Darwin exception-port query through direct "
     CHECK(countNamedInstructions(*F, "morok.test.exc.mach_msg") >= 1u);
     CHECK(countNamedInstructions(*F, "morok.test.exc.msg2.ports") == 0u);
     CHECK(countNamedInstructions(*F, "morok.test.exc.direct.rc") >= 1u);
+    checkDarwinExceptionPortVariableReplyParser(*F, "morok.test.exc");
     CHECK_FALSE(verifyModule(M, &errs()));
 }
 
@@ -1415,6 +1451,7 @@ TEST_CASE("PlatformRuntime emits Darwin arm64 exception-port query through "
     CHECK(countNamedInstructions(*F, "morok.test.exc.mach_msg") >= 1u);
     CHECK(countNamedInstructions(*F, "morok.test.exc.msg2.ports") >= 1u);
     CHECK(countNamedInstructions(*F, "morok.test.exc.direct.rc") >= 1u);
+    checkDarwinExceptionPortVariableReplyParser(*F, "morok.test.exc");
     CHECK_FALSE(verifyModule(M, &errs()));
 }
 
