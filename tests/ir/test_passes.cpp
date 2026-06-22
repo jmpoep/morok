@@ -17150,6 +17150,8 @@ define i32 @main() { ret i32 0 }
     CHECK(hasInlineAsmCall(*Oracle));
     CHECK(countNamedInstructions(*Oracle, "morok.pftlb.mprotect.none") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.pftlb.primary.delta") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.pattern.missing") >= 1u);
+    checkSealEnforcement(*M, *Oracle);
     CHECK(countNamedInstructions(*Handler, "morok.pftlb.mprotect.page") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }

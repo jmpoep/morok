@@ -9219,8 +9219,8 @@ Function *pageFaultTlbProbe(Module &M, GlobalVariable *State,
               "morok.pftlb.primary.delta");
     foldState(AB, State, secondaryDelta, 0xC4D81729E63B5A90ULL,
               "morok.pftlb.secondary.delta");
-    foldFlag(AB, State, missing, 0x916B03D5E24A7F8CULL,
-             "morok.pftlb.pattern.missing");
+    foldEnforcedFlag(AB, State, missing, 0x916B03D5E24A7F8CULL,
+                     "morok.pftlb.pattern.missing");
     foldFlag(AB, State, extra, 0x4E7A92C80D5B31F6ULL,
              "morok.pftlb.pattern.extra");
     foldFlag(AB, State, slow, 0xA71D38E52F94C60BULL,
