@@ -20071,21 +20071,33 @@ define i32 @main() { ret i32 0 }
     Function *Ctor = M->getFunction("morok.trap");
     Function *Probe = M->getFunction("morok.trap.win.tf");
     Function *Handler = M->getFunction("morok.trap.win.veh");
+    Function *CdProbe = M->getFunction("morok.trap.win.cd03");
+    Function *CdHandler = M->getFunction("morok.trap.win.cd03.veh");
+    Function *CdTrip = M->getFunction("morok.trap.win.cd03.trip");
     Function *Peb = M->getFunction("morok.win.peb");
     Function *Ldr = M->getFunction("morok.win.ldr.module");
     Function *Resolve = M->getFunction("morok.win.pe.resolve");
     REQUIRE(Ctor != nullptr);
     REQUIRE(Probe != nullptr);
     REQUIRE(Handler != nullptr);
+    REQUIRE(CdProbe != nullptr);
+    REQUIRE(CdHandler != nullptr);
+    REQUIRE(CdTrip != nullptr);
     REQUIRE(Peb != nullptr);
     REQUIRE(Ldr != nullptr);
     REQUIRE(Resolve != nullptr);
     checkWindowsTlsCallbacks(*M, "trap", "morok.trap");
     CHECK(M->getGlobalVariable("morok.trap.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.trap.hits", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.trap.win.cd03.expected", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.trap.win.cd03.result", true) != nullptr);
     CHECK(countCallsTo(*Ctor, "morok.trap.win.tf") >= 1u);
+    CHECK(countCallsTo(*Ctor, "morok.trap.win.cd03") >= 1u);
     checkSealEnforcement(*M, *Probe);
+    checkSealEnforcement(*M, *CdProbe);
     CHECK(hasInlineAsmCall(*Probe));
+    CHECK(hasInlineAsmCall(*CdTrip));
     CHECK(hasInlineAsmCall(*Peb));
     CHECK(M->getFunction("AddVectoredExceptionHandler") == nullptr);
     CHECK(M->getFunction("RtlAddVectoredExceptionHandler") == nullptr);
@@ -20103,15 +20115,48 @@ define i32 @main() { ret i32 0 }
                                  "morok.trap.win.veh.single.step") >= 1u);
     CHECK(countNamedInstructions(*Handler,
                                  "morok.trap.win.veh.eflags.clear") >= 1u);
+    CHECK(countNamedInstructions(*CdProbe, "morok.trap.win.cd03.peb") >= 1u);
+    CHECK(countNamedInstructions(*CdProbe, "morok.trap.win.cd03.ntdll") >= 1u);
+    CHECK(countNamedInstructions(*CdProbe, "morok.trap.win.cd03.rtladd") >=
+          1u);
+    CHECK(countNamedInstructions(*CdProbe,
+                                 "morok.trap.win.cd03.veh.handle") >= 1u);
+    CHECK(countNamedInstructions(*CdProbe,
+                                 "morok.trap.win.cd03.resume.bad") >= 1u);
+    CHECK(countNamedInstructions(*CdProbe, "morok.trap.win.cd03.missing") >=
+          1u);
+    CHECK(countNamedInstructions(*CdProbe,
+                                 "morok.trap.win.cd03.remove.status") >= 1u);
+    CHECK(countNamedInstructions(*CdHandler,
+                                 "morok.trap.win.cd03.breakpoint") >= 1u);
+    CHECK(countNamedInstructions(*CdHandler, "morok.trap.win.cd03.clean") >=
+          1u);
+    CHECK(countNamedInstructions(*CdHandler, "morok.trap.win.cd03.short") >=
+          1u);
+    CHECK(countNamedInstructions(*CdHandler,
+                                 "morok.trap.win.cd03.verdict") >= 1u);
     // Regression (#225): AMD64 CONTEXT.EFlags is at 0x44. Pinned here so a fix
     // to the i686 0xC0 offset cannot silently break the x64 path.
     CHECK(namedGepByteOffset(*Handler, "morok.trap.win.veh.eflags.ptr") == 0x44);
     CHECK(namedGepByteOffset(*Handler,
                              "morok.trap.win.veh.eflags.store.ptr") == 0x44);
+    CHECK(namedGepByteOffset(*CdHandler,
+                             "morok.trap.win.cd03.context.ip.ptr") == 0xF8);
+    CHECK(namedGepByteOffset(*CdHandler,
+                             "morok.trap.win.cd03.context.ip.store.ptr") ==
+          0xF8);
     Instruction *Missing =
         findNamedInstruction(*Probe, "morok.trap.win.single_step.missing");
     REQUIRE(Missing != nullptr);
     CHECK(valueFeedsNamedInstruction(Missing, "morok.seal.fold.anti_debug"));
+    Instruction *BadResume =
+        findNamedInstruction(*CdProbe, "morok.trap.win.cd03.resume.bad");
+    REQUIRE(BadResume != nullptr);
+    CHECK(valueFeedsNamedInstruction(BadResume, "morok.seal.fold.anti_debug"));
+    Instruction *CdMissing =
+        findNamedInstruction(*CdProbe, "morok.trap.win.cd03.missing");
+    REQUIRE(CdMissing != nullptr);
+    CHECK(valueFeedsNamedInstruction(CdMissing, "morok.seal.fold.anti_debug"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -20129,33 +20174,64 @@ define i32 @main() { ret i32 0 }
     Function *Ctor = M->getFunction("morok.trap");
     Function *Probe = M->getFunction("morok.trap.win.tf");
     Function *Handler = M->getFunction("morok.trap.win.veh");
+    Function *CdProbe = M->getFunction("morok.trap.win.cd03");
+    Function *CdHandler = M->getFunction("morok.trap.win.cd03.veh");
+    Function *CdTrip = M->getFunction("morok.trap.win.cd03.trip");
     REQUIRE(Ctor != nullptr);
     REQUIRE(Probe != nullptr);
     REQUIRE(Handler != nullptr);
     checkWindowsTlsCallbacks(*M, "trap", "morok.trap",
                              CallingConv::X86_StdCall);
+    REQUIRE(CdProbe != nullptr);
+    REQUIRE(CdHandler != nullptr);
+    REQUIRE(CdTrip != nullptr);
     CHECK(Handler->getCallingConv() == CallingConv::X86_StdCall);
+    CHECK(CdHandler->getCallingConv() == CallingConv::X86_StdCall);
     CHECK(countCallsTo(*Ctor, "morok.trap.win.tf") >= 1u);
+    CHECK(countCallsTo(*Ctor, "morok.trap.win.cd03") >= 1u);
     CHECK(hasInlineAsmCall(*Probe));
+    CHECK(hasInlineAsmCall(*CdTrip));
     CHECK(M->getFunction("RtlAddVectoredExceptionHandler") == nullptr);
+    CHECK(M->getFunction("RtlRemoveVectoredExceptionHandler") == nullptr);
     CHECK(countNamedInstructions(*Probe, "morok.trap.win.rtladd") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.trap.win.veh.handle") >= 1u);
     CHECK(countNamedInstructions(*Handler,
                                  "morok.trap.win.veh.eflags.clear") >= 1u);
+    CHECK(countNamedInstructions(*CdProbe, "morok.trap.win.cd03.rtladd") >=
+          1u);
+    CHECK(countNamedInstructions(*CdProbe,
+                                 "morok.trap.win.cd03.veh.handle") >= 1u);
+    CHECK(countNamedInstructions(*CdHandler, "morok.trap.win.cd03.clean") >=
+          1u);
+    CHECK(countNamedInstructions(*CdHandler, "morok.trap.win.cd03.short") >=
+          1u);
     // Regression (#225): on i686 the VEH handler must read/write CONTEXT.EFlags
     // at 0xC0, not 0xC4 (0xC4 is Esp). Using 0xC4 masked the trap flag out of
     // Esp, corrupting the stack pointer and leaving TF set.
     CHECK(namedGepByteOffset(*Handler, "morok.trap.win.veh.eflags.ptr") == 0xC0);
     CHECK(namedGepByteOffset(*Handler,
                              "morok.trap.win.veh.eflags.store.ptr") == 0xC0);
+    CHECK(namedGepByteOffset(*CdHandler,
+                             "morok.trap.win.cd03.context.ip.ptr") == 0xB8);
+    CHECK(namedGepByteOffset(*CdHandler,
+                             "morok.trap.win.cd03.context.ip.store.ptr") ==
+          0xB8);
     CallInst *Register = nullptr;
+    CallInst *CdRegister = nullptr;
     for (Instruction &I : instructions(*Probe))
         if (auto *CI = dyn_cast<CallInst>(&I))
             if (CI->getName() == "morok.trap.win.veh.handle")
                 Register = CI;
+    for (Instruction &I : instructions(*CdProbe))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            if (CI->getName() == "morok.trap.win.cd03.veh.handle")
+                CdRegister = CI;
     REQUIRE(Register != nullptr);
+    REQUIRE(CdRegister != nullptr);
     CHECK(Register->getCallingConv() == CallingConv::X86_StdCall);
+    CHECK(CdRegister->getCallingConv() == CallingConv::X86_StdCall);
     checkSealEnforcement(*M, *Probe);
+    checkSealEnforcement(*M, *CdProbe);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

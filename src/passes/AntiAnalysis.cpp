@@ -11640,6 +11640,30 @@ GlobalVariable *trapHitCounter(Module &M) {
     return gv;
 }
 
+GlobalVariable *trapLongInt3Expected(Module &M) {
+    if (auto *existing = M.getGlobalVariable("morok.trap.win.cd03.expected",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *ip = intPtrTy(M);
+    auto *gv = new GlobalVariable(
+        M, ip, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(ip, 0), "morok.trap.win.cd03.expected");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *trapLongInt3Result(Module &M) {
+    if (auto *existing = M.getGlobalVariable("morok.trap.win.cd03.result",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i32, 0), "morok.trap.win.cd03.result");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
 bool useLinuxX86SiginfoTrapHandler(const Triple &TT) {
     return TT.isOSLinux() && TT.getArch() == Triple::x86_64;
 }
@@ -23942,6 +23966,293 @@ Function *windowsTrapFlagProbe(Module &M, GlobalVariable *Counter,
     return fn;
 }
 
+Function *windowsLongInt3VehHandler(Module &M, GlobalVariable *Result,
+                                    GlobalVariable *Expected,
+                                    GlobalVariable *State, const Triple &TT) {
+    const bool x86 = TT.getArch() == Triple::x86;
+    const bool x64 = TT.getArch() == Triple::x86_64;
+    if (!TT.isOSWindows() || (!x86 && !x64))
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.trap.win.cd03.veh"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i32, {ptr}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.trap.win.cd03.veh", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    if (x86)
+        fn->setCallingConv(CallingConv::X86_StdCall);
+    fn->setDSOLocal(true);
+    Argument *exceptionPointers = fn->getArg(0);
+    exceptionPointers->setName("exception_pointers");
+
+    const unsigned contextRecordOff = x86 ? 0x04 : 0x08;
+    const unsigned exceptionAddressOff = x86 ? 0x0c : 0x10;
+    const unsigned ipOff = x86 ? 0xb8 : 0xf8;
+    constexpr std::uint32_t kExceptionBreakpoint = 0x80000003u;
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *readBB = BasicBlock::Create(ctx, "read", fn);
+    auto *inspectBB = BasicBlock::Create(ctx, "inspect", fn);
+    auto *handleBB = BasicBlock::Create(ctx, "cd03", fn);
+    auto *searchBB = BasicBlock::Create(ctx, "search", fn);
+
+    IRBuilder<> B(entry);
+    B.CreateCondBr(B.CreateICmpNE(exceptionPointers,
+                                  ConstantPointerNull::get(ptr),
+                                  "morok.trap.win.cd03.args.present"),
+                   readBB, searchBB);
+
+    IRBuilder<> RB(readBB);
+    Value *record = loadAt(RB, M, ptr, exceptionPointers, 0ULL,
+                           "morok.trap.win.cd03.record");
+    Value *context = loadAt(RB, M, ptr, exceptionPointers, contextRecordOff,
+                            "morok.trap.win.cd03.context");
+    Value *hasRecord =
+        RB.CreateICmpNE(record, ConstantPointerNull::get(ptr),
+                        "morok.trap.win.cd03.record.present");
+    Value *hasContext =
+        RB.CreateICmpNE(context, ConstantPointerNull::get(ptr),
+                        "morok.trap.win.cd03.context.present");
+    RB.CreateCondBr(RB.CreateAnd(hasRecord, hasContext,
+                                 "morok.trap.win.cd03.pointers.ready"),
+                    inspectBB, searchBB);
+
+    IRBuilder<> IB(inspectBB);
+    Value *code =
+        loadAt(IB, M, i32, record, 0ULL, "morok.trap.win.cd03.code");
+    Value *contextIp =
+        loadAt(IB, M, ip, context, ipOff, "morok.trap.win.cd03.context.ip");
+    auto *expectedLoad =
+        IB.CreateLoad(ip, Expected, "morok.trap.win.cd03.expected");
+    expectedLoad->setVolatile(true);
+    Value *breakpoint =
+        IB.CreateICmpEQ(code, ConstantInt::get(i32, kExceptionBreakpoint),
+                        "morok.trap.win.cd03.breakpoint");
+    Value *armed =
+        IB.CreateICmpNE(expectedLoad, ConstantInt::get(ip, 0),
+                        "morok.trap.win.cd03.armed");
+    Value *clean =
+        IB.CreateICmpEQ(contextIp, expectedLoad, "morok.trap.win.cd03.clean");
+    Value *shortIp = IB.CreateSub(expectedLoad, ConstantInt::get(ip, 1),
+                                  "morok.trap.win.cd03.short.ip");
+    Value *shortResume =
+        IB.CreateICmpEQ(contextIp, shortIp, "morok.trap.win.cd03.short");
+    Value *ours = IB.CreateAnd(
+        IB.CreateAnd(breakpoint, armed, "morok.trap.win.cd03.code.ready"),
+        IB.CreateOr(clean, shortResume, "morok.trap.win.cd03.resume.known"),
+        "morok.trap.win.cd03.ours");
+    IB.CreateCondBr(ours, handleBB, searchBB);
+
+    IRBuilder<> HB(handleBB);
+    Value *address =
+        loadAt(HB, M, ip, record, exceptionAddressOff,
+               "morok.trap.win.cd03.address");
+    Value *delta =
+        HB.CreateSub(contextIp, address, "morok.trap.win.cd03.resume.delta");
+    Value *verdict = HB.CreateSelect(shortResume, ConstantInt::get(i32, 2),
+                                     ConstantInt::get(i32, 1),
+                                     "morok.trap.win.cd03.verdict");
+    auto *resultStore = HB.CreateStore(verdict, Result);
+    resultStore->setVolatile(true);
+    storeAt(HB, M, context, ipOff, expectedLoad,
+            "morok.trap.win.cd03.context.ip.store");
+    foldState(HB, State, code, 0x91A7E42BC603D5F8ULL,
+              "morok.trap.win.cd03.code.mix");
+    foldState(HB, State, address, 0x4F62B1D897A30E5CULL,
+              "morok.trap.win.cd03.address.mix");
+    foldState(HB, State, contextIp, 0xC38D5EA1492076BFULL,
+              "morok.trap.win.cd03.context.mix");
+    foldState(HB, State, delta, 0x6A5E039F2D71C4B8ULL,
+              "morok.trap.win.cd03.delta.mix");
+    foldState(HB, State, verdict, 0xB7E40A63C91D852FULL,
+              "morok.trap.win.cd03.verdict.mix");
+    HB.CreateRet(ConstantInt::getSigned(i32, -1));
+
+    IRBuilder<> SB(searchBB);
+    SB.CreateRet(ConstantInt::get(i32, 0));
+    return fn;
+}
+
+Function *windowsLongInt3Trip(Module &M, const Triple &TT) {
+    if (Function *existing = M.getFunction("morok.trap.win.cd03.trip"))
+        return existing;
+    const bool x86 = TT.getArch() == Triple::x86;
+    const bool x64 = TT.getArch() == Triple::x86_64;
+    if (!TT.isOSWindows() || (!x86 && !x64))
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(
+        FunctionType::get(Type::getVoidTy(ctx), {ptr}, false),
+        GlobalValue::PrivateLinkage, "morok.trap.win.cd03.trip", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *expectedSlot = fn->getArg(0);
+    expectedSlot->setName("expected_slot");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    auto *asmTy = FunctionType::get(Type::getVoidTy(ctx), {ptr}, false);
+    StringRef asmText =
+        x64 ? StringRef("movq $0, %r10\nleaq 1f(%rip), %rax\nmovq %rax, "
+                        "(%r10)\n.byte 0xcd, 0x03\n1:")
+            : StringRef("movl $0, %ecx\ncalll 0f\n0:\npopl %eax\naddl "
+                        "$$(1f-0b), %eax\nmovl %eax, (%ecx)\n.byte 0xcd, "
+                        "0x03\n1:");
+    StringRef constraints =
+        x64 ? StringRef("r,~{rax},~{r10},~{memory},~{dirflag},~{fpsr},~{flags}")
+            : StringRef("r,~{eax},~{ecx},~{memory},~{dirflag},~{fpsr},~{flags}");
+    InlineAsm *IA = InlineAsm::get(asmTy, asmText, constraints,
+                                   /*hasSideEffects=*/true);
+    B.CreateCall(asmTy, IA, {expectedSlot});
+    B.CreateRetVoid();
+    return fn;
+}
+
+Function *windowsLongInt3Probe(Module &M, GlobalVariable *State,
+                               ir::IRRandom &rng, const Triple &TT) {
+    const bool x86 = TT.getArch() == Triple::x86;
+    const bool x64 = TT.getArch() == Triple::x86_64;
+    if (!TT.isOSWindows() || (!x86 && !x64))
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.trap.win.cd03"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.trap.win.cd03", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    Function *pebReader = windowsPebReader(M);
+    Function *moduleByHash = windowsLdrModuleByHash(M);
+    Function *resolver = windowsPeExportResolver(M);
+    GlobalVariable *expected = trapLongInt3Expected(M);
+    GlobalVariable *result = trapLongInt3Result(M);
+    Function *handler =
+        windowsLongInt3VehHandler(M, result, expected, State, TT);
+    Function *trip = windowsLongInt3Trip(M, TT);
+    if (!pebReader || !moduleByHash || !resolver || !handler || !trip)
+        return nullptr;
+
+    auto setWinApiCallConv = [&](CallInst *CI) {
+        if (x86)
+            CI->setCallingConv(CallingConv::X86_StdCall);
+    };
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *resolveBB = BasicBlock::Create(ctx, "resolve", fn);
+    auto *registerBB = BasicBlock::Create(ctx, "register", fn);
+    auto *stimulusBB = BasicBlock::Create(ctx, "stimulus", fn);
+    auto *removeBB = BasicBlock::Create(ctx, "remove", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    B.CreateStore(ConstantInt::get(i32, 0), result)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), expected)->setVolatile(true);
+    Value *peb = B.CreateCall(pebReader, {}, "morok.trap.win.cd03.peb");
+    foldState(B, State, peb, rng.next(), "morok.trap.win.cd03.peb.mix");
+    B.CreateCondBr(B.CreateICmpNE(peb, ConstantInt::get(ip, 0),
+                                  "morok.trap.win.cd03.peb.present"),
+                   resolveBB, retBB);
+
+    IRBuilder<> RB(resolveBB);
+    Value *ntdll = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("ntdll.dll"))},
+        "morok.trap.win.cd03.ntdll");
+    Value *rtlAdd = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64,
+                                 fnv1aName("RtlAddVectoredExceptionHandler"))},
+        "morok.trap.win.cd03.rtladd");
+    Value *rtlRemove = RB.CreateCall(
+        resolver,
+        {ntdll,
+         ConstantInt::get(i64,
+                          fnv1aName("RtlRemoveVectoredExceptionHandler"))},
+        "morok.trap.win.cd03.rtlremove");
+    foldState(RB, State, ntdll, rng.next(), "morok.trap.win.cd03.ntdll.mix");
+    foldState(RB, State, rtlAdd, rng.next(), "morok.trap.win.cd03.rtladd.mix");
+    foldState(RB, State, rtlRemove, rng.next(),
+              "morok.trap.win.cd03.rtlremove.mix");
+    Value *missingAdd =
+        RB.CreateICmpEQ(rtlAdd, ConstantInt::get(ip, 0),
+                        "morok.trap.win.cd03.rtladd.missing");
+    foldEnforcedFlag(RB, State, missingAdd, 0x58C0F1A7D3924E6BULL,
+                     "morok.trap.win.cd03.veh.register");
+    RB.CreateCondBr(RB.CreateNot(missingAdd,
+                                 "morok.trap.win.cd03.rtladd.ready"),
+                    registerBB, retBB);
+
+    IRBuilder<> GB(registerBB);
+    auto *addTy = FunctionType::get(ptr, {i32, ptr}, false);
+    auto *handle = GB.CreateCall(
+        addTy,
+        GB.CreateIntToPtr(rtlAdd, ptr, "morok.trap.win.cd03.rtladd.ptr"),
+        {ConstantInt::get(i32, 1), handler},
+        "morok.trap.win.cd03.veh.handle");
+    setWinApiCallConv(handle);
+    foldState(GB, State, handle, rng.next(),
+              "morok.trap.win.cd03.veh.handle.mix");
+    Value *missingHandle =
+        GB.CreateICmpEQ(handle, ConstantPointerNull::get(ptr),
+                        "morok.trap.win.cd03.veh.missing");
+    foldEnforcedFlag(GB, State, missingHandle, 0xA6D457B1083CE29FULL,
+                     "morok.trap.win.cd03.veh.missing");
+    GB.CreateCondBr(GB.CreateNot(missingHandle,
+                                 "morok.trap.win.cd03.veh.handle.ready"),
+                    stimulusBB, retBB);
+
+    IRBuilder<> SB(stimulusBB);
+    SB.CreateCall(trip->getFunctionType(), trip, {expected});
+    auto *verdict =
+        SB.CreateLoad(i32, result, "morok.trap.win.cd03.verdict.final");
+    verdict->setVolatile(true);
+    foldState(SB, State, verdict, 0xC7A2D5410F6E83B9ULL,
+              "morok.trap.win.cd03.verdict.final.mix");
+    Value *badResume =
+        SB.CreateICmpEQ(verdict, ConstantInt::get(i32, 2),
+                        "morok.trap.win.cd03.resume.bad");
+    foldEnforcedFlag(SB, State, badResume, 0x2E9A6C1374D58B0FULL,
+                     "morok.trap.win.cd03.resume.bad");
+    Value *missing =
+        SB.CreateICmpEQ(verdict, ConstantInt::get(i32, 0),
+                        "morok.trap.win.cd03.missing");
+    foldEnforcedFlag(SB, State, missing, 0xD104B6E82A75C39FULL,
+                     "morok.trap.win.cd03.missing");
+    SB.CreateCondBr(SB.CreateICmpNE(rtlRemove, ConstantInt::get(ip, 0),
+                                    "morok.trap.win.cd03.rtlremove.ready"),
+                    removeBB, retBB);
+
+    IRBuilder<> RMB(removeBB);
+    auto *removeTy = FunctionType::get(i32, {ptr}, false);
+    auto *removeStatus = RMB.CreateCall(
+        removeTy,
+        RMB.CreateIntToPtr(rtlRemove, ptr,
+                           "morok.trap.win.cd03.rtlremove.ptr"),
+        {handle}, "morok.trap.win.cd03.remove.status");
+    setWinApiCallConv(removeStatus);
+    foldState(RMB, State, removeStatus, rng.next(),
+              "morok.trap.win.cd03.remove.status.mix");
+    RMB.CreateBr(retBB);
+
+    IRBuilder<> RetB(retBB);
+    RetB.CreateRetVoid();
+    return fn;
+}
+
 void emitWindowsAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
                           ir::IRRandom &rng, const Triple &TT) {
     IRBuilder<> B(&Ctor->getEntryBlock());
@@ -24040,11 +24351,13 @@ bool trapOracleModule(Module &M, ir::IRRandom &rng) {
         GlobalVariable *state = trapOracleState(M, rng);
         GlobalVariable *counter = trapHitCounter(M);
         Function *probe = windowsTrapFlagProbe(M, counter, state, rng, tt);
-        if (!probe)
+        Function *cd03 = windowsLongInt3Probe(M, state, rng, tt);
+        if (!probe || !cd03)
             return false;
 
         IRBuilder<> B(&ctor->getEntryBlock());
         B.CreateCall(probe);
+        B.CreateCall(cd03);
         B.CreateRetVoid();
         appendToGlobalCtors(M, ctor, 0);
         registerWindowsTlsCallbacks(M, ctor, "trap", rng);
