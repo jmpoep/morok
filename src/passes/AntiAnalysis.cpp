@@ -5021,6 +5021,9 @@ Function *linuxMapsCensusProbe(Module &M, ir::IRRandom &rng,
     auto *i32 = Type::getInt32Ty(ctx);
     auto *i64 = Type::getInt64Ty(ctx);
     auto *ip = intPtrTy(M);
+    constexpr std::uint64_t kEnvReadChunk = 8192;
+    constexpr std::uint64_t kEnvMaxReads = 16;
+    constexpr std::uint32_t kEnvStateDead = 255;
 
     auto *fn = Function::Create(FunctionType::get(i64, false),
                                 GlobalValue::PrivateLinkage,
@@ -5039,11 +5042,20 @@ Function *linuxMapsCensusProbe(Module &M, ir::IRRandom &rng,
     auto *retBB = BasicBlock::Create(ctx, "ret", fn);
 
     IRBuilder<> B(entry);
-    auto *bufTy = ArrayType::get(i8, 8192);
+    auto *bufTy = ArrayType::get(i8, kEnvReadChunk);
     AllocaInst *buf = B.CreateAlloca(bufTy, nullptr, "morok.antihook.maps.buf");
     AllocaInst *diff =
         B.CreateAlloca(i64, nullptr, "morok.antihook.maps.diff");
+    AllocaInst *envReads =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.env.read.count");
+    AllocaInst *envPreloadState =
+        B.CreateAlloca(i32, nullptr, "morok.antihook.env.preload.state");
+    AllocaInst *envAuditState =
+        B.CreateAlloca(i32, nullptr, "morok.antihook.env.audit.state");
     B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), envReads);
+    B.CreateStore(ConstantInt::get(i32, 0), envPreloadState);
+    B.CreateStore(ConstantInt::get(i32, 0), envAuditState);
     Value *path = ir::emitCloakedSymbol(B, M, "/proc/self/maps", rng);
 
     std::uint32_t ptraceNr = 0;
@@ -5075,11 +5087,11 @@ Function *linuxMapsCensusProbe(Module &M, ir::IRRandom &rng,
     if (direct) {
         nread = emitLinuxSyscall(
             OB, M, TT, readNr,
-            {fdLong, bufPtr, ConstantInt::get(ip, 8192)});
+            {fdLong, bufPtr, ConstantInt::get(ip, kEnvReadChunk)});
     } else {
         nread = OB.CreateCall(readDecl(M),
                               {OB.CreateTruncOrBitCast(fdLong, i32), bufPtr,
-                               ConstantInt::get(ip, 8192)});
+                               ConstantInt::get(ip, kEnvReadChunk)});
     }
     nread->setName("morok.antihook.maps.read");
     OB.CreateCondBr(OB.CreateICmpSGT(nread, ConstantInt::get(ip, 86)),
@@ -5166,14 +5178,18 @@ Function *linuxMapsCensusProbe(Module &M, ir::IRRandom &rng,
 
     // The LD_PRELOAD / LD_AUDIT interposition the field report used hooks getenv
     // to hide itself, so the old getenv probe was blind to its own injector.
-    // Read the markers from /proc/self/environ via a direct syscall instead: it
+    // Stream the markers from /proc/self/environ via direct syscalls instead: it
     // is the kernel's exec-time copy of the environment, immune both to getenv
-    // interposition and to a constructor that unsetenv()s the variable out of
-    // the libc `environ` array.  Any hit folds into the same seal-bound diff.
+    // interposition and to a constructor that unsetenv()s the variable out of the
+    // libc `environ` array.  The scanner is anchored to NUL-delimited entry
+    // starts, carries marker state across chunk boundaries, and is capped so a
+    // hostile environment cannot turn startup into unbounded I/O.
     auto *envReadBB = BasicBlock::Create(ctx, "env.read", fn);
+    auto *envDoReadBB = BasicBlock::Create(ctx, "env.do.read", fn);
     auto *envScanLoopBB = BasicBlock::Create(ctx, "env.scan.loop", fn);
     auto *envScanBodyBB = BasicBlock::Create(ctx, "env.scan.body", fn);
     auto *envScanNextBB = BasicBlock::Create(ctx, "env.scan.next", fn);
+    auto *envReadNextBB = BasicBlock::Create(ctx, "env.read.next", fn);
     auto *envCloseBB = BasicBlock::Create(ctx, "env.close", fn);
 
     IRBuilder<> EB(envBB);
@@ -5193,50 +5209,94 @@ Function *linuxMapsCensusProbe(Module &M, ir::IRRandom &rng,
                     retBB);
 
     IRBuilder<> ERB(envReadBB);
+    Value *envReadCount =
+        ERB.CreateLoad(ip, envReads, "morok.antihook.env.read.count.cur");
+    Value *envCanRead =
+        ERB.CreateICmpULT(envReadCount, ConstantInt::get(ip, kEnvMaxReads),
+                          "morok.antihook.env.read.limit");
     Value *envBufPtr = ERB.CreateInBoundsGEP(
         bufTy, buf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
         "morok.antihook.env.ptr");
+    ERB.CreateCondBr(envCanRead, envDoReadBB, envCloseBB);
+
+    IRBuilder<> EDRB(envDoReadBB);
     Value *envNread = nullptr;
     if (direct) {
-        envNread = emitLinuxSyscall(ERB, M, TT, readNr,
+        envNread = emitLinuxSyscall(EDRB, M, TT, readNr,
                                     {envFd, envBufPtr,
-                                     ConstantInt::get(ip, 8192)});
+                                     ConstantInt::get(ip, kEnvReadChunk)});
     } else {
-        envNread = ERB.CreateCall(
-            readDecl(M), {ERB.CreateTruncOrBitCast(envFd, i32), envBufPtr,
-                          ConstantInt::get(ip, 8192)});
+        envNread = EDRB.CreateCall(
+            readDecl(M), {EDRB.CreateTruncOrBitCast(envFd, i32), envBufPtr,
+                          ConstantInt::get(ip, kEnvReadChunk)});
     }
     envNread->setName("morok.antihook.env.read");
-    ERB.CreateCondBr(ERB.CreateICmpSGT(envNread, ConstantInt::get(ip, 11)),
-                     envScanLoopBB, envCloseBB);
+    EDRB.CreateCondBr(EDRB.CreateICmpSGT(envNread, ConstantInt::get(ip, 0),
+                                         "morok.antihook.env.read.nonempty"),
+                      envScanLoopBB, envCloseBB);
 
     IRBuilder<> ESL(envScanLoopBB);
     auto *envIdx = ESL.CreatePHI(ip, 2, "morok.antihook.env.idx");
-    envIdx->addIncoming(ConstantInt::get(ip, 0), envReadBB);
-    Value *envInBounds = ESL.CreateAnd(
-        ESL.CreateICmpULT(ESL.CreateAdd(envIdx, ConstantInt::get(ip, 11)),
-                          envNread),
-        ESL.CreateICmpULT(envIdx, ConstantInt::get(ip, 8181)));
-    ESL.CreateCondBr(envInBounds, envScanBodyBB, envCloseBB);
+    envIdx->addIncoming(ConstantInt::get(ip, 0), envDoReadBB);
+    Value *envInBounds =
+        ESL.CreateICmpULT(envIdx, envNread, "morok.antihook.env.idx.live");
+    ESL.CreateCondBr(envInBounds, envScanBodyBB, envReadNextBB);
 
     IRBuilder<> ESB(envScanBodyBB);
-    auto matchMarker = [&](const char *Marker) -> Value * {
-        Value *m = ConstantInt::getTrue(ctx);
-        for (unsigned k = 0; Marker[k] != '\0'; ++k) {
-            Value *ch =
-                loadAt(ESB, M, i8, buf,
-                       ESB.CreateAdd(envIdx, ConstantInt::get(ip, k)),
-                       "morok.antihook.env.ch");
-            Value *eq = ESB.CreateICmpEQ(
-                ch, ConstantInt::get(
-                        i8, static_cast<unsigned>(
-                                static_cast<unsigned char>(Marker[k]))));
-            m = ESB.CreateAnd(m, eq);
+    Value *envCh = loadAt(ESB, M, i8, buf, envIdx, "morok.antihook.env.ch");
+    Value *envIsNul = ESB.CreateICmpEQ(
+        envCh, ConstantInt::get(i8, 0), "morok.antihook.env.nul");
+    auto expectedMarkerByte = [&](Value *State, StringRef Marker,
+                                  StringRef Prefix) -> Value * {
+        Value *expected = ConstantInt::get(i8, 0);
+        for (int k = static_cast<int>(Marker.size()) - 1; k >= 0; --k) {
+            Value *atState = ESB.CreateICmpEQ(
+                State, ConstantInt::get(i32, static_cast<unsigned>(k)),
+                Twine(Prefix) + ".state." + Twine(k));
+            expected = ESB.CreateSelect(
+                atState,
+                ConstantInt::get(
+                    i8, static_cast<unsigned>(
+                            static_cast<unsigned char>(
+                                Marker[static_cast<std::size_t>(k)]))),
+                expected, Twine(Prefix) + ".expected." + Twine(k));
         }
-        return m;
+        return expected;
     };
-    Value *hitPreload = matchMarker("LD_PRELOAD=");
-    Value *hitAudit = matchMarker("LD_AUDIT=");
+    auto advanceMarker = [&](AllocaInst *StateSlot, StringRef Marker,
+                             StringRef Prefix) -> Value * {
+        Value *state =
+            ESB.CreateLoad(i32, StateSlot, Twine(Prefix) + ".state.cur");
+        Value *alive = ESB.CreateICmpNE(
+            state, ConstantInt::get(i32, kEnvStateDead),
+            Twine(Prefix) + ".state.live");
+        Value *expected = expectedMarkerByte(state, Marker, Prefix);
+        Value *matches =
+            ESB.CreateICmpEQ(envCh, expected, Twine(Prefix) + ".match");
+        Value *advance =
+            ESB.CreateAnd(alive, matches, Twine(Prefix) + ".advance");
+        Value *advancedState =
+            ESB.CreateAdd(state, ConstantInt::get(i32, 1),
+                          Twine(Prefix) + ".state.inc");
+        Value *nonNulState = ESB.CreateSelect(
+            advance, advancedState, ConstantInt::get(i32, kEnvStateDead),
+            Twine(Prefix) + ".state.nonnull");
+        Value *nextState = ESB.CreateSelect(
+            envIsNul, ConstantInt::get(i32, 0), nonNulState,
+            Twine(Prefix) + ".state.next");
+        ESB.CreateStore(nextState, StateSlot);
+        Value *hit =
+            ESB.CreateICmpEQ(nextState,
+                             ConstantInt::get(
+                                 i32, static_cast<unsigned>(Marker.size())),
+                             Twine(Prefix) + ".hit");
+        return ESB.CreateAnd(ESB.CreateNot(envIsNul), hit,
+                             Twine(Prefix) + ".hit.byte");
+    };
+    Value *hitPreload = advanceMarker(envPreloadState, "LD_PRELOAD=",
+                                      "morok.antihook.env.preload");
+    Value *hitAudit =
+        advanceMarker(envAuditState, "LD_AUDIT=", "morok.antihook.env.audit");
     incrementDiff(ESB, diff, hitPreload, "morok.antihook.env.preload");
     incrementDiff(ESB, diff, hitAudit, "morok.antihook.env.audit");
     ESB.CreateBr(envScanNextBB);
@@ -5246,6 +5306,15 @@ Function *linuxMapsCensusProbe(Module &M, ir::IRRandom &rng,
                                    "morok.antihook.env.next");
     ESN.CreateBr(envScanLoopBB);
     envIdx->addIncoming(envNext, envScanNextBB);
+
+    IRBuilder<> ERNB(envReadNextBB);
+    Value *envReadNext =
+        ERNB.CreateAdd(ERNB.CreateLoad(ip, envReads,
+                                       "morok.antihook.env.read.count.done"),
+                       ConstantInt::get(ip, 1),
+                       "morok.antihook.env.read.next");
+    ERNB.CreateStore(envReadNext, envReads);
+    ERNB.CreateBr(envReadBB);
 
     IRBuilder<> ECB(envCloseBB);
     if (direct)

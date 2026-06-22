@@ -15110,6 +15110,20 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.env.preload") >= 1u);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.env.audit") >= 1u);
+    CHECK(countNamedAllocas(*Maps, "morok.antihook.env.read.count") == 1u);
+    CHECK(countNamedAllocas(*Maps, "morok.antihook.env.preload.state") == 1u);
+    CHECK(countNamedAllocas(*Maps, "morok.antihook.env.audit.state") == 1u);
+    CHECK(hasNamedIcmpWithConstant(*Maps, "morok.antihook.env.read.limit", 16u));
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.read.next") >= 1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.idx.live") >= 1u);
+    CHECK(countNamedInstructions(*Maps,
+                                 "morok.antihook.env.preload.state.next") >=
+          1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.audit.state.next") >=
+          1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.preload.hit") >= 1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.audit.hit") >= 1u);
+    CHECK_FALSE(functionHasConstantInt(*Maps, 8181u));
     CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
                                  "morok.antihook.prologue.x86.hit") >= 1u);
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/exe"));
