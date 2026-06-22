@@ -18228,18 +18228,62 @@ Function *windowsUnhandledExceptionFilter(Module &M) {
     Argument *exceptionPtrs = fn->arg_begin();
     exceptionPtrs->setName("morok.win.attach.uef.exception.ptrs");
 
+    // The probe raises a private, continuable software exception (0xE0424D4F)
+    // and expects the UEF to observe exactly that. SetUnhandledExceptionFilter
+    // is process-wide, so the callback MUST inspect EXCEPTION_RECORD.Exception-
+    // Code and pass anything else through with EXCEPTION_CONTINUE_SEARCH (0):
+    // otherwise an unrelated unhandled exception on another thread (an access
+    // violation, __fastfail, etc.) would be marked as the probe hit and
+    // resumed at the faulting instruction instead of reaching the prior/default
+    // filter, turning a clean crash into a livelock/DoS (#221).
+    constexpr std::uint32_t kProbeExceptionCode = 0xE0424D4Fu;
+
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *recordBB = BasicBlock::Create(ctx, "record", fn);
+    auto *markBB = BasicBlock::Create(ctx, "mark", fn);
+    auto *searchBB = BasicBlock::Create(ctx, "search", fn);
+
     IRBuilder<> B(entry);
+    B.CreateCondBr(B.CreateICmpNE(exceptionPtrs,
+                                  ConstantPointerNull::get(ptr),
+                                  "morok.win.attach.uef.args.present"),
+                   recordBB, searchBB);
+
+    // EXCEPTION_POINTERS.ExceptionRecord @ offset 0;
+    // EXCEPTION_RECORD.ExceptionCode @ offset 0.
+    IRBuilder<> RB(recordBB);
+    Value *record = loadAt(RB, M, ptr, exceptionPtrs, 0ULL,
+                           "morok.win.attach.uef.record");
+    Value *hasRecord =
+        RB.CreateICmpNE(record, ConstantPointerNull::get(ptr),
+                        "morok.win.attach.uef.record.present");
+    Value *safeRecord = RB.CreateSelect(hasRecord, record, exceptionPtrs,
+                                        "morok.win.attach.uef.record.safe");
+    Value *code =
+        loadAt(RB, M, i32, safeRecord, 0ULL, "morok.win.attach.uef.code");
+    Value *match =
+        RB.CreateICmpEQ(code, ConstantInt::get(i32, kProbeExceptionCode),
+                        "morok.win.attach.uef.code.match");
+    RB.CreateCondBr(RB.CreateAnd(hasRecord, match,
+                                 "morok.win.attach.uef.probe.hit"),
+                    markBB, searchBB);
+
+    IRBuilder<> MB(markBB);
     Value *ptrBits =
-        B.CreatePtrToInt(exceptionPtrs, intPtrTy(M),
-                         "morok.win.attach.uef.exception.bits");
-    Value *marker = B.CreateOr(
-        B.CreateTrunc(ptrBits, i32, "morok.win.attach.uef.exception.low"),
+        MB.CreatePtrToInt(exceptionPtrs, intPtrTy(M),
+                          "morok.win.attach.uef.exception.bits");
+    Value *marker = MB.CreateOr(
+        MB.CreateTrunc(ptrBits, i32, "morok.win.attach.uef.exception.low"),
         ConstantInt::get(i32, 1), "morok.win.attach.uef.reached.marker");
-    StoreInst *hit =
-        B.CreateStore(marker, windowsUefReachedFlag(M));
+    StoreInst *hit = MB.CreateStore(marker, windowsUefReachedFlag(M));
     hit->setVolatile(true);
-    B.CreateRet(ConstantInt::getSigned(i32, -1));
+    // EXCEPTION_CONTINUE_EXECUTION: resume the probe's continuable exception.
+    MB.CreateRet(ConstantInt::getSigned(i32, -1));
+
+    // EXCEPTION_CONTINUE_SEARCH: let the OS proceed to the prior/default filter
+    // for null args or any non-probe exception.
+    IRBuilder<> SB(searchBB);
+    SB.CreateRet(ConstantInt::get(i32, 0));
     return fn;
 }
 

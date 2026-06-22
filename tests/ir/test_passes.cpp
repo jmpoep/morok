@@ -18650,6 +18650,21 @@ define i32 @main() { ret i32 0 }
                                  "morok.win.attach.uef.routing.missed") >= 1u);
     CHECK(countNamedInstructions(*Uef,
                                  "morok.win.attach.uef.reached.marker") >= 1u);
+    // #221: the process-wide UEF callback must inspect EXCEPTION_RECORD.
+    // ExceptionCode (loaded via the record), compare it against the probe's
+    // private code 0xE0424D4F, and return EXCEPTION_CONTINUE_SEARCH (ret i32 0)
+    // for any non-probe exception instead of swallowing/resuming it.
+    CHECK(countNamedInstructions(*Uef, "morok.win.attach.uef.record") >= 1u);
+    CHECK(countNamedInstructions(*Uef, "morok.win.attach.uef.code.match") >=
+          1u);
+    CHECK(functionHasConstantInt(*Uef, 0xE0424D4Fu));
+    bool uefHasContinueSearch = false;
+    for (Instruction &I : instructions(*Uef))
+        if (auto *Ret = dyn_cast<ReturnInst>(&I))
+            if (auto *RV = dyn_cast_or_null<ConstantInt>(Ret->getReturnValue()))
+                if (RV->isZero())
+                    uefHasContinueSearch = true;
+    CHECK(uefHasContinueSearch);
     Instruction *UefMissed =
         findNamedInstruction(*Probe, "morok.win.attach.uef.routing.missed");
     REQUIRE(UefMissed != nullptr);
