@@ -411,6 +411,8 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.windows_kernel_debugger.enabled,
              src.windows_kernel_debugger.enabled);
     mergeOpt(dst.windows_syscalls.enabled, src.windows_syscalls.enabled);
+    mergeOpt(dst.windows_process_modules.enabled,
+             src.windows_process_modules.enabled);
     mergeOpt(dst.platform_runtime.enabled, src.platform_runtime.enabled);
     mergeOpt(dst.platform_runtime.direct_syscalls,
              src.platform_runtime.direct_syscalls);

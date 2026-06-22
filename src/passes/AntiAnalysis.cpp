@@ -13941,6 +13941,103 @@ Function *windowsWideNameHash(Module &M) {
     return fn;
 }
 
+Function *windowsAsciiNameHashBounded(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.ascii.hash"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, {ptr, i32}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.ascii.hash", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *name = fn->getArg(0);
+    name->setName("name");
+    Argument *bytes = fn->getArg(1);
+    bytes->setName("bytes");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    Value *limit = B.CreateSelect(
+        B.CreateICmpULT(bytes, ConstantInt::get(i32, 256)), bytes,
+        ConstantInt::get(i32, 256), "morok.win.ascii.limit");
+    Value *hasName =
+        B.CreateAnd(B.CreateICmpNE(name, ConstantPointerNull::get(ptr)),
+                    B.CreateICmpNE(limit, ConstantInt::get(i32, 0)),
+                    "morok.win.ascii.present");
+    B.CreateCondBr(hasName, loopBB, retBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *idx = LB.CreatePHI(i32, 2, "morok.win.ascii.idx");
+    auto *acc = LB.CreatePHI(i64, 2, "morok.win.ascii.acc");
+    idx->addIncoming(ConstantInt::get(i32, 0), entry);
+    acc->addIncoming(ConstantInt::get(i64, 1469598103934665603ULL), entry);
+    LB.CreateCondBr(LB.CreateICmpULT(idx, limit, "morok.win.ascii.idx.ok"),
+                    bodyBB, retBB);
+
+    IRBuilder<> BB(bodyBB);
+    Value *idxIp = BB.CreateZExt(idx, ip, "morok.win.ascii.idx.ip");
+    Value *ch = BB.CreateLoad(i8, gepI8(BB, M, name, idxIp,
+                                        "morok.win.ascii.char.ptr"),
+                              "morok.win.ascii.char");
+    BB.CreateCondBr(BB.CreateICmpNE(ch, ConstantInt::get(i8, 0),
+                                    "morok.win.ascii.nonzero"),
+                    nextBB, retBB);
+
+    IRBuilder<> NB(nextBB);
+    Value *wide = NB.CreateZExt(ch, i32, "morok.win.ascii.wide");
+    Value *geA = NB.CreateICmpUGE(wide, ConstantInt::get(i32, 'A'),
+                                  "morok.win.ascii.ge.a");
+    Value *leZ = NB.CreateICmpULE(wide, ConstantInt::get(i32, 'Z'),
+                                  "morok.win.ascii.le.z");
+    Value *lower = NB.CreateSelect(
+        NB.CreateAnd(geA, leZ, "morok.win.ascii.upper"),
+        NB.CreateAdd(wide, ConstantInt::get(i32, 'a' - 'A')),
+        wide, "morok.win.ascii.lower");
+    Value *byte = NB.CreateTrunc(lower, i8, "morok.win.ascii.byte");
+    Value *nextAcc =
+        NB.CreateMul(NB.CreateXor(acc, NB.CreateZExt(byte, i64),
+                                  "morok.win.ascii.xor"),
+                     ConstantInt::get(i64, 1099511628211ULL),
+                     "morok.win.ascii.next");
+    Value *nextIdx =
+        NB.CreateAdd(idx, ConstantInt::get(i32, 1), "morok.win.ascii.idx.next");
+    NB.CreateBr(loopBB);
+    idx->addIncoming(nextIdx, nextBB);
+    acc->addIncoming(nextAcc, nextBB);
+
+    IRBuilder<> RB(retBB);
+    auto *retAcc = RB.CreatePHI(i64, 3, "morok.win.ascii.ret");
+    retAcc->addIncoming(ConstantInt::get(i64, 1469598103934665603ULL), entry);
+    retAcc->addIncoming(acc, loopBB);
+    retAcc->addIncoming(acc, bodyBB);
+    RB.CreateRet(retAcc);
+    return fn;
+}
+
+Value *hashMatchesAny(IRBuilderBase &B, Value *Hash,
+                      std::initializer_list<std::uint64_t> Hashes,
+                      const Twine &Name) {
+    auto *hashTy = cast<IntegerType>(Hash->getType());
+    Value *any = ConstantInt::getFalse(B.getContext());
+    for (std::uint64_t H : Hashes) {
+        Value *eq = B.CreateICmpEQ(Hash, ConstantInt::get(hashTy, H),
+                                   Name + ".eq");
+        any = B.CreateOr(any, eq, Name + ".any");
+    }
+    return any;
+}
+
 Function *windowsLdrModuleByHash(Module &M) {
     if (Function *existing = M.getFunction("morok.win.ldr.module"))
         return existing;
@@ -19642,6 +19739,472 @@ Function *windowsKernelDebuggerProbe(Module &M, GlobalVariable *State,
     return fn;
 }
 
+Function *windowsProcessModuleProbe(Module &M, GlobalVariable *State,
+                                    ir::IRRandom &rng, const Triple &TT) {
+    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
+        intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.win.procmod.probe"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    constexpr std::uint64_t kProcessInfoBufferBytes = 96 * 1024;
+    constexpr std::uint64_t kProcessInfoFixedBytes = 0x60;
+    constexpr std::uint32_t kProcessWalkLimit = 160;
+    constexpr std::uint64_t kModuleInfoBufferBytes = 32 * 1024;
+    constexpr std::uint64_t kModuleInfoHeaderBytes = 8;
+    constexpr std::uint64_t kModuleInfoEntryBytes = 296;
+    constexpr std::uint64_t kModuleInfoFileNameOffset = 38;
+    constexpr std::uint64_t kModuleInfoPathOffset = 40;
+    constexpr std::uint32_t kModuleWalkLimit = 160;
+    constexpr std::uint64_t kProcessNameKey = 0xB947E31C6A852D10ULL;
+    constexpr std::uint64_t kModuleNameKey = 0x6C2F91A7D438B50EULL;
+
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.procmod.probe", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    Function *pebReader = windowsPebReader(M);
+    Function *moduleByHash = windowsLdrModuleByHash(M);
+    Function *resolver = windowsPeExportResolver(M);
+    Function *wideHash = windowsWideNameHash(M);
+    Function *asciiHash = windowsAsciiNameHashBounded(M);
+    Function *scanner = windowsSyscallStubScanner(M);
+    Function *direct = windowsDirectSyscallThunk(M);
+    if (!pebReader || !moduleByHash || !resolver || !wideHash || !asciiHash ||
+        !scanner || !direct)
+        return nullptr;
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *resolveBB = BasicBlock::Create(ctx, "resolve", fn);
+    auto *processQueryBB = BasicBlock::Create(ctx, "process.query", fn);
+    auto *processLoopBB = BasicBlock::Create(ctx, "process.loop", fn);
+    auto *processBodyBB = BasicBlock::Create(ctx, "process.body", fn);
+    auto *processNextBB = BasicBlock::Create(ctx, "process.next", fn);
+    auto *moduleQueryBB = BasicBlock::Create(ctx, "module.query", fn);
+    auto *moduleLoopBB = BasicBlock::Create(ctx, "module.loop", fn);
+    auto *moduleBodyBB = BasicBlock::Create(ctx, "module.body", fn);
+    auto *moduleNextBB = BasicBlock::Create(ctx, "module.next", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "done", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *retLen =
+        B.CreateAlloca(i32, nullptr, "morok.win.procmod.retlen");
+    AllocaInst *processHits =
+        B.CreateAlloca(i32, nullptr, "morok.win.procmod.process.hits.slot");
+    AllocaInst *moduleHits =
+        B.CreateAlloca(i32, nullptr, "morok.win.procmod.module.hits.slot");
+    AllocaInst *processMix =
+        B.CreateAlloca(i64, nullptr, "morok.win.procmod.process.mix.slot");
+    AllocaInst *moduleMix =
+        B.CreateAlloca(i64, nullptr, "morok.win.procmod.module.mix.slot");
+    auto *processBufTy = ArrayType::get(i8, kProcessInfoBufferBytes);
+    auto *moduleBufTy = ArrayType::get(i8, kModuleInfoBufferBytes);
+    AllocaInst *processBuf =
+        B.CreateAlloca(processBufTy, nullptr, "morok.win.procmod.process.buf");
+    AllocaInst *moduleBuf =
+        B.CreateAlloca(moduleBufTy, nullptr, "morok.win.procmod.module.buf");
+    B.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), processHits)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), moduleHits)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), processMix)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), moduleMix)->setVolatile(true);
+
+    Value *peb = B.CreateCall(pebReader, {}, "morok.win.procmod.peb");
+    foldState(B, State, peb, rng.next(), "morok.win.procmod.peb.mix");
+    B.CreateCondBr(B.CreateICmpNE(peb, ConstantInt::get(ip, 0),
+                                  "morok.win.procmod.peb.present"),
+                   resolveBB, doneBB);
+
+    IRBuilder<> RB(resolveBB);
+    Value *ntdll = RB.CreateCall(
+        moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("ntdll.dll"))},
+        "morok.win.procmod.ntdll");
+    Value *qsi = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtQuerySystemInformation"))},
+        "morok.win.procmod.ntqsi");
+    Value *qsiPack = RB.CreateCall(
+        scanner,
+        {RB.CreateIntToPtr(qsi, ptr, "morok.win.procmod.ntqsi.scan.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.win.procmod.ntqsi.pack");
+    Value *qsiSsn = RB.CreateTrunc(qsiPack, i32,
+                                   "morok.win.procmod.ntqsi.ssn");
+    foldState(RB, State, ntdll, rng.next(), "morok.win.procmod.ntdll.mix");
+    foldState(RB, State, qsi, rng.next(), "morok.win.procmod.ntqsi.mix");
+    foldState(RB, State, qsiPack, rng.next(),
+              "morok.win.procmod.ntqsi.pack.mix");
+    Value *qsiReady = RB.CreateAnd(
+        RB.CreateICmpNE(qsi, ConstantInt::get(ip, 0)),
+        RB.CreateICmpNE(qsiSsn, ConstantInt::get(i32, 0)),
+        "morok.win.procmod.ntqsi.direct.ready");
+    foldFlag(RB, State,
+             RB.CreateNot(qsiReady, "morok.win.procmod.ntqsi.direct.missing"),
+             0x51B842F0C63D9A17ULL,
+             "morok.win.procmod.ntqsi.direct.missing");
+    RB.CreateCondBr(qsiReady, processQueryBB, doneBB);
+
+    IRBuilder<> PQ(processQueryBB);
+    PQ.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
+    Value *processBufIp =
+        PQ.CreatePtrToInt(processBuf, ip, "morok.win.procmod.process.buf.ip");
+    Value *retLenIp =
+        PQ.CreatePtrToInt(retLen, ip, "morok.win.procmod.retlen.ip");
+    auto *directTy = direct->getFunctionType();
+    Value *processStatusRaw = PQ.CreateCall(
+        directTy, direct,
+        {qsiSsn, ConstantInt::get(ip, 5), processBufIp,
+         ConstantInt::get(ip, kProcessInfoBufferBytes), retLenIp},
+        "morok.win.procmod.process.status.raw");
+    Value *processStatus = PQ.CreateTrunc(
+        processStatusRaw, i32, "morok.win.procmod.process.status");
+    Value *processOk =
+        PQ.CreateICmpSGE(processStatus, ConstantInt::get(i32, 0),
+                         "morok.win.procmod.process.ok");
+    Value *processLen =
+        PQ.CreateLoad(i32, retLen, "morok.win.procmod.process.retlen");
+    cast<LoadInst>(processLen)->setVolatile(true);
+    Value *processLenIp =
+        PQ.CreateZExt(processLen, ip, "morok.win.procmod.process.retlen.ip");
+    Value *processLenBound = PQ.CreateSelect(
+        PQ.CreateICmpULT(processLenIp,
+                         ConstantInt::get(ip, kProcessInfoBufferBytes)),
+        processLenIp, ConstantInt::get(ip, kProcessInfoBufferBytes),
+        "morok.win.procmod.process.retlen.bound");
+    Value *processLimit = PQ.CreateSelect(
+        PQ.CreateICmpNE(processLenIp, ConstantInt::get(ip, 0),
+                        "morok.win.procmod.process.retlen.nonzero"),
+        processLenBound, ConstantInt::get(ip, kProcessInfoBufferBytes),
+        "morok.win.procmod.process.walk.limit");
+    foldState(PQ, State, processStatus, rng.next(),
+              "morok.win.procmod.process.status.mix");
+    foldState(PQ, State, processLen, rng.next(),
+              "morok.win.procmod.process.retlen.mix");
+    PQ.CreateCondBr(processOk, processLoopBB, moduleQueryBB);
+
+    IRBuilder<> PL(processLoopBB);
+    auto *processOff =
+        PL.CreatePHI(ip, 2, "morok.win.procmod.process.off");
+    auto *processIdx =
+        PL.CreatePHI(i32, 2, "morok.win.procmod.process.idx");
+    processOff->addIncoming(ConstantInt::get(ip, 0), processQueryBB);
+    processIdx->addIncoming(ConstantInt::get(i32, 0), processQueryBB);
+    Value *processEntryEnd = PL.CreateAdd(
+        processOff, ConstantInt::get(ip, kProcessInfoFixedBytes),
+        "morok.win.procmod.process.entry.end");
+    Value *processOffOk = PL.CreateICmpULE(
+        processEntryEnd, processLimit, "morok.win.procmod.process.off.ok");
+    Value *processIdxOk =
+        PL.CreateICmpULT(processIdx, ConstantInt::get(i32, kProcessWalkLimit),
+                         "morok.win.procmod.process.idx.ok");
+    PL.CreateCondBr(PL.CreateAnd(processOffOk, processIdxOk,
+                                 "morok.win.procmod.process.keep.walking"),
+                    processBodyBB, moduleQueryBB);
+
+    IRBuilder<> PB(processBodyBB);
+    Value *processEntry =
+        gepI8(PB, M, processBuf, processOff, "morok.win.procmod.process.entry");
+    Value *nextOffset = loadAt(PB, M, i32, processEntry, 0ULL,
+                               "morok.win.procmod.process.next.offset");
+    Value *nameLen = loadAt(PB, M, i16, processEntry, 0x38,
+                            "morok.win.procmod.process.name.len");
+    Value *nameBuffer = loadAt(PB, M, ip, processEntry, 0x40,
+                               "morok.win.procmod.process.name.buffer");
+    Value *pid = loadAt(PB, M, ip, processEntry, 0x50,
+                        "morok.win.procmod.process.pid");
+    Value *processBase =
+        PB.CreatePtrToInt(processBuf, ip, "morok.win.procmod.process.base");
+    Value *processEnd =
+        PB.CreateAdd(processBase, processLimit,
+                     "morok.win.procmod.process.end");
+    Value *nameLenIp =
+        PB.CreateZExt(nameLen, ip, "morok.win.procmod.process.name.len.ip");
+    Value *nameEnd =
+        PB.CreateAdd(nameBuffer, nameLenIp,
+                     "morok.win.procmod.process.name.end");
+    Value *nameNoWrap = PB.CreateICmpUGE(
+        nameEnd, nameBuffer, "morok.win.procmod.process.name.no.wrap");
+    Value *nameStartOk = PB.CreateICmpUGE(
+        nameBuffer, processBase, "morok.win.procmod.process.name.start.ok");
+    Value *nameEndOk = PB.CreateICmpULE(
+        nameEnd, processEnd, "morok.win.procmod.process.name.end.ok");
+    Value *nameLenOk = PB.CreateICmpULE(
+        nameLen, ConstantInt::get(i16, 520),
+        "morok.win.procmod.process.name.len.ok");
+    Value *nameValid = PB.CreateAnd(
+        PB.CreateAnd(nameNoWrap, nameLenOk,
+                     "morok.win.procmod.process.name.size.ok"),
+        PB.CreateAnd(nameStartOk, nameEndOk,
+                     "morok.win.procmod.process.name.range.ok"),
+        "morok.win.procmod.process.name.valid");
+    Value *safeNameBuffer =
+        PB.CreateSelect(nameValid, nameBuffer, ConstantInt::get(ip, 0),
+                        "morok.win.procmod.process.name.safe");
+    Value *safeNameLen =
+        PB.CreateSelect(nameValid, nameLen, ConstantInt::get(i16, 0),
+                        "morok.win.procmod.process.name.len.safe");
+    Value *processNameHash = PB.CreateCall(
+        wideHash,
+        {PB.CreateIntToPtr(safeNameBuffer, ptr,
+                           "morok.win.procmod.process.name.ptr"),
+         safeNameLen},
+        "morok.win.procmod.process.name.hash");
+    Value *processNameKeyed =
+        PB.CreateXor(processNameHash, ConstantInt::get(i64, kProcessNameKey),
+                     "morok.win.procmod.process.name.key");
+    Value *processNameMatched = hashMatchesAny(
+        PB, processNameKeyed,
+        {fnv1aLowerAsciiName("x64dbg.exe") ^ kProcessNameKey,
+         fnv1aLowerAsciiName("x32dbg.exe") ^ kProcessNameKey,
+         fnv1aLowerAsciiName("ida64.exe") ^ kProcessNameKey,
+         fnv1aLowerAsciiName("ida.exe") ^ kProcessNameKey,
+         fnv1aLowerAsciiName("windbg.exe") ^ kProcessNameKey,
+         fnv1aLowerAsciiName("windbgx.exe") ^ kProcessNameKey,
+         fnv1aLowerAsciiName("processhacker.exe") ^ kProcessNameKey,
+         fnv1aLowerAsciiName("systeminformer.exe") ^ kProcessNameKey,
+         fnv1aLowerAsciiName("cheatengine.exe") ^ kProcessNameKey,
+         fnv1aLowerAsciiName("cheatengine-x86_64.exe") ^ kProcessNameKey,
+         fnv1aLowerAsciiName("ollydbg.exe") ^ kProcessNameKey},
+        "morok.win.procmod.process.name.match");
+    Value *processNameHit =
+        PB.CreateAnd(nameValid, processNameMatched,
+                     "morok.win.procmod.process.name.hit");
+    Value *oldProcessHits =
+        PB.CreateLoad(i32, processHits,
+                      "morok.win.procmod.process.hits.old");
+    cast<LoadInst>(oldProcessHits)->setVolatile(true);
+    PB.CreateStore(PB.CreateAdd(oldProcessHits,
+                                PB.CreateZExt(processNameHit, i32),
+                                "morok.win.procmod.process.hits.next"),
+                   processHits)
+        ->setVolatile(true);
+    Value *oldProcessMix =
+        PB.CreateLoad(i64, processMix, "morok.win.procmod.process.mix.old");
+    cast<LoadInst>(oldProcessMix)->setVolatile(true);
+    Value *processEntryMix = PB.CreateXor(
+        processNameHash,
+        PB.CreateZExtOrTrunc(pid, i64, "morok.win.procmod.process.pid.i64"),
+        "morok.win.procmod.process.entry.mix");
+    PB.CreateStore(
+          PB.CreateXor(PB.CreateMul(oldProcessMix,
+                                    ConstantInt::get(i64,
+                                                     0xA0761D6478BD642FULL),
+                                    "morok.win.procmod.process.mix.mul"),
+                       processEntryMix, "morok.win.procmod.process.mix.next"),
+          processMix)
+        ->setVolatile(true);
+    PB.CreateBr(processNextBB);
+
+    IRBuilder<> PN(processNextBB);
+    Value *nextOffsetIp =
+        PN.CreateZExt(nextOffset, ip, "morok.win.procmod.process.next.ip");
+    Value *nextProcessOff =
+        PN.CreateAdd(processOff, nextOffsetIp,
+                     "morok.win.procmod.process.next.off");
+    Value *hasNextProcess =
+        PN.CreateICmpNE(nextOffset, ConstantInt::get(i32, 0),
+                        "morok.win.procmod.process.next.present");
+    Value *advanced = PN.CreateICmpUGT(nextProcessOff, processOff,
+                                       "morok.win.procmod.process.advance");
+    Value *nextProcessIdx =
+        PN.CreateAdd(processIdx, ConstantInt::get(i32, 1),
+                     "morok.win.procmod.process.next.idx");
+    PN.CreateCondBr(PN.CreateAnd(hasNextProcess, advanced,
+                                 "morok.win.procmod.process.continue"),
+                    processLoopBB, moduleQueryBB);
+    processOff->addIncoming(nextProcessOff, processNextBB);
+    processIdx->addIncoming(nextProcessIdx, processNextBB);
+
+    IRBuilder<> MQ(moduleQueryBB);
+    MQ.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
+    Value *moduleBufIp =
+        MQ.CreatePtrToInt(moduleBuf, ip, "morok.win.procmod.module.buf.ip");
+    Value *moduleRetLenIp =
+        MQ.CreatePtrToInt(retLen, ip, "morok.win.procmod.module.retlen.ip");
+    Value *moduleStatusRaw = MQ.CreateCall(
+        directTy, direct,
+        {qsiSsn, ConstantInt::get(ip, 0x0B), moduleBufIp,
+         ConstantInt::get(ip, kModuleInfoBufferBytes), moduleRetLenIp},
+        "morok.win.procmod.module.status.raw");
+    Value *moduleStatus =
+        MQ.CreateTrunc(moduleStatusRaw, i32, "morok.win.procmod.module.status");
+    Value *moduleOk =
+        MQ.CreateICmpSGE(moduleStatus, ConstantInt::get(i32, 0),
+                         "morok.win.procmod.module.ok");
+    Value *moduleLen =
+        MQ.CreateLoad(i32, retLen, "morok.win.procmod.module.retlen");
+    cast<LoadInst>(moduleLen)->setVolatile(true);
+    Value *moduleLenIp =
+        MQ.CreateZExt(moduleLen, ip, "morok.win.procmod.module.retlen.ip");
+    Value *moduleLenBound = MQ.CreateSelect(
+        MQ.CreateICmpULT(moduleLenIp,
+                         ConstantInt::get(ip, kModuleInfoBufferBytes)),
+        moduleLenIp, ConstantInt::get(ip, kModuleInfoBufferBytes),
+        "morok.win.procmod.module.retlen.bound");
+    Value *moduleLimit = MQ.CreateSelect(
+        MQ.CreateICmpNE(moduleLenIp, ConstantInt::get(ip, 0),
+                        "morok.win.procmod.module.retlen.nonzero"),
+        moduleLenBound, ConstantInt::get(ip, kModuleInfoBufferBytes),
+        "morok.win.procmod.module.walk.limit");
+    Value *moduleCount =
+        loadAt(MQ, M, i32, moduleBuf, 0ULL, "morok.win.procmod.module.count");
+    Value *moduleWalkLimit = MQ.CreateSelect(
+        MQ.CreateICmpULT(moduleCount, ConstantInt::get(i32, kModuleWalkLimit)),
+        moduleCount, ConstantInt::get(i32, kModuleWalkLimit),
+        "morok.win.procmod.module.count.limit");
+    foldState(MQ, State, moduleStatus, rng.next(),
+              "morok.win.procmod.module.status.mix");
+    foldState(MQ, State, moduleLen, rng.next(),
+              "morok.win.procmod.module.retlen.mix");
+    foldState(MQ, State, moduleCount, rng.next(),
+              "morok.win.procmod.module.count.mix");
+    MQ.CreateCondBr(moduleOk, moduleLoopBB, doneBB);
+
+    IRBuilder<> ML(moduleLoopBB);
+    auto *moduleIdx =
+        ML.CreatePHI(i32, 2, "morok.win.procmod.module.idx");
+    moduleIdx->addIncoming(ConstantInt::get(i32, 0), moduleQueryBB);
+    Value *moduleIdxOk =
+        ML.CreateICmpULT(moduleIdx, moduleWalkLimit,
+                         "morok.win.procmod.module.idx.ok");
+    Value *moduleEntryOff = ML.CreateAdd(
+        ConstantInt::get(ip, kModuleInfoHeaderBytes),
+        ML.CreateMul(ML.CreateZExt(moduleIdx, ip),
+                     ConstantInt::get(ip, kModuleInfoEntryBytes),
+                     "morok.win.procmod.module.entry.mul"),
+        "morok.win.procmod.module.entry.off");
+    Value *moduleEntryEnd = ML.CreateAdd(
+        moduleEntryOff, ConstantInt::get(ip, kModuleInfoEntryBytes),
+        "morok.win.procmod.module.entry.end");
+    Value *moduleOffOk = ML.CreateICmpULE(
+        moduleEntryEnd, moduleLimit, "morok.win.procmod.module.off.ok");
+    ML.CreateCondBr(ML.CreateAnd(moduleIdxOk, moduleOffOk,
+                                 "morok.win.procmod.module.keep.walking"),
+                    moduleBodyBB, doneBB);
+
+    IRBuilder<> MB(moduleBodyBB);
+    Value *moduleEntry =
+        gepI8(MB, M, moduleBuf, moduleEntryOff,
+              "morok.win.procmod.module.entry");
+    Value *fileNameOff =
+        loadAt(MB, M, i16, moduleEntry, kModuleInfoFileNameOffset,
+               "morok.win.procmod.module.file.name.off");
+    Value *fileNameOff32 =
+        MB.CreateZExt(fileNameOff, i32,
+                      "morok.win.procmod.module.file.name.off.i32");
+    Value *fileNameOffIp =
+        MB.CreateZExt(fileNameOff, ip,
+                      "morok.win.procmod.module.file.name.off.ip");
+    Value *fileNameOffOk =
+        MB.CreateICmpULT(fileNameOff, ConstantInt::get(i16, 256),
+                         "morok.win.procmod.module.file.name.off.ok");
+    Value *moduleNameOff = MB.CreateAdd(
+        MB.CreateAdd(moduleEntryOff, ConstantInt::get(ip, kModuleInfoPathOffset),
+                     "morok.win.procmod.module.path.off"),
+        fileNameOffIp, "morok.win.procmod.module.name.off");
+    Value *remainingBytes = MB.CreateSub(
+        ConstantInt::get(i32, 256), fileNameOff32,
+        "morok.win.procmod.module.name.remaining.raw");
+    Value *safeRemainingBytes =
+        MB.CreateSelect(fileNameOffOk, remainingBytes, ConstantInt::get(i32, 0),
+                        "morok.win.procmod.module.name.remaining");
+    Value *moduleNameHash = MB.CreateCall(
+        asciiHash,
+        {gepI8(MB, M, moduleBuf, moduleNameOff,
+               "morok.win.procmod.module.name.ptr"),
+         safeRemainingBytes},
+        "morok.win.procmod.module.name.hash");
+    Value *moduleNameKeyed =
+        MB.CreateXor(moduleNameHash, ConstantInt::get(i64, kModuleNameKey),
+                     "morok.win.procmod.module.name.key");
+    Value *moduleNameMatched = hashMatchesAny(
+        MB, moduleNameKeyed,
+        {fnv1aLowerAsciiName("scyllahide.dll") ^ kModuleNameKey,
+         fnv1aLowerAsciiName("scyllahidex64dbgplugin.dp64") ^ kModuleNameKey,
+         fnv1aLowerAsciiName("scyllahidex86dbgplugin.dp32") ^ kModuleNameKey,
+         fnv1aLowerAsciiName("titanhide.dll") ^ kModuleNameKey,
+         fnv1aLowerAsciiName("titanhide.sys") ^ kModuleNameKey},
+        "morok.win.procmod.module.name.match");
+    Value *moduleNameHit =
+        MB.CreateAnd(fileNameOffOk, moduleNameMatched,
+                     "morok.win.procmod.module.name.hit");
+    Value *oldModuleHits =
+        MB.CreateLoad(i32, moduleHits, "morok.win.procmod.module.hits.old");
+    cast<LoadInst>(oldModuleHits)->setVolatile(true);
+    MB.CreateStore(MB.CreateAdd(oldModuleHits, MB.CreateZExt(moduleNameHit, i32),
+                                "morok.win.procmod.module.hits.next"),
+                   moduleHits)
+        ->setVolatile(true);
+    Value *oldModuleMix =
+        MB.CreateLoad(i64, moduleMix, "morok.win.procmod.module.mix.old");
+    cast<LoadInst>(oldModuleMix)->setVolatile(true);
+    MB.CreateStore(
+          MB.CreateXor(MB.CreateMul(oldModuleMix,
+                                    ConstantInt::get(i64,
+                                                     0x9E3779B185EBCA87ULL),
+                                    "morok.win.procmod.module.mix.mul"),
+                       moduleNameHash, "morok.win.procmod.module.mix.next"),
+          moduleMix)
+        ->setVolatile(true);
+    MB.CreateBr(moduleNextBB);
+
+    IRBuilder<> MN(moduleNextBB);
+    Value *nextModuleIdx =
+        MN.CreateAdd(moduleIdx, ConstantInt::get(i32, 1),
+                     "morok.win.procmod.module.next.idx");
+    MN.CreateBr(moduleLoopBB);
+    moduleIdx->addIncoming(nextModuleIdx, moduleNextBB);
+
+    IRBuilder<> DB(doneBB);
+    Value *finalProcessHits =
+        DB.CreateLoad(i32, processHits,
+                      "morok.win.procmod.process.hits.final");
+    cast<LoadInst>(finalProcessHits)->setVolatile(true);
+    Value *finalModuleHits =
+        DB.CreateLoad(i32, moduleHits, "morok.win.procmod.module.hits.final");
+    cast<LoadInst>(finalModuleHits)->setVolatile(true);
+    Value *finalProcessMix =
+        DB.CreateLoad(i64, processMix, "morok.win.procmod.process.mix.final");
+    cast<LoadInst>(finalProcessMix)->setVolatile(true);
+    Value *finalModuleMix =
+        DB.CreateLoad(i64, moduleMix, "morok.win.procmod.module.mix.final");
+    cast<LoadInst>(finalModuleMix)->setVolatile(true);
+    Value *processHit =
+        DB.CreateICmpNE(finalProcessHits, ConstantInt::get(i32, 0),
+                        "morok.win.procmod.process.hit");
+    Value *moduleHit =
+        DB.CreateICmpNE(finalModuleHits, ConstantInt::get(i32, 0),
+                        "morok.win.procmod.module.hit");
+    Value *censusHit =
+        DB.CreateOr(processHit, moduleHit, "morok.win.procmod.census.hit");
+    foldState(DB, State, finalProcessMix, rng.next(),
+              "morok.win.procmod.process.mix");
+    foldState(DB, State, finalModuleMix, rng.next(),
+              "morok.win.procmod.module.mix");
+    foldState(DB, State, finalProcessHits, rng.next(),
+              "morok.win.procmod.process.hits.mix");
+    foldState(DB, State, finalModuleHits, rng.next(),
+              "morok.win.procmod.module.hits.mix");
+    foldFlag(DB, State, processHit, 0x6F51C2A07D9E438BULL,
+             "morok.win.procmod.process.hit", /*ScoreSoftSignal=*/true);
+    foldFlag(DB, State, moduleHit, 0xA3D9701C5E48B62FULL,
+             "morok.win.procmod.module.hit", /*ScoreSoftSignal=*/true);
+    foldFlag(DB, State, censusHit, 0x2E8B61D4A907C35FULL,
+             "morok.win.procmod.census.hit");
+    DB.CreateRetVoid();
+    return fn;
+}
+
 Function *windowsSyscallsProbe(Module &M, GlobalVariable *State,
                                ir::IRRandom &rng, const Triple &TT) {
     if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
@@ -22236,6 +22799,22 @@ bool windowsSyscallsModule(Module &M, ir::IRRandom &rng) {
     return true;
 }
 
+bool windowsProcessModulesModule(Module &M, ir::IRRandom &rng) {
+    const Triple tt(M.getTargetTriple());
+    antiDebugSeal(M, rng);
+    GlobalVariable *state = windowsPeState(M, rng);
+    Function *probe = windowsProcessModuleProbe(M, state, rng, tt);
+    if (!probe)
+        return false;
+
+    Function *ctor = makeCtorShell(M, "morok.win.procmod");
+    IRBuilder<> B(&ctor->getEntryBlock());
+    B.CreateCall(probe);
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, ctor, 0);
+    return true;
+}
+
 bool windowsUnhookModule(Module &M, ir::IRRandom &rng) {
     const Triple tt(M.getTargetTriple());
     antiDebugSeal(M, rng);
@@ -22345,6 +22924,13 @@ PreservedAnalyses WindowsSyscallsPass::run(Module &M,
     ir::IRRandom rng(engine_);
     return windowsSyscallsModule(M, rng) ? PreservedAnalyses::none()
                                          : PreservedAnalyses::all();
+}
+
+PreservedAnalyses WindowsProcessModulesPass::run(Module &M,
+                                                 ModuleAnalysisManager &) {
+    ir::IRRandom rng(engine_);
+    return windowsProcessModulesModule(M, rng) ? PreservedAnalyses::none()
+                                               : PreservedAnalyses::all();
 }
 
 PreservedAnalyses WindowsUnhookPass::run(Module &M,

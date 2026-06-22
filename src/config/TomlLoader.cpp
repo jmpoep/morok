@@ -590,6 +590,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseToggle(*t, pc.windows_kernel_debugger);
     if (auto *t = p["windows_syscalls"].as_table())
         parseToggle(*t, pc.windows_syscalls);
+    if (auto *t = p["windows_process_modules"].as_table())
+        parseToggle(*t, pc.windows_process_modules);
     if (auto *t = p["platform_runtime"].as_table())
         parsePlatformRuntime(*t, pc.platform_runtime);
     if (auto *t = p["windows_unhook"].as_table())

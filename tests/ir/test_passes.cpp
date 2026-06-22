@@ -19181,6 +19181,94 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("windowsProcessModulesModule emits raw process/module census probes") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-pc-windows-msvc"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(7139);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::windowsProcessModulesModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.win.procmod");
+    Function *Probe = M->getFunction("morok.win.procmod.probe");
+    Function *Peb = M->getFunction("morok.win.peb");
+    Function *Resolve = M->getFunction("morok.win.pe.resolve");
+    Function *Ldr = M->getFunction("morok.win.ldr.module");
+    Function *WideHash = M->getFunction("morok.win.wide.hash");
+    Function *AsciiHash = M->getFunction("morok.win.ascii.hash");
+    Function *Scan = M->getFunction("morok.win.sys.scan");
+    Function *Direct = M->getFunction("morok.win.sys.direct");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Probe != nullptr);
+    REQUIRE(Peb != nullptr);
+    REQUIRE(Resolve != nullptr);
+    REQUIRE(Ldr != nullptr);
+    REQUIRE(WideHash != nullptr);
+    REQUIRE(AsciiHash != nullptr);
+    REQUIRE(Scan != nullptr);
+    REQUIRE(Direct != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.seal.score.anti_debug.weight", true) !=
+          nullptr);
+    checkNoSealEnforcement(*Probe);
+    CHECK(M->getFunction("NtQuerySystemInformation") == nullptr);
+    CHECK(hasInlineAsmCall(*Peb));
+    CHECK(hasInlineAsmCall(*Direct));
+    CHECK(countNamedInstructions(*WideHash, "morok.win.wide.lower") >= 1u);
+    CHECK(countNamedInstructions(*AsciiHash, "morok.win.ascii.lower") >= 1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.halo") >= 1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.tartarus") >= 1u);
+    CHECK(maxStaticAllocaArrayBytes(*Probe,
+                                    "morok.win.procmod.process.buf") ==
+          96u * 1024u);
+    CHECK(maxStaticAllocaArrayBytes(*Probe,
+                                    "morok.win.procmod.module.buf") ==
+          32u * 1024u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.procmod.ntdll") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.procmod.ntqsi.pack") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.ntqsi.direct.ready") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.process.status") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.process.name.valid") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.process.name.hash") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.process.name.key") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.process.name.hit") >= 1u);
+    CHECK(namedInstructionUsesConstant(
+        *Probe, "morok.win.procmod.process.entry.end", 0x60));
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.process.hits.final") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.process.hit.score") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.module.status") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.procmod.module.count") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.module.name.hash") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.module.name.key") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.module.name.hit") >= 1u);
+    CHECK(namedInstructionUsesConstant(
+        *Probe, "morok.win.procmod.module.entry.end", 296));
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.module.hits.final") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.procmod.module.hit.score") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.procmod.census.hit") >=
+          1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("windowsUnhookModule emits KnownDlls text remap probes") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

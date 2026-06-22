@@ -509,6 +509,10 @@ PassPluginLibraryInfo getPluginInfo() {
                         MPM.addPass(passes::WindowsSyscallsPass());
                         return true;
                     }
+                    if (name == "morok-winprocmod") {
+                        MPM.addPass(passes::WindowsProcessModulesPass());
+                        return true;
+                    }
                     if (name == "morok-winunhook") {
                         MPM.addPass(passes::WindowsUnhookPass());
                         return true;

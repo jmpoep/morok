@@ -1097,6 +1097,7 @@ PassConfig makeMax() {
     c.windows_anti_attach.enabled = true;
     c.windows_kernel_debugger.enabled = true;
     c.windows_syscalls.enabled = true;
+    c.windows_process_modules.enabled = true;
     c.platform_runtime.enabled = true;
     c.platform_runtime.direct_syscalls = "auto";
     c.platform_runtime.windows_mode = "direct_syscall";

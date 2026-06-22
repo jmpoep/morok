@@ -475,6 +475,7 @@ struct PassConfig {
     ToggleConfig windows_anti_attach;
     ToggleConfig windows_kernel_debugger;
     ToggleConfig windows_syscalls;
+    ToggleConfig windows_process_modules;
     PlatformRuntimeConfig platform_runtime;
     ToggleConfig windows_unhook;
     ToggleConfig windows_veh_audit;

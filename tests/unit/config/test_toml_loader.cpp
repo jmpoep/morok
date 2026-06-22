@@ -415,6 +415,8 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     enabled = true
     [passes.windows_syscalls]
     enabled = true
+    [passes.windows_process_modules]
+    enabled = true
     [passes.platform_runtime]
     enabled = true
     direct_syscalls = "auto"
@@ -645,6 +647,7 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.windows_anti_attach.enabled == true);
     CHECK(r.config.passes.windows_kernel_debugger.enabled == true);
     CHECK(r.config.passes.windows_syscalls.enabled == true);
+    CHECK(r.config.passes.windows_process_modules.enabled == true);
     CHECK(r.config.passes.platform_runtime.enabled == true);
     CHECK(r.config.passes.platform_runtime.direct_syscalls == "auto");
     CHECK(r.config.passes.platform_runtime.windows_mode == "hashed_import");

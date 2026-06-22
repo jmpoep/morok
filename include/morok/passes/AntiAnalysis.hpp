@@ -16,6 +16,7 @@
 //   • WindowsAntiAttach — patches remote-breakin/debug-break stubs.
 //   • WindowsKernelDebugger — samples kernel-debugger and decoy census signals.
 //   • WindowsSyscalls — uses Hell's/Halo's/Tartarus-style syscall dispatch.
+//   • WindowsProcessModules — scores debugger process and module census hits.
 //   • WindowsUnhook — remaps KnownDlls and restores hooked `.text` sections.
 //   • WindowsVehAudit — decodes and strips foreign vectored exception handlers.
 //   • WindowsProcessMitigations — opts into ACG/CIG process policies.
@@ -110,6 +111,13 @@ bool windowsKernelDebuggerModule(llvm::Module &M, morok::ir::IRRandom &rng);
 /// ntdll-gadget syscall paths, and folds divergences into hidden Windows state.
 /// Returns true if code was added.
 bool windowsSyscallsModule(llvm::Module &M, morok::ir::IRRandom &rng);
+
+/// Inject Windows x86_64 process/module census probes.  The emitted startup
+/// probe resolves NtQuerySystemInformation by hash, recovers its direct syscall
+/// number, walks bounded SystemProcessInformation and SystemModuleInformation
+/// buffers, and folds debugger-tool basename hits as telemetry/soft score only.
+/// Returns true if code was added.
+bool windowsProcessModulesModule(llvm::Module &M, morok::ir::IRRandom &rng);
 
 /// Inject Windows x86_64 KnownDlls unhooking.  The emitted startup probe resolves
 /// `NtOpenSection`, `NtMapViewOfSection`, `NtProtectVirtualMemory`,
@@ -281,6 +289,19 @@ private:
 class WindowsSyscallsPass : public llvm::PassInfoMixin<WindowsSyscallsPass> {
 public:
     explicit WindowsSyscallsPass(std::uint64_t seed = 0x5C411C5u)
+        : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
+
+    llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
+    static bool isRequired() { return true; }
+
+private:
+    core::Xoshiro256pp engine_;
+};
+
+class WindowsProcessModulesPass
+    : public llvm::PassInfoMixin<WindowsProcessModulesPass> {
+public:
+    explicit WindowsProcessModulesPass(std::uint64_t seed = 0xC011EC75u)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);

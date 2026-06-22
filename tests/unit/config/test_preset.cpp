@@ -466,6 +466,7 @@ TEST_CASE("max preset enables every pass at full intensity") {
     CHECK(c.windows_anti_attach.enabled == true);
     CHECK(c.windows_kernel_debugger.enabled == true);
     CHECK(c.windows_syscalls.enabled == true);
+    CHECK(c.windows_process_modules.enabled == true);
     CHECK(c.platform_runtime.enabled == true);
     CHECK(c.platform_runtime.direct_syscalls == "auto");
     CHECK(c.platform_runtime.windows_mode == "direct_syscall");
