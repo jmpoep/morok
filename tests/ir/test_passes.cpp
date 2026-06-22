@@ -18069,6 +18069,7 @@ entry:
     Function *SigtrapHandler =
         M->getFunction("morok.antidbg.sigtrap.handler");
     Function *HotProbe = M->getFunction("morok.antidbg.probe");
+    Function *Rr = M->getFunction("morok.antidbg.rr");
     REQUIRE(Memfd != nullptr);
     REQUIRE(Sigmask != nullptr);
     REQUIRE(PtraceStop != nullptr);
@@ -18084,6 +18085,7 @@ entry:
     CHECK(Sigtrap != nullptr);
     CHECK(SigtrapHandler != nullptr);
     CHECK(HotProbe != nullptr);
+    CHECK(Rr != nullptr);
     CHECK(Memfd->arg_size() == 3);
     CHECK(M->getFunction("morok.watchdog") != nullptr);
     Function *AntiDbg = M->getFunction("morok.antidbg");
@@ -18117,6 +18119,8 @@ entry:
     CHECK(hasInlineAsmCall(*Watch));
     CHECK(hasInlineAsmCall(*FaultCf));
     CHECK(hasInlineAsmCall(*Sigtrap));
+    CHECK(hasInlineAsmCall(*Rr));
+    checkNoSealEnforcement(*Rr);
     CHECK(countNamedInstructions(*Memfd, "morok.antidbg.memfd.readlink") >= 1u);
     CHECK(hasNamedIcmpWithConstant(*Memfd, "morok.antidbg.memfd.prefix.enough",
                                    7u));
@@ -18265,6 +18269,23 @@ entry:
           1u);
     CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.dr.ptracer.scope1") >=
           1u);
+    CHECK(countCallsTo(*AntiDbg, "morok.antidbg.rr") == 1u);
+    CHECK(countNamedInstructions(*Rr,
+                                 "morok.antidbg.rr.perf.paranoid.value") >= 1u);
+    CHECK(countNamedInstructions(*Rr,
+                                 "morok.antidbg.rr.perf.paranoid.strict") >= 1u);
+    CHECK(countNamedInstructions(*Rr,
+                                 "morok.antidbg.rr.perf.hw.denied.lowpolicy") >=
+          1u);
+    CHECK(countNamedInstructions(*Rr, "morok.antidbg.rr.clock.raw.delta") >= 1u);
+    CHECK(countNamedInstructions(*Rr, "morok.antidbg.rr.clock.quantized") >= 1u);
+    CHECK(countNamedInstructions(*Rr, "morok.antidbg.rr.clock.suspicious") >=
+          1u);
+    CHECK(countNamedInstructions(*Rr, "morok.antidbg.rr.parent.comm.rr") >= 1u);
+    CHECK(countNamedInstructions(*Rr,
+                                 "morok.antidbg.rr.parent.comm.detach") >= 1u);
+    CHECK(functionHasConstantInt(*Rr, 298u)); // perf_event_open
+    CHECK(functionHasConstantInt(*Rr, 228u)); // clock_gettime
     CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.dr.ptracer.old") ==
           0u);
     CHECK(storesNamedValueToGlobalPrefix(*AntiDbg, "morok.antidbg.dr.active",
@@ -18474,6 +18495,10 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/task"));
     CHECK_FALSE(
         hasReadableByteString(*M, "/proc/sys/kernel/yama/ptrace_scope"));
+    CHECK_FALSE(
+        hasReadableByteString(*M, "/proc/sys/kernel/perf_event_paranoid"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/comm"));
+    CHECK_FALSE(hasReadableByteString(*M, "rr-detach"));
     CHECK_FALSE(hasReadableByteString(*M, "TracerPid"));
     CHECK_FALSE(hasReadableByteString(*M, "ptrace_stop"));
     CHECK_FALSE(hasReadableByteString(*M, "SigBlk"));
@@ -18558,6 +18583,9 @@ define i32 @main() { ret i32 0 }
     REQUIRE(FaultCfHandler != nullptr);
     CHECK(M->getFunction("morok.antidbg.sigtrap") == nullptr);
     CHECK(M->getFunction("morok.antidbg.sigtrap.handler") == nullptr);
+    Function *Rr = M->getFunction("morok.antidbg.rr");
+    REQUIRE(Rr != nullptr);
+    checkNoSealEnforcement(*Rr);
     CHECK(maxStaticAllocaArrayElements(*Ctor,
                                        "morok.antidbg.seccomp.filters") == 17u);
     CHECK(maxStaticAllocaArrayElements(
@@ -18569,6 +18597,13 @@ define i32 @main() { ret i32 0 }
               *Sigmask, "morok.antidbg.sigmask.rt_sigprocmask") >= 1u);
     CHECK(countNamedInstructions(
               *PtraceStop, "morok.antidbg.ptrace_stop.kernel.uname") >= 1u);
+    CHECK(countNamedInstructions(*Rr,
+                                 "morok.antidbg.rr.perf.hw.denied.lowpolicy") >=
+          1u);
+    CHECK(countNamedInstructions(*Rr, "morok.antidbg.rr.clock.raw.delta") >= 1u);
+    CHECK(countNamedInstructions(*Rr, "morok.antidbg.rr.parent.comm.hit") >= 1u);
+    CHECK(functionHasConstantInt(*Rr, 241u)); // perf_event_open
+    CHECK(functionHasConstantInt(*Rr, 113u)); // clock_gettime
     auto Aarch64SigsysSentinels = namedCallFirstArgConstants(
         *Ctor, "morok.antidbg.seccomp.sigsys.raise");
     auto Aarch64TraceSentinels = namedCallFirstArgConstants(

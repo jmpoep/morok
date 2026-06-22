@@ -1009,6 +1009,8 @@ Value *emitDarwinSysctl(IRBuilder<> &B, Module &M, const Triple &TT, Value *Mib,
 Value *emitClockGettimeNanos(IRBuilder<> &B, Module &M, std::int32_t ClockId,
                              const Twine &Name);
 Value *emitRdtscp(IRBuilder<> &B, Module &M);
+Function *linuxRrReplayProbe(Module &M, GlobalVariable *State,
+                             ir::IRRandom &rng, const Triple &TT);
 
 Value *emitDarwinCsops(IRBuilder<> &B, Module &M, const Triple &TT, Value *Pid,
                        Value *Ops, Value *UserAddr, Value *UserSize) {
@@ -4513,6 +4515,8 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
             drActive = nullptr;
         }
     }
+    if (Function *rr = linuxRrReplayProbe(M, State, rng, TT))
+        B.CreateCall(rr);
     emitLinuxHardening(B, M, State, rng, TT, drSentinel);
 
     Function *statusFn = linuxStatusTracerCheck(M, rng, TT);
@@ -13320,6 +13324,7 @@ struct LinuxPerfParanoidSample {
     Value *value;
     Value *ready;
     Value *high;
+    Value *strict;
 };
 
 bool linuxSchedulerStepSyscalls(const Triple &TT, std::uint32_t &PerfOpen,
@@ -13493,7 +13498,7 @@ LinuxPerfParanoidSample emitLinuxPerfParanoidRead(IRBuilder<> &B, Module &M,
     if (!linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr)) {
         Value *zero = ConstantInt::get(i32, 0);
         Value *notReady = ConstantInt::getFalse(ctx);
-        return {zero, notReady, notReady};
+        return {zero, notReady, notReady, notReady};
     }
 
     auto *bufTy = ArrayType::get(i8, kBufBytes);
@@ -13558,7 +13563,14 @@ LinuxPerfParanoidSample emitLinuxPerfParanoidRead(IRBuilder<> &B, Module &M,
                                     Name + ".ge2"),
                     Name + ".policy"),
         Name + ".high");
-    return {value, ready, high};
+    Value *strict = B.CreateAnd(
+        ready,
+        B.CreateAnd(nonNegative,
+                    B.CreateICmpUGE(value, ConstantInt::get(i32, 3),
+                                    Name + ".ge3"),
+                    Name + ".strict.policy"),
+        Name + ".strict");
+    return {value, ready, high, strict};
 }
 
 SchedulerCounterSample emitLinuxRusageSwitches(IRBuilder<> &B, Module &M,
@@ -13585,6 +13597,219 @@ SchedulerCounterSample emitLinuxRusageSwitches(IRBuilder<> &B, Module &M,
     return {B.CreateSelect(ready, total, ConstantInt::get(i64, 0),
                            Name + ".total"),
             ready};
+}
+
+struct LinuxClockSample {
+    Value *nanos;
+    Value *ready;
+};
+
+bool linuxClockGettimeSyscall(const Triple &TT, std::uint32_t &ClockGettime) {
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        ClockGettime = 228;
+        return true;
+    case Triple::aarch64:
+        ClockGettime = 113;
+        return true;
+    default:
+        return false;
+    }
+}
+
+LinuxClockSample emitLinuxRawClockGettimeNanos(IRBuilder<> &B, Module &M,
+                                               const Triple &TT,
+                                               std::int32_t ClockId,
+                                               const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    std::uint32_t clockNr = 0;
+    if (!linuxClockGettimeSyscall(TT, clockNr))
+        return {ConstantInt::get(i64, 0), ConstantInt::getFalse(ctx)};
+
+    auto *tsTy = StructType::get(ctx, {i64, i64});
+    auto *ts = B.CreateAlloca(tsTy, nullptr, Name + ".ts");
+    Value *secPtr = B.CreateStructGEP(tsTy, ts, 0, Name + ".sec.ptr");
+    Value *nsecPtr = B.CreateStructGEP(tsTy, ts, 1, Name + ".nsec.ptr");
+    B.CreateStore(ConstantInt::get(i64, 0), secPtr)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), nsecPtr)->setVolatile(true);
+
+    Value *rc = emitLinuxSyscall(B, M, TT, clockNr,
+                                 {ConstantInt::getSigned(i32, ClockId), ts});
+    rc->setName(Name + ".rc");
+    auto *sec = B.CreateLoad(i64, secPtr, Name + ".sec");
+    auto *nsec = B.CreateLoad(i64, nsecPtr, Name + ".nsec");
+    sec->setVolatile(true);
+    nsec->setVolatile(true);
+    Value *ready = B.CreateICmpEQ(rc, ConstantInt::get(ip, 0), Name + ".ready");
+    Value *nanos =
+        B.CreateAdd(B.CreateMul(sec, ConstantInt::get(i64, 1000000000ULL),
+                                Name + ".sec.ns"),
+                    nsec, Name + ".nanos.raw");
+    return {B.CreateSelect(ready, nanos, ConstantInt::get(i64, 0),
+                           Name + ".nanos"),
+            ready};
+}
+
+Function *linuxRrReplayProbe(Module &M, GlobalVariable *State,
+                             ir::IRRandom &rng, const Triple &TT) {
+    if (!TT.isOSLinux() || intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antidbg.rr"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antidbg.rr", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+
+    LinuxPerfParanoidSample paranoid = emitLinuxPerfParanoidRead(
+        B, M, rng, TT, "morok.antidbg.rr.perf.paranoid");
+    Value *hwReady = nullptr;
+    Value *hwFd = emitLinuxPerfOpen(
+        B, M, TT, /*Type=*/0, /*Config=*/1,
+        /*AttrFlags=*/(1ULL << 5) | (1ULL << 6), /*OpenFlags=*/8,
+        "morok.antidbg.rr.perf.hw.open", hwReady);
+    Value *hwDenied = B.CreateOr(
+        B.CreateICmpEQ(hwFd, ConstantInt::getSigned(ip, -1),
+                       "morok.antidbg.rr.perf.hw.eperm"),
+        B.CreateICmpEQ(hwFd, ConstantInt::getSigned(ip, -13),
+                       "morok.antidbg.rr.perf.hw.eacces"),
+        "morok.antidbg.rr.perf.hw.denied");
+    emitLinuxPerfClose(B, M, TT, hwFd);
+    Value *paranoidLt3 =
+        B.CreateAnd(paranoid.ready,
+                    B.CreateNot(paranoid.strict,
+                                "morok.antidbg.rr.perf.paranoid.strict.not"),
+                    "morok.antidbg.rr.perf.paranoid.lt3");
+    Value *hwDeniedLowPolicy =
+        B.CreateAnd(hwDenied, paranoidLt3,
+                    "morok.antidbg.rr.perf.hw.denied.lowpolicy");
+    foldState(B, State, paranoid.value, 0xF62D8C4E5A0193B7ULL,
+              "morok.antidbg.rr.perf.paranoid.value");
+    foldFlag(B, State, paranoid.strict, 0xC38A701DBE64925FULL,
+             "morok.antidbg.rr.perf.paranoid.strict");
+    foldFlag(B, State, hwDeniedLowPolicy, 0x4AB73D5E90C2186FULL,
+             "morok.antidbg.rr.perf.hw.denied.lowpolicy");
+
+    auto *clockAcc = B.CreateAlloca(i64, nullptr, "morok.antidbg.rr.clock.acc");
+    B.CreateStore(ConstantInt::get(i64, rng.next()), clockAcc)->setVolatile(true);
+    Value *clockHits = ConstantInt::get(i32, 0);
+    Value *clockReadySamples = ConstantInt::get(i32, 0);
+    Value *clockMix = ConstantInt::get(i64, rng.next());
+    for (unsigned sample = 0; sample < 3; ++sample) {
+        LinuxClockSample before = emitLinuxRawClockGettimeNanos(
+            B, M, TT, 4, "morok.antidbg.rr.clock.raw.before");
+        emitShortTimingSpan(B, clockAcc,
+                            rng.next() ^ (0x91E10DA5C79E7B1DULL * (sample + 1)));
+        LinuxClockSample after = emitLinuxRawClockGettimeNanos(
+            B, M, TT, 4, "morok.antidbg.rr.clock.raw.after");
+        Value *ordered = B.CreateICmpUGE(after.nanos, before.nanos,
+                                         "morok.antidbg.rr.clock.raw.ordered");
+        Value *sampleReady =
+            B.CreateAnd(B.CreateAnd(before.ready, after.ready),
+                        ordered, "morok.antidbg.rr.clock.raw.ready");
+        Value *delta = B.CreateSelect(
+            sampleReady, B.CreateSub(after.nanos, before.nanos),
+            ConstantInt::get(i64, 0), "morok.antidbg.rr.clock.raw.delta");
+        Value *zero =
+            B.CreateAnd(sampleReady,
+                        B.CreateICmpEQ(delta, ConstantInt::get(i64, 0),
+                                       "morok.antidbg.rr.clock.raw.zero"),
+                        "morok.antidbg.rr.clock.zero");
+        Value *quantum = B.CreateAnd(
+            sampleReady,
+            B.CreateAnd(B.CreateICmpUGT(delta, ConstantInt::get(i64, 0),
+                                        "morok.antidbg.rr.clock.raw.nonzero"),
+                        B.CreateICmpEQ(
+                            B.CreateURem(delta, ConstantInt::get(i64, 10000),
+                                         "morok.antidbg.rr.clock.raw.mod"),
+                            ConstantInt::get(i64, 0),
+                            "morok.antidbg.rr.clock.raw.quantum"),
+                        "morok.antidbg.rr.clock.raw.quantized"),
+            "morok.antidbg.rr.clock.quantized");
+        Value *sampleHit =
+            B.CreateOr(zero, quantum, "morok.antidbg.rr.clock.sample.hit");
+        clockHits = B.CreateAdd(clockHits, B.CreateZExt(sampleHit, i32),
+                                "morok.antidbg.rr.clock.hits.n");
+        clockReadySamples =
+            B.CreateAdd(clockReadySamples, B.CreateZExt(sampleReady, i32),
+                        "morok.antidbg.rr.clock.ready.n");
+        clockMix = B.CreateXor(
+            B.CreateAdd(clockMix,
+                        B.CreateMul(delta,
+                                    ConstantInt::get(i64, rng.next() | 1ULL))),
+            B.CreateZExt(sampleHit, i64), "morok.antidbg.rr.clock.mix.step");
+    }
+    Value *clockSuspicious =
+        B.CreateICmpUGE(clockHits, ConstantInt::get(i32, 2),
+                        "morok.antidbg.rr.clock.suspicious");
+    foldState(B, State, clockMix, 0x2F0C9A81D5E746B3ULL,
+              "morok.antidbg.rr.clock.mix");
+    foldState(B, State, clockReadySamples, 0x8B1462D9C0E53F7AULL,
+              "morok.antidbg.rr.clock.ready");
+    foldState(B, State, clockHits, 0x571AC8E3D06F92B5ULL,
+              "morok.antidbg.rr.clock.hits");
+    foldFlag(B, State, clockSuspicious, 0xD4F3A9126E58C07BULL,
+             "morok.antidbg.rr.clock.suspicious");
+
+    std::uint32_t getppidNr = 0;
+    std::uint32_t readlinkatNr = 0;
+    if (linuxDbiParentSyscalls(TT, getppidNr, readlinkatNr)) {
+        Value *ppid = emitLinuxSyscall(B, M, TT, getppidNr, {});
+        ppid->setName("morok.antidbg.rr.parent.pid");
+        auto *pathTy = ArrayType::get(i8, 96);
+        AllocaInst *commPath =
+            B.CreateAlloca(pathTy, nullptr, "morok.antidbg.rr.parent.comm.path");
+        Value *commPathPtr = B.CreateInBoundsGEP(
+            pathTy, commPath, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+            "morok.antidbg.rr.parent.comm.path.ptr");
+        FunctionCallee snprintfFn = M.getOrInsertFunction(
+            "snprintf", FunctionType::get(i32, {ptr, ip, ptr}, true));
+        B.CreateCall(snprintfFn,
+                     {commPathPtr, ConstantInt::get(ip, 96),
+                      ir::emitCloakedSymbol(B, M, "/proc/%ld/comm", rng), ppid},
+                     "morok.antidbg.rr.parent.comm.path.n");
+        ReadFileIR comm = emitReadPathValue(
+            B, M, fn, commPathPtr, 64, TT, "morok.antidbg.rr.parent.comm");
+        auto *afterCommBB =
+            BasicBlock::Create(ctx, "morok.antidbg.rr.after.parent.comm", fn);
+
+        IRBuilder<> MissB(comm.ret0);
+        MissB.CreateBr(afterCommBB);
+
+        IRBuilder<> CB(comm.afterRead);
+        Value *commRr = bufferHasLiteral(
+            CB, M, comm.buf, comm.n, {0x72, 0x72, 0x0a}, 64,
+            "morok.antidbg.rr.parent.comm.rr");
+        Value *commDetach = bufferHasLiteral(
+            CB, M, comm.buf, comm.n,
+            {0x72, 0x72, 0x2d, 0x64, 0x65, 0x74, 0x61, 0x63, 0x68}, 64,
+            "morok.antidbg.rr.parent.comm.detach");
+        Value *commHit =
+            CB.CreateOr(commRr, commDetach, "morok.antidbg.rr.parent.comm.hit");
+        foldFlag(CB, State, commHit, 0xAE63D18C47F2059BULL,
+                 "morok.antidbg.rr.parent.comm");
+        CB.CreateBr(afterCommBB);
+
+        B.SetInsertPoint(afterCommBB);
+    }
+
+    B.CreateRetVoid();
+    return fn;
 }
 
 SchedulerCounterSample emitDarwinThreadCpuNanos(IRBuilder<> &B, Module &M,
