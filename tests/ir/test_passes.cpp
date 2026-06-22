@@ -683,6 +683,54 @@ std::size_t countInlineAsmBodies(Function &F, StringRef needle) {
     return n;
 }
 
+TEST_CASE("RuntimeSeal gates weighted detector score with corroboration") {
+    LLVMContext ctx;
+    Module M("seal-score", ctx);
+    auto *VoidTy = Type::getVoidTy(ctx);
+    auto *I1 = Type::getInt1Ty(ctx);
+    Function *Probe =
+        Function::Create(FunctionType::get(VoidTy, {I1, I1}, false),
+                         GlobalValue::ExternalLinkage, "probe", M);
+    auto ArgIt = Probe->arg_begin();
+    Argument *First = &*ArgIt++;
+    Argument *Second = &*ArgIt;
+    First->setName("first");
+    Second->setName("second");
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(12901);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::runtime_seal::getChannel(
+        M, morok::passes::runtime_seal::kAntiDebugChannel, rng);
+
+    IRBuilder<> B(BasicBlock::Create(ctx, "entry", Probe));
+    morok::passes::runtime_seal::foldWeightedFlag(
+        B, morok::passes::runtime_seal::kAntiDebugChannel, First,
+        /*Weight=*/16, /*EvidenceMask=*/1, /*Threshold=*/32,
+        0x1290A11CEULL, "morok.score.first");
+    morok::passes::runtime_seal::foldWeightedFlag(
+        B, morok::passes::runtime_seal::kAntiDebugChannel, Second,
+        /*Weight=*/16, /*EvidenceMask=*/2, /*Threshold=*/32,
+        0x1290B0B5ULL, "morok.score.second");
+    B.CreateRetVoid();
+
+    CHECK(M.getGlobalVariable("morok.seal.score.anti_debug.weight", true) !=
+          nullptr);
+    CHECK(M.getGlobalVariable("morok.seal.score.anti_debug.evidence", true) !=
+          nullptr);
+    CHECK(M.getGlobalVariable("morok.seal.score.anti_debug.committed", true) !=
+          nullptr);
+    CHECK(countNamedInstructions(*Probe, "morok.score.first.coherent") == 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.score.second.commit") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.score.second.seal.next") ==
+          1u);
+
+    std::size_t Branches = 0;
+    for (Instruction &I : instructions(*Probe))
+        Branches += isa<BranchInst>(&I) ? 1u : 0u;
+    CHECK(Branches == 0u);
+    CHECK_FALSE(verifyModule(M, &errs()));
+}
+
 TEST_CASE("functionFission outlines regions into smaller noinline callees") {
     LLVMContext ctx;
     const char *ir = R"ir(
@@ -17554,11 +17602,15 @@ define i32 @main() { ret i32 0 }
     Function *Oracle = M->getFunction("morok.timing.oracle");
     REQUIRE(Oracle != nullptr);
     CHECK(M->getGlobalVariable("morok.timing.state", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.seal.score.anti_debug.weight", true) !=
+          nullptr);
     checkNoSealEnforcement(*Oracle);
     CHECK(M->getFunction("morok.timing") != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
     CHECK(countNamedInstructions(*Oracle, "morok.timing.bad.distribution") >=
           1u);
+    CHECK(countNamedInstructions(*Oracle,
+                                 "morok.timing.bad.distribution.score") >= 1u);
     // The x86 timestamp read lives in a CPUID-gated helper (rdtscp + rdtsc
     // fallback); the probe calls it rather than inlining the asm.
     Function *Tsc = M->getFunction("morok.timing.tsc.read");

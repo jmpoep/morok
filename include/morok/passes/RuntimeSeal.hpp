@@ -41,4 +41,9 @@ void foldWord(llvm::IRBuilderBase &B, llvm::StringRef Channel,
               llvm::Value *Word, std::uint64_t Salt,
               const llvm::Twine &Name);
 
+void foldWeightedFlag(llvm::IRBuilderBase &B, llvm::StringRef Channel,
+                      llvm::Value *Flag, std::uint32_t Weight,
+                      std::uint64_t EvidenceMask, std::uint32_t Threshold,
+                      std::uint64_t Salt, const llvm::Twine &Name);
+
 } // namespace morok::passes::runtime_seal

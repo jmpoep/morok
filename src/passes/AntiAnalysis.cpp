@@ -253,9 +253,26 @@ void foldState(IRBuilderBase &B, GlobalVariable *State, Value *V,
     st->setVolatile(true);
 }
 
+std::uint64_t scoreEvidenceMask(std::uint64_t Salt) {
+    const std::uint64_t Mixed =
+        Salt ^ (Salt >> 19) ^ (Salt >> 37) ^ 0xD1B54A32D192ED03ULL;
+    return 1ULL << (Mixed & 63ULL);
+}
+
+void foldSoftScore(IRBuilderBase &B, Value *Flag, std::uint64_t Salt,
+                   const Twine &Name) {
+    runtime_seal::foldWeightedFlag(
+        B, runtime_seal::kAntiDebugChannel, Flag, /*Weight=*/4,
+        scoreEvidenceMask(Salt), /*Threshold=*/32,
+        Salt ^ 0xC6A4A7935BD1E995ULL, Name + ".score");
+}
+
 void foldFlag(IRBuilderBase &B, GlobalVariable *State, Value *Flag,
-              std::uint64_t Salt, const Twine &Name) {
+              std::uint64_t Salt, const Twine &Name,
+              bool ScoreSoftSignal = false) {
     foldState(B, State, B.CreateZExtOrTrunc(Flag, B.getInt64Ty()), Salt, Name);
+    if (ScoreSoftSignal)
+        foldSoftScore(B, Flag, Salt, Name);
 }
 
 void foldPoisonFlag(IRBuilderBase &B, Value *Flag, std::uint64_t Salt,
@@ -302,7 +319,7 @@ void sealFold(IRBuilderBase &B, Value *Flag, std::uint64_t Salt) {
 
 void foldEnforcedFlag(IRBuilderBase &B, GlobalVariable *State, Value *Flag,
                       std::uint64_t Salt, const Twine &Name) {
-    foldFlag(B, State, Flag, Salt, Name);
+    foldFlag(B, State, Flag, Salt, Name, /*ScoreSoftSignal=*/false);
     // Only use this for detector verdicts proven false on clean e2e runs.
     // Host/jitter-sensitive probes should remain foldFlag telemetry.
     sealFold(B, Flag, Salt ^ 0xA5B0E176D83429CFULL);
@@ -7796,9 +7813,10 @@ Function *timingOracleProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
         "morok.timing.divergent.distribution");
     // Wall-clock spans are scheduler-sensitive; keep these verdicts telemetry.
     foldFlag(B, State, badDistribution, 0xA331D8B47E1C5905ULL,
-             "morok.timing.bad.distribution");
+             "morok.timing.bad.distribution", /*ScoreSoftSignal=*/true);
     foldFlag(B, State, divergentDistribution, 0x5E74B29D13C8A60BULL,
-             "morok.timing.divergent.distribution");
+             "morok.timing.divergent.distribution",
+             /*ScoreSoftSignal=*/true);
     B.CreateRetVoid();
     return fn;
 }
