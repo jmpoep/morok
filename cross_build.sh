@@ -54,6 +54,7 @@ PYTHON="${PYTHON:-python3}"
 BUILD_LINUX=1
 BUILD_MACOS=1
 STRIP_BINARIES=1
+CLEAN_OUT=0
 
 LINUX_TARGET="${LINUX_TARGET:-x86_64-linux-musl}"
 LINUX_CC="${LINUX_CC:-}"
@@ -88,6 +89,9 @@ Options:
   --no-macos             Skip macOS
   --no-strip             Do not strip produced binaries
   --no-audit             Skip the final morok-audit release gate
+  --clean                Wipe the output dir before building, so stale artifacts
+                         from a previous run (e.g. a static binary left over when
+                         switching to --dynamic) cannot fail the bundle audit
   --dynamic              Linux dynamic link (default: static)
   --extra-cflags FLAGS   Extra compiler flags (e.g. "-no-pie -ffast-math")
   --extra-sources PATHS  Extra source files compiled alongside the main source
@@ -176,6 +180,7 @@ while [ "$#" -gt 0 ]; do
     --no-macos) BUILD_MACOS=0; shift ;;
     --no-strip) STRIP_BINARIES=0; shift ;;
     --no-audit) AUDIT_BINARIES=0; shift ;;
+    --clean) CLEAN_OUT=1; shift ;;
     --dynamic) LINUX_STATIC=0; shift ;;
     --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
     --extra-sources) EXTRA_SOURCES="$2"; shift 2 ;;
@@ -226,6 +231,18 @@ if [ -n "$C_STD" ]; then
   STD=(-std="$C_STD")
 fi
 need_tool "$COMPILER"
+
+# Stale artifacts from a previous run persist in OUT_DIR (this script only
+# mkdir -p's it), and the release audit scans the whole directory — so a binary
+# left over from a different flag set (e.g. a static build before --dynamic) can
+# fail the bundle.  --clean wipes OUT_DIR first.  Guard against an empty or root
+# path so a misconfigured OUT_DIR can never `rm -rf /`.
+if [ "$CLEAN_OUT" -eq 1 ]; then
+  case "$OUT_DIR" in
+    "" | "/" ) die "refusing to --clean unsafe OUT_DIR: '$OUT_DIR'" ;;
+    * ) echo ">> cleaning $OUT_DIR"; rm -rf "$OUT_DIR" ;;
+  esac
+fi
 
 mkdir -p "$OUT_DIR"
 BASE="$(basename "$SRC")"
