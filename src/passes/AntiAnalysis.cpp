@@ -18952,6 +18952,557 @@ Function *windowsUnhandledExceptionFilter(Module &M) {
     return fn;
 }
 
+Function *windowsSelfDebugAttachHelper(
+    Module &M, std::uint32_t PidMask,
+    const std::array<std::uint16_t, 5> &Marker) {
+    if (Function *existing = M.getFunction("morok.win.attach.selfdbg"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    constexpr std::uint32_t kMaxImageWchars = 260;
+    constexpr std::uint32_t kCommandWchars = 32;
+    constexpr std::uint32_t kStartupInfoBytes = 104;
+    constexpr std::uint32_t kProcessInfoBytes = 32;
+    constexpr std::uint32_t kDebugEventBytes = 192;
+    constexpr std::uint32_t kAttachPolls = 40;
+
+    auto *fn = Function::Create(
+        FunctionType::get(i64, {ip, ip, ip, ip, ip, ip, ip, ip, ip, ip, ip,
+                                ip},
+                          false),
+        GlobalValue::PrivateLinkage, "morok.win.attach.selfdbg", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    auto argIt = fn->arg_begin();
+    Value *getCmd = &*argIt++;
+    getCmd->setName("getcmd");
+    Value *getModule = &*argIt++;
+    getModule->setName("getmodule");
+    Value *createProcess = &*argIt++;
+    createProcess->setName("createprocess");
+    Value *getPid = &*argIt++;
+    getPid->setName("getpid");
+    Value *debugActive = &*argIt++;
+    debugActive->setName("debugactive");
+    Value *waitDebug = &*argIt++;
+    waitDebug->setName("waitdebug");
+    Value *continueDebug = &*argIt++;
+    continueDebug->setName("continuedebug");
+    Value *sleepFn = &*argIt++;
+    sleepFn->setName("sleep");
+    Value *waitSingle = &*argIt++;
+    waitSingle->setName("waitsingle");
+    Value *ntQip = &*argIt++;
+    ntQip->setName("ntqip");
+    Value *closeHandle = &*argIt++;
+    closeHandle->setName("closehandle");
+    Value *exitProcess = &*argIt++;
+    exitProcess->setName("exitprocess");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *cmdGateBB = BasicBlock::Create(ctx, "cmd.gate", fn);
+    auto *parseLoopBB = BasicBlock::Create(ctx, "parse.loop", fn);
+    auto *parseValidBB = BasicBlock::Create(ctx, "parse.valid", fn);
+    auto *parseDoneBB = BasicBlock::Create(ctx, "parse.done", fn);
+    auto *childGateBB = BasicBlock::Create(ctx, "child.gate", fn);
+    auto *childAttachBB = BasicBlock::Create(ctx, "child.attach", fn);
+    auto *childPumpBB = BasicBlock::Create(ctx, "child.pump", fn);
+    auto *childContinueBB = BasicBlock::Create(ctx, "child.continue", fn);
+    auto *childExitBB = BasicBlock::Create(ctx, "child.exit", fn);
+    auto *parentGateBB = BasicBlock::Create(ctx, "parent.gate", fn);
+    auto *parentBuildBB = BasicBlock::Create(ctx, "parent.build", fn);
+    auto *parentCreateBB = BasicBlock::Create(ctx, "parent.create", fn);
+    auto *parentPollBB = BasicBlock::Create(ctx, "parent.poll", fn);
+    auto *parentQueryBB = BasicBlock::Create(ctx, "parent.query", fn);
+    auto *parentDoneBB = BasicBlock::Create(ctx, "parent.done", fn);
+    auto *parentCloseDbgBB = BasicBlock::Create(ctx, "parent.close.dbg", fn);
+    auto *parentCloseChildBB =
+        BasicBlock::Create(ctx, "parent.close.child", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *result = B.CreateAlloca(i64, nullptr,
+                                        "morok.win.attach.selfdbg.result.slot");
+    AllocaInst *imageBuf =
+        B.CreateAlloca(ArrayType::get(i16, kMaxImageWchars), nullptr,
+                       "morok.win.attach.selfdbg.image");
+    AllocaInst *cmdBuf =
+        B.CreateAlloca(ArrayType::get(i16, kCommandWchars), nullptr,
+                       "morok.win.attach.selfdbg.cmd");
+    AllocaInst *startup =
+        B.CreateAlloca(ArrayType::get(i8, kStartupInfoBytes), nullptr,
+                       "morok.win.attach.selfdbg.startup");
+    AllocaInst *procInfo =
+        B.CreateAlloca(ArrayType::get(i8, kProcessInfoBytes), nullptr,
+                       "morok.win.attach.selfdbg.procinfo");
+    AllocaInst *debugEvent =
+        B.CreateAlloca(ArrayType::get(i8, kDebugEventBytes), nullptr,
+                       "morok.win.attach.selfdbg.event");
+    AllocaInst *dbgObject =
+        B.CreateAlloca(ptr, nullptr, "morok.win.attach.selfdbg.dbgobj.slot");
+    AllocaInst *retLen =
+        B.CreateAlloca(i32, nullptr, "morok.win.attach.selfdbg.retlen");
+    AllocaInst *childProcess =
+        B.CreateAlloca(ptr, nullptr, "morok.win.attach.selfdbg.child.process");
+    AllocaInst *childThread =
+        B.CreateAlloca(ptr, nullptr, "morok.win.attach.selfdbg.child.thread");
+    AllocaInst *childDead =
+        B.CreateAlloca(i1, nullptr, "morok.win.attach.selfdbg.child.dead.slot");
+    B.CreateStore(ConstantInt::get(i64, 0), result)->setVolatile(true);
+    B.CreateStore(ConstantPointerNull::get(ptr), dbgObject)->setVolatile(true);
+    B.CreateStore(ConstantPointerNull::get(ptr), childProcess)
+        ->setVolatile(true);
+    B.CreateStore(ConstantPointerNull::get(ptr), childThread)
+        ->setVolatile(true);
+    B.CreateStore(ConstantInt::getFalse(ctx), childDead)->setVolatile(true);
+
+    auto orResult = [&](IRBuilder<> &IB, Value *Word, const Twine &Name) {
+        Value *old = IB.CreateLoad(i64, result, Name + ".old");
+        cast<LoadInst>(old)->setVolatile(true);
+        IB.CreateStore(IB.CreateOr(old, Word, Name), result)->setVolatile(true);
+    };
+    auto wcharPtr = [&](IRBuilder<> &IB, Value *Base, Value *Index,
+                        const Twine &Name) -> Value * {
+        Value *wide = IB.CreateZExtOrTrunc(Index, ip, Name + ".idx");
+        Value *off = IB.CreateMul(wide, ConstantInt::get(ip, 2),
+                                  Name + ".byte.off");
+        return gepI8(IB, M, Base, off, Name + ".ptr");
+    };
+    auto loadWchar = [&](IRBuilder<> &IB, Value *Base, Value *Index,
+                         const Twine &Name) -> Value * {
+        auto *li = IB.CreateLoad(i16, wcharPtr(IB, Base, Index, Name), Name);
+        li->setAlignment(Align(2));
+        return li;
+    };
+    auto storeWchar = [&](IRBuilder<> &IB, Value *Base, Value *Index, Value *Ch,
+                          const Twine &Name) {
+        auto *st = IB.CreateStore(Ch, wcharPtr(IB, Base, Index, Name));
+        st->setAlignment(Align(2));
+        st->setVolatile(true);
+    };
+    auto closeIfPresent = [&](IRBuilder<> &IB, Value *Handle,
+                              const Twine &Name) {
+        auto *closeTy = FunctionType::get(i32, {ptr}, false);
+        Value *ready = IB.CreateAnd(
+            IB.CreateICmpNE(closeHandle, ConstantInt::get(ip, 0),
+                            Name + ".api"),
+            IB.CreateICmpNE(Handle, ConstantPointerNull::get(ptr),
+                            Name + ".handle"),
+            Name + ".ready");
+        auto *callBB = BasicBlock::Create(ctx, (Name + ".call").str(), fn);
+        auto *doneBB = BasicBlock::Create(ctx, (Name + ".done").str(), fn);
+        IB.CreateCondBr(ready, callBB, doneBB);
+        IRBuilder<> CB(callBB);
+        Value *status = CB.CreateCall(
+            closeTy,
+            CB.CreateIntToPtr(closeHandle, ptr, Name + ".close.ptr"), {Handle},
+            Name + ".status");
+        orResult(CB,
+                 CB.CreateShl(CB.CreateZExt(status, i64),
+                              ConstantInt::get(i64, 16)),
+                 Name + ".mix");
+        CB.CreateBr(doneBB);
+        IB.SetInsertPoint(doneBB);
+    };
+
+    Value *childCmdReady = B.CreateAnd(
+        B.CreateICmpNE(getCmd, ConstantInt::get(ip, 0),
+                       "morok.win.attach.selfdbg.getcmd.ready"),
+        B.CreateICmpNE(exitProcess, ConstantInt::get(ip, 0),
+                       "morok.win.attach.selfdbg.exit.ready"),
+        "morok.win.attach.selfdbg.child.cmd.ready");
+    B.CreateCondBr(childCmdReady, cmdGateBB, parentGateBB);
+
+    IRBuilder<> CGB(cmdGateBB);
+    auto *getCmdTy = FunctionType::get(ptr, {}, false);
+    Value *cmdLine = CGB.CreateCall(
+        getCmdTy,
+        CGB.CreateIntToPtr(getCmd, ptr, "morok.win.attach.selfdbg.getcmd.ptr"),
+        {}, "morok.win.attach.selfdbg.getcmd");
+    Value *markerMatch = CGB.CreateICmpNE(
+        cmdLine, ConstantPointerNull::get(ptr),
+        "morok.win.attach.selfdbg.cmd.present");
+    for (std::uint32_t I = 0; I < Marker.size(); ++I) {
+        Value *ch = loadWchar(CGB, cmdLine, ConstantInt::get(i32, I),
+                              "morok.win.attach.selfdbg.marker.ch");
+        markerMatch = CGB.CreateAnd(
+            markerMatch,
+            CGB.CreateICmpEQ(ch, ConstantInt::get(i16, Marker[I]),
+                             "morok.win.attach.selfdbg.marker.eq"),
+            "morok.win.attach.selfdbg.marker.match");
+    }
+    CGB.CreateCondBr(markerMatch, parseLoopBB, parentGateBB);
+
+    IRBuilder<> PLB(parseLoopBB);
+    PHINode *hexIdx = PLB.CreatePHI(i32, 2, "morok.win.attach.selfdbg.hex.idx");
+    PHINode *hexAcc = PLB.CreatePHI(i32, 2, "morok.win.attach.selfdbg.hex.acc");
+    hexIdx->addIncoming(ConstantInt::get(i32, 0), cmdGateBB);
+    hexAcc->addIncoming(ConstantInt::get(i32, 0), cmdGateBB);
+    Value *hexPos =
+        PLB.CreateAdd(ConstantInt::get(i32, Marker.size()), hexIdx,
+                      "morok.win.attach.selfdbg.hex.pos");
+    Value *hexCh =
+        loadWchar(PLB, cmdLine, hexPos, "morok.win.attach.selfdbg.hex.ch");
+    Value *dec = PLB.CreateAnd(
+        PLB.CreateICmpUGE(hexCh, ConstantInt::get(i16, '0'),
+                          "morok.win.attach.selfdbg.hex.dec.lo"),
+        PLB.CreateICmpULE(hexCh, ConstantInt::get(i16, '9'),
+                          "morok.win.attach.selfdbg.hex.dec.hi"),
+        "morok.win.attach.selfdbg.hex.dec");
+    Value *upper = PLB.CreateAnd(
+        PLB.CreateICmpUGE(hexCh, ConstantInt::get(i16, 'A'),
+                          "morok.win.attach.selfdbg.hex.upper.lo"),
+        PLB.CreateICmpULE(hexCh, ConstantInt::get(i16, 'F'),
+                          "morok.win.attach.selfdbg.hex.upper.hi"),
+        "morok.win.attach.selfdbg.hex.upper");
+    Value *lower = PLB.CreateAnd(
+        PLB.CreateICmpUGE(hexCh, ConstantInt::get(i16, 'a'),
+                          "morok.win.attach.selfdbg.hex.lower.lo"),
+        PLB.CreateICmpULE(hexCh, ConstantInt::get(i16, 'f'),
+                          "morok.win.attach.selfdbg.hex.lower.hi"),
+        "morok.win.attach.selfdbg.hex.lower");
+    Value *valid = PLB.CreateOr(dec, PLB.CreateOr(upper, lower),
+                                "morok.win.attach.selfdbg.hex.valid");
+    Value *digitDec =
+        PLB.CreateSub(PLB.CreateZExt(hexCh, i32), ConstantInt::get(i32, '0'),
+                      "morok.win.attach.selfdbg.hex.digit.dec");
+    Value *digitUpper =
+        PLB.CreateSub(PLB.CreateZExt(hexCh, i32),
+                      ConstantInt::get(i32, 'A' - 10),
+                      "morok.win.attach.selfdbg.hex.digit.upper");
+    Value *digitLower =
+        PLB.CreateSub(PLB.CreateZExt(hexCh, i32),
+                      ConstantInt::get(i32, 'a' - 10),
+                      "morok.win.attach.selfdbg.hex.digit.lower");
+    Value *digit =
+        PLB.CreateSelect(dec, digitDec,
+                         PLB.CreateSelect(upper, digitUpper, digitLower,
+                                          "morok.win.attach.selfdbg.hex.digit.az"),
+                         "morok.win.attach.selfdbg.hex.digit");
+    Value *nextAcc = PLB.CreateOr(
+        PLB.CreateShl(hexAcc, ConstantInt::get(i32, 4),
+                      "morok.win.attach.selfdbg.hex.shift"),
+        digit, "morok.win.attach.selfdbg.hex.next");
+    Value *lastHex = PLB.CreateICmpEQ(hexIdx, ConstantInt::get(i32, 7),
+                                      "morok.win.attach.selfdbg.hex.last");
+    Value *nextHexIdx = PLB.CreateAdd(hexIdx, ConstantInt::get(i32, 1),
+                                      "morok.win.attach.selfdbg.hex.idx.next");
+    PLB.CreateCondBr(valid, parseValidBB, parentGateBB);
+
+    IRBuilder<> PVB(parseValidBB);
+    PVB.CreateCondBr(lastHex, parseDoneBB, parseLoopBB);
+    hexIdx->addIncoming(nextHexIdx, parseValidBB);
+    hexAcc->addIncoming(nextAcc, parseValidBB);
+
+    IRBuilder<> PDB(parseDoneBB);
+    Value *parentPid =
+        PDB.CreateXor(nextAcc, ConstantInt::get(i32, PidMask),
+                      "morok.win.attach.selfdbg.child.parent.pid");
+    PDB.CreateBr(childGateBB);
+
+    IRBuilder<> ChG(childGateBB);
+    Value *childApisReady = ChG.CreateAnd(
+        ChG.CreateICmpNE(debugActive, ConstantInt::get(ip, 0),
+                         "morok.win.attach.selfdbg.debugactive.ready"),
+        ChG.CreateAnd(ChG.CreateICmpNE(waitDebug, ConstantInt::get(ip, 0),
+                                       "morok.win.attach.selfdbg.wait.ready"),
+                      ChG.CreateICmpNE(continueDebug, ConstantInt::get(ip, 0),
+                                       "morok.win.attach.selfdbg.continue.ready"),
+                      "morok.win.attach.selfdbg.pump.ready"),
+        "morok.win.attach.selfdbg.child.apis.ready");
+    ChG.CreateCondBr(childApisReady, childAttachBB, childExitBB);
+
+    IRBuilder<> ChA(childAttachBB);
+    auto *debugActiveTy = FunctionType::get(i32, {i32}, false);
+    Value *attachOk = ChA.CreateCall(
+        debugActiveTy,
+        ChA.CreateIntToPtr(debugActive, ptr,
+                           "morok.win.attach.selfdbg.debugactive.ptr"),
+        {parentPid}, "morok.win.attach.selfdbg.child.debugactive");
+    ChA.CreateCondBr(ChA.CreateICmpNE(attachOk, ConstantInt::get(i32, 0),
+                                      "morok.win.attach.selfdbg.child.attached"),
+                     childPumpBB, childExitBB);
+
+    IRBuilder<> ChP(childPumpBB);
+    ChP.CreateMemSet(debugEvent, ConstantInt::get(i8, 0),
+                     ConstantInt::get(ip, kDebugEventBytes), MaybeAlign(1));
+    auto *waitDebugTy = FunctionType::get(i32, {ptr, i32}, false);
+    Value *waitOk = ChP.CreateCall(
+        waitDebugTy,
+        ChP.CreateIntToPtr(waitDebug, ptr,
+                           "morok.win.attach.selfdbg.wait.ptr"),
+        {debugEvent, ConstantInt::get(i32, 0xFFFFFFFFu)},
+        "morok.win.attach.selfdbg.child.wait");
+    ChP.CreateCondBr(ChP.CreateICmpNE(waitOk, ConstantInt::get(i32, 0),
+                                      "morok.win.attach.selfdbg.child.wait.ok"),
+                     childContinueBB, childExitBB);
+
+    IRBuilder<> ChC(childContinueBB);
+    auto *continueDebugTy = FunctionType::get(i32, {i32, i32, i32}, false);
+    Value *eventPid =
+        loadAt(ChC, M, i32, debugEvent, 4ULL,
+               "morok.win.attach.selfdbg.child.event.pid");
+    Value *eventTid =
+        loadAt(ChC, M, i32, debugEvent, 8ULL,
+               "morok.win.attach.selfdbg.child.event.tid");
+    Value *cont = ChC.CreateCall(
+        continueDebugTy,
+        ChC.CreateIntToPtr(continueDebug, ptr,
+                           "morok.win.attach.selfdbg.continue.ptr"),
+        {eventPid, eventTid, ConstantInt::get(i32, 0x00010002u)},
+        "morok.win.attach.selfdbg.child.continue");
+    orResult(ChC, ChC.CreateZExt(cont, i64),
+             "morok.win.attach.selfdbg.child.continue.mix");
+    ChC.CreateBr(childPumpBB);
+
+    IRBuilder<> ChE(childExitBB);
+    auto *exitTy = FunctionType::get(Type::getVoidTy(ctx), {i32}, false);
+    ChE.CreateCall(exitTy,
+                   ChE.CreateIntToPtr(exitProcess, ptr,
+                                      "morok.win.attach.selfdbg.exit.ptr"),
+                   {ConstantInt::get(i32, 207)});
+    ChE.CreateRet(ConstantInt::get(i64, 0));
+
+    IRBuilder<> PG(parentGateBB);
+    Value *parentReady = PG.CreateAnd(
+        PG.CreateAnd(PG.CreateICmpNE(getModule, ConstantInt::get(ip, 0),
+                                     "morok.win.attach.selfdbg.getmodule.ready"),
+                     PG.CreateICmpNE(createProcess, ConstantInt::get(ip, 0),
+                                     "morok.win.attach.selfdbg.create.ready"),
+                     "morok.win.attach.selfdbg.spawn.apis"),
+        PG.CreateAnd(
+            PG.CreateICmpNE(getPid, ConstantInt::get(ip, 0),
+                            "morok.win.attach.selfdbg.getpid.ready"),
+            PG.CreateAnd(
+                PG.CreateICmpNE(sleepFn, ConstantInt::get(ip, 0),
+                                "morok.win.attach.selfdbg.sleep.ready"),
+                PG.CreateAnd(PG.CreateICmpNE(waitSingle, ConstantInt::get(ip, 0),
+                                             "morok.win.attach.selfdbg.waitsingle.ready"),
+                             PG.CreateICmpNE(ntQip, ConstantInt::get(ip, 0),
+                                             "morok.win.attach.selfdbg.ntqip.ready"),
+                             "morok.win.attach.selfdbg.poll.apis"),
+                "morok.win.attach.selfdbg.time.apis"),
+            "morok.win.attach.selfdbg.pid.apis"),
+        "morok.win.attach.selfdbg.parent.ready");
+    orResult(PG, PG.CreateSelect(parentReady, ConstantInt::get(i64, 1),
+                                 ConstantInt::get(i64, 0),
+                                 "morok.win.attach.selfdbg.ready.word"),
+             "morok.win.attach.selfdbg.ready.mix");
+    PG.CreateCondBr(parentReady, parentBuildBB, retBB);
+
+    IRBuilder<> PBB(parentBuildBB);
+    PBB.CreateMemSet(imageBuf, ConstantInt::get(i8, 0),
+                     ConstantInt::get(ip, kMaxImageWchars * 2), MaybeAlign(2));
+    PBB.CreateMemSet(cmdBuf, ConstantInt::get(i8, 0),
+                     ConstantInt::get(ip, kCommandWchars * 2), MaybeAlign(2));
+    auto *getModuleTy = FunctionType::get(i32, {ptr, ptr, i32}, false);
+    Value *imageLen = PBB.CreateCall(
+        getModuleTy,
+        PBB.CreateIntToPtr(getModule, ptr,
+                           "morok.win.attach.selfdbg.getmodule.ptr"),
+        {ConstantPointerNull::get(ptr), imageBuf,
+         ConstantInt::get(i32, kMaxImageWchars)},
+        "morok.win.attach.selfdbg.getmodule");
+    Value *imageOk =
+        PBB.CreateAnd(PBB.CreateICmpNE(imageLen, ConstantInt::get(i32, 0),
+                                       "morok.win.attach.selfdbg.image.nonempty"),
+                      PBB.CreateICmpULT(imageLen,
+                                        ConstantInt::get(i32, kMaxImageWchars),
+                                        "morok.win.attach.selfdbg.image.inrange"),
+                      "morok.win.attach.selfdbg.image.ok");
+    for (std::uint32_t I = 0; I < Marker.size(); ++I)
+        storeWchar(PBB, cmdBuf, ConstantInt::get(i32, I),
+                   ConstantInt::get(i16, Marker[I]),
+                   "morok.win.attach.selfdbg.cmd.marker");
+    auto *getPidTy = FunctionType::get(i32, {}, false);
+    Value *selfPid = PBB.CreateCall(
+        getPidTy,
+        PBB.CreateIntToPtr(getPid, ptr, "morok.win.attach.selfdbg.getpid.ptr"),
+        {}, "morok.win.attach.selfdbg.getpid");
+    Value *encodedPid =
+        PBB.CreateXor(selfPid, ConstantInt::get(i32, PidMask),
+                      "morok.win.attach.selfdbg.encoded.pid");
+    for (std::uint32_t I = 0; I < 8; ++I) {
+        Value *nib = PBB.CreateAnd(
+            PBB.CreateLShr(encodedPid, ConstantInt::get(i32, (7 - I) * 4),
+                           "morok.win.attach.selfdbg.pid.nibble.shift"),
+            ConstantInt::get(i32, 0xF),
+            "morok.win.attach.selfdbg.pid.nibble");
+        Value *hex = PBB.CreateSelect(
+            PBB.CreateICmpULT(nib, ConstantInt::get(i32, 10),
+                              "morok.win.attach.selfdbg.pid.nibble.dec"),
+            PBB.CreateAdd(nib, ConstantInt::get(i32, '0'),
+                          "morok.win.attach.selfdbg.pid.hex.dec"),
+            PBB.CreateAdd(nib, ConstantInt::get(i32, 'A' - 10),
+                          "morok.win.attach.selfdbg.pid.hex.alpha"),
+            "morok.win.attach.selfdbg.pid.hex");
+        storeWchar(PBB, cmdBuf, ConstantInt::get(i32, Marker.size() + I),
+                   PBB.CreateTrunc(hex, i16,
+                                   "morok.win.attach.selfdbg.pid.hex.w"),
+                   "morok.win.attach.selfdbg.cmd.pid");
+    }
+    storeWchar(PBB, cmdBuf, ConstantInt::get(i32, Marker.size() + 8),
+               ConstantInt::get(i16, 0), "morok.win.attach.selfdbg.cmd.nul");
+    PBB.CreateCondBr(imageOk, parentCreateBB, retBB);
+
+    IRBuilder<> PCB(parentCreateBB);
+    PCB.CreateMemSet(startup, ConstantInt::get(i8, 0),
+                     ConstantInt::get(ip, kStartupInfoBytes), MaybeAlign(1));
+    PCB.CreateMemSet(procInfo, ConstantInt::get(i8, 0),
+                     ConstantInt::get(ip, kProcessInfoBytes), MaybeAlign(1));
+    storeAt(PCB, M, startup, 0, ConstantInt::get(i32, kStartupInfoBytes),
+            "morok.win.attach.selfdbg.startup.cb");
+    auto *createProcessTy =
+        FunctionType::get(i32,
+                          {ptr, ptr, ptr, ptr, i32, i32, ptr, ptr, ptr, ptr},
+                          false);
+    Value *created = PCB.CreateCall(
+        createProcessTy,
+        PCB.CreateIntToPtr(createProcess, ptr,
+                           "morok.win.attach.selfdbg.createprocess.ptr"),
+        {imageBuf, cmdBuf, ConstantPointerNull::get(ptr),
+         ConstantPointerNull::get(ptr), ConstantInt::get(i32, 0),
+         ConstantInt::get(i32, 0x08000000u), ConstantPointerNull::get(ptr),
+         ConstantPointerNull::get(ptr), startup, procInfo},
+        "morok.win.attach.selfdbg.createprocess");
+    Value *createdOk =
+        PCB.CreateICmpNE(created, ConstantInt::get(i32, 0),
+                         "morok.win.attach.selfdbg.created");
+    orResult(PCB, PCB.CreateSelect(createdOk, ConstantInt::get(i64, 2),
+                                   ConstantInt::get(i64, 0),
+                                   "morok.win.attach.selfdbg.created.word"),
+             "morok.win.attach.selfdbg.created.mix");
+    Value *procHandle =
+        loadAt(PCB, M, ptr, procInfo, 0ULL,
+               "morok.win.attach.selfdbg.child.process.handle");
+    Value *threadHandle =
+        loadAt(PCB, M, ptr, procInfo, 8ULL,
+               "morok.win.attach.selfdbg.child.thread.handle");
+    PCB.CreateStore(procHandle, childProcess)->setVolatile(true);
+    PCB.CreateStore(threadHandle, childThread)->setVolatile(true);
+    closeIfPresent(PCB, threadHandle, "morok.win.attach.selfdbg.close.thread");
+    PCB.CreateCondBr(createdOk, parentPollBB, retBB);
+
+    IRBuilder<> PPB(parentPollBB);
+    PHINode *pollIdx =
+        PPB.CreatePHI(i32, 2, "morok.win.attach.selfdbg.poll.idx");
+    pollIdx->addIncoming(ConstantInt::get(i32, 0), PCB.GetInsertBlock());
+    auto *sleepTy = FunctionType::get(Type::getVoidTy(ctx), {i32}, false);
+    PPB.CreateCall(
+        sleepTy,
+        PPB.CreateIntToPtr(sleepFn, ptr, "morok.win.attach.selfdbg.sleep.ptr"),
+        {ConstantInt::get(i32, 25)});
+    Value *storedProcess = PPB.CreateLoad(
+        ptr, childProcess, "morok.win.attach.selfdbg.child.process.current");
+    cast<LoadInst>(storedProcess)->setVolatile(true);
+    auto *waitSingleTy = FunctionType::get(i32, {ptr, i32}, false);
+    Value *waitStatus = PPB.CreateCall(
+        waitSingleTy,
+        PPB.CreateIntToPtr(waitSingle, ptr,
+                           "morok.win.attach.selfdbg.waitsingle.ptr"),
+        {storedProcess, ConstantInt::get(i32, 0)},
+        "morok.win.attach.selfdbg.child.wait.status");
+    Value *alive = PPB.CreateICmpEQ(waitStatus, ConstantInt::get(i32, 0x102),
+                                    "morok.win.attach.selfdbg.child.alive");
+    PPB.CreateStore(PPB.CreateNot(alive, "morok.win.attach.selfdbg.child.dead"),
+                    childDead)
+        ->setVolatile(true);
+    PPB.CreateBr(parentQueryBB);
+
+    IRBuilder<> PQB(parentQueryBB);
+    PQB.CreateStore(ConstantPointerNull::get(ptr), dbgObject)
+        ->setVolatile(true);
+    PQB.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
+    auto *qipTy = FunctionType::get(i32, {ptr, i32, ptr, i32, ptr}, false);
+    Value *qipStatus = PQB.CreateCall(
+        qipTy,
+        PQB.CreateIntToPtr(ntQip, ptr, "morok.win.attach.selfdbg.ntqip.ptr"),
+        {PQB.CreateIntToPtr(ConstantInt::getSigned(ip, -1), ptr),
+         ConstantInt::get(i32, 0x1E), dbgObject,
+         ConstantInt::get(i32, M.getDataLayout().getPointerSize()), retLen},
+        "morok.win.attach.selfdbg.ntqip.status");
+    Value *debugHandle =
+        PQB.CreateLoad(ptr, dbgObject, "morok.win.attach.selfdbg.dbgobj");
+    cast<LoadInst>(debugHandle)->setVolatile(true);
+    Value *qipOk = PQB.CreateICmpSGE(qipStatus, ConstantInt::get(i32, 0),
+                                     "morok.win.attach.selfdbg.ntqip.ok");
+    Value *deadNow =
+        PQB.CreateLoad(i1, childDead, "morok.win.attach.selfdbg.dead.value");
+    cast<LoadInst>(deadNow)->setVolatile(true);
+    Value *attached = PQB.CreateAnd(
+        PQB.CreateAnd(qipOk,
+                      PQB.CreateICmpNE(
+                          debugHandle, ConstantPointerNull::get(ptr),
+                          "morok.win.attach.selfdbg.debug.object.present"),
+                      "morok.win.attach.selfdbg.debug.object.valid"),
+        PQB.CreateNot(deadNow, "morok.win.attach.selfdbg.child.not.dead"),
+        "morok.win.attach.selfdbg.attached");
+    Value *handleBits = PQB.CreatePtrToInt(
+        debugHandle, ip, "morok.win.attach.selfdbg.debug.object.bits");
+    Value *handleFrag = PQB.CreateAnd(
+        PQB.CreateZExtOrTrunc(handleBits, i64), ConstantInt::get(i64, 0xFFFF),
+        "morok.win.attach.selfdbg.debug.object.fragment");
+    orResult(PQB,
+             PQB.CreateShl(handleFrag, ConstantInt::get(i64, 32),
+                           "morok.win.attach.selfdbg.fragment.word"),
+             "morok.win.attach.selfdbg.fragment.mix");
+    orResult(PQB,
+             PQB.CreateSelect(attached, ConstantInt::get(i64, 4),
+                              ConstantInt::get(i64, 0),
+                              "morok.win.attach.selfdbg.attached.word"),
+             "morok.win.attach.selfdbg.attached.mix");
+    orResult(PQB,
+             PQB.CreateSelect(deadNow, ConstantInt::get(i64, 8),
+                              ConstantInt::get(i64, 0),
+                              "morok.win.attach.selfdbg.dead.word"),
+             "morok.win.attach.selfdbg.dead.mix");
+    Value *pollDone = PQB.CreateOr(
+        attached,
+        PQB.CreateOr(deadNow,
+                     PQB.CreateICmpUGE(pollIdx,
+                                       ConstantInt::get(i32, kAttachPolls - 1),
+                                       "morok.win.attach.selfdbg.poll.last"),
+                     "morok.win.attach.selfdbg.poll.stop"),
+        "morok.win.attach.selfdbg.poll.done");
+    Value *nextPollIdx = PQB.CreateAdd(pollIdx, ConstantInt::get(i32, 1),
+                                       "morok.win.attach.selfdbg.poll.next");
+    PQB.CreateCondBr(pollDone, parentDoneBB, parentPollBB);
+    pollIdx->addIncoming(nextPollIdx, parentQueryBB);
+
+    IRBuilder<> PDB2(parentDoneBB);
+    Value *finalDbg = PDB2.CreateLoad(ptr, dbgObject,
+                                      "morok.win.attach.selfdbg.dbgobj.final");
+    cast<LoadInst>(finalDbg)->setVolatile(true);
+    Value *hasDbg =
+        PDB2.CreateICmpNE(finalDbg, ConstantPointerNull::get(ptr),
+                          "morok.win.attach.selfdbg.dbgobj.closeable");
+    PDB2.CreateCondBr(hasDbg, parentCloseDbgBB, parentCloseChildBB);
+
+    IRBuilder<> PCD(parentCloseDbgBB);
+    closeIfPresent(PCD, finalDbg, "morok.win.attach.selfdbg.close.dbgobj");
+    PCD.CreateBr(parentCloseChildBB);
+
+    IRBuilder<> PCC(parentCloseChildBB);
+    Value *finalProcess = PCC.CreateLoad(
+        ptr, childProcess, "morok.win.attach.selfdbg.child.process.final");
+    cast<LoadInst>(finalProcess)->setVolatile(true);
+    closeIfPresent(PCC, finalProcess, "morok.win.attach.selfdbg.close.process");
+    PCC.CreateBr(retBB);
+
+    IRBuilder<> RB(retBB);
+    Value *out = RB.CreateLoad(i64, result, "morok.win.attach.selfdbg.result");
+    cast<LoadInst>(out)->setVolatile(true);
+    RB.CreateRet(out);
+    return fn;
+}
+
 Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
                                  ir::IRRandom &rng, const Triple &TT) {
     if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
@@ -18977,6 +19528,14 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
     Function *patchRet = windowsPatchRetHelper(M);
     Function *patchRemote = windowsPatchRemoteBreakinHelper(M);
     Function *invalidProbe = windowsInvalidHandleProbeHelper(M);
+    const std::uint32_t selfDebugPidMask =
+        (static_cast<std::uint32_t>(rng.next() ^ 0xA7C35D19u) | 1u);
+    std::array<std::uint16_t, 5> selfDebugMarker{};
+    for (std::uint32_t I = 0; I < selfDebugMarker.size(); ++I)
+        selfDebugMarker[I] =
+            static_cast<std::uint16_t>(0xE000u | (rng.next() & 0x0FFFu));
+    Function *selfDebug =
+        windowsSelfDebugAttachHelper(M, selfDebugPidMask, selfDebugMarker);
     Function *scanner = windowsSyscallStubScanner(M);
     Function *direct11 = windowsDirectSyscall11Thunk(M);
     Function *watcher = windowsRemoteBreakinWatchThread(M, State);
@@ -18985,8 +19544,8 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
     Function *uefFilter = windowsUnhandledExceptionFilter(M);
     GlobalVariable *uefReached = windowsUefReachedFlag(M);
     if (!pebReader || !moduleByHash || !resolver || !patchRet ||
-        !patchRemote || !invalidProbe || !scanner || !direct11 || !watcher ||
-        !invalidExceptionSeen || !uefFilter || !uefReached)
+        !patchRemote || !invalidProbe || !selfDebug || !scanner || !direct11 ||
+        !watcher || !invalidExceptionSeen || !uefFilter || !uefReached)
         return nullptr;
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
@@ -19111,6 +19670,123 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
         RB.CreateICmpNE(kernelbaseRaise, ConstantInt::get(ip, 0),
                         "morok.win.attach.kernelbase.raiseexception.ready"),
         kernelbaseRaise, kernel32Raise, "morok.win.attach.uef.raise");
+    Value *ntQip = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtQueryInformationProcess"))},
+        "morok.win.attach.selfdbg.ntqip");
+    Value *kernelbaseGetCommandLine = RB.CreateCall(
+        resolver,
+        {kernelbase, ConstantInt::get(i64, fnv1aName("GetCommandLineW"))},
+        "morok.win.attach.selfdbg.kernelbase.getcmd");
+    Value *kernel32GetCommandLine = RB.CreateCall(
+        resolver,
+        {kernel32, ConstantInt::get(i64, fnv1aName("GetCommandLineW"))},
+        "morok.win.attach.selfdbg.kernel32.getcmd");
+    Value *getCommandLine = RB.CreateSelect(
+        RB.CreateICmpNE(kernelbaseGetCommandLine, ConstantInt::get(ip, 0),
+                        "morok.win.attach.selfdbg.kernelbase.getcmd.ready"),
+        kernelbaseGetCommandLine, kernel32GetCommandLine,
+        "morok.win.attach.selfdbg.getcmd");
+    Value *kernelbaseGetModuleFileName = RB.CreateCall(
+        resolver,
+        {kernelbase, ConstantInt::get(i64, fnv1aName("GetModuleFileNameW"))},
+        "morok.win.attach.selfdbg.kernelbase.getmodule");
+    Value *kernel32GetModuleFileName = RB.CreateCall(
+        resolver,
+        {kernel32, ConstantInt::get(i64, fnv1aName("GetModuleFileNameW"))},
+        "morok.win.attach.selfdbg.kernel32.getmodule");
+    Value *getModuleFileName = RB.CreateSelect(
+        RB.CreateICmpNE(kernelbaseGetModuleFileName, ConstantInt::get(ip, 0),
+                        "morok.win.attach.selfdbg.kernelbase.getmodule.ready"),
+        kernelbaseGetModuleFileName, kernel32GetModuleFileName,
+        "morok.win.attach.selfdbg.getmodule");
+    Value *kernelbaseCreateProcess = RB.CreateCall(
+        resolver,
+        {kernelbase, ConstantInt::get(i64, fnv1aName("CreateProcessW"))},
+        "morok.win.attach.selfdbg.kernelbase.createprocess");
+    Value *kernel32CreateProcess = RB.CreateCall(
+        resolver,
+        {kernel32, ConstantInt::get(i64, fnv1aName("CreateProcessW"))},
+        "morok.win.attach.selfdbg.kernel32.createprocess");
+    Value *createProcess = RB.CreateSelect(
+        RB.CreateICmpNE(kernelbaseCreateProcess, ConstantInt::get(ip, 0),
+                        "morok.win.attach.selfdbg.kernelbase.createprocess.ready"),
+        kernelbaseCreateProcess, kernel32CreateProcess,
+        "morok.win.attach.selfdbg.createprocess.api");
+    Value *kernelbaseGetPid = RB.CreateCall(
+        resolver,
+        {kernelbase, ConstantInt::get(i64, fnv1aName("GetCurrentProcessId"))},
+        "morok.win.attach.selfdbg.kernelbase.getpid");
+    Value *kernel32GetPid = RB.CreateCall(
+        resolver,
+        {kernel32, ConstantInt::get(i64, fnv1aName("GetCurrentProcessId"))},
+        "morok.win.attach.selfdbg.kernel32.getpid");
+    Value *getCurrentProcessId = RB.CreateSelect(
+        RB.CreateICmpNE(kernelbaseGetPid, ConstantInt::get(ip, 0),
+                        "morok.win.attach.selfdbg.kernelbase.getpid.ready"),
+        kernelbaseGetPid, kernel32GetPid, "morok.win.attach.selfdbg.getpid");
+    Value *kernelbaseDebugActive = RB.CreateCall(
+        resolver,
+        {kernelbase, ConstantInt::get(i64, fnv1aName("DebugActiveProcess"))},
+        "morok.win.attach.selfdbg.kernelbase.debugactive");
+    Value *kernel32DebugActive = RB.CreateCall(
+        resolver,
+        {kernel32, ConstantInt::get(i64, fnv1aName("DebugActiveProcess"))},
+        "morok.win.attach.selfdbg.kernel32.debugactive");
+    Value *debugActiveProcess = RB.CreateSelect(
+        RB.CreateICmpNE(kernelbaseDebugActive, ConstantInt::get(ip, 0),
+                        "morok.win.attach.selfdbg.kernelbase.debugactive.ready"),
+        kernelbaseDebugActive, kernel32DebugActive,
+        "morok.win.attach.selfdbg.debugactive");
+    Value *kernelbaseWaitDebug = RB.CreateCall(
+        resolver,
+        {kernelbase, ConstantInt::get(i64, fnv1aName("WaitForDebugEvent"))},
+        "morok.win.attach.selfdbg.kernelbase.waitdebug");
+    Value *kernel32WaitDebug = RB.CreateCall(
+        resolver,
+        {kernel32, ConstantInt::get(i64, fnv1aName("WaitForDebugEvent"))},
+        "morok.win.attach.selfdbg.kernel32.waitdebug");
+    Value *waitForDebugEvent = RB.CreateSelect(
+        RB.CreateICmpNE(kernelbaseWaitDebug, ConstantInt::get(ip, 0),
+                        "morok.win.attach.selfdbg.kernelbase.waitdebug.ready"),
+        kernelbaseWaitDebug, kernel32WaitDebug,
+        "morok.win.attach.selfdbg.waitdebug");
+    Value *kernelbaseContinueDebug = RB.CreateCall(
+        resolver,
+        {kernelbase, ConstantInt::get(i64, fnv1aName("ContinueDebugEvent"))},
+        "morok.win.attach.selfdbg.kernelbase.continuedebug");
+    Value *kernel32ContinueDebug = RB.CreateCall(
+        resolver,
+        {kernel32, ConstantInt::get(i64, fnv1aName("ContinueDebugEvent"))},
+        "morok.win.attach.selfdbg.kernel32.continuedebug");
+    Value *continueDebugEvent = RB.CreateSelect(
+        RB.CreateICmpNE(kernelbaseContinueDebug, ConstantInt::get(ip, 0),
+                        "morok.win.attach.selfdbg.kernelbase.continuedebug.ready"),
+        kernelbaseContinueDebug, kernel32ContinueDebug,
+        "morok.win.attach.selfdbg.continuedebug");
+    Value *kernelbaseSleep = RB.CreateCall(
+        resolver, {kernelbase, ConstantInt::get(i64, fnv1aName("Sleep"))},
+        "morok.win.attach.selfdbg.kernelbase.sleep");
+    Value *kernel32Sleep = RB.CreateCall(
+        resolver, {kernel32, ConstantInt::get(i64, fnv1aName("Sleep"))},
+        "morok.win.attach.selfdbg.kernel32.sleep");
+    Value *sleep = RB.CreateSelect(
+        RB.CreateICmpNE(kernelbaseSleep, ConstantInt::get(ip, 0),
+                        "morok.win.attach.selfdbg.kernelbase.sleep.ready"),
+        kernelbaseSleep, kernel32Sleep, "morok.win.attach.selfdbg.sleep");
+    Value *kernelbaseWaitSingle = RB.CreateCall(
+        resolver,
+        {kernelbase, ConstantInt::get(i64, fnv1aName("WaitForSingleObject"))},
+        "morok.win.attach.selfdbg.kernelbase.waitsingle");
+    Value *kernel32WaitSingle = RB.CreateCall(
+        resolver,
+        {kernel32, ConstantInt::get(i64, fnv1aName("WaitForSingleObject"))},
+        "morok.win.attach.selfdbg.kernel32.waitsingle");
+    Value *waitForSingleObject = RB.CreateSelect(
+        RB.CreateICmpNE(kernelbaseWaitSingle, ConstantInt::get(ip, 0),
+                        "morok.win.attach.selfdbg.kernelbase.waitsingle.ready"),
+        kernelbaseWaitSingle, kernel32WaitSingle,
+        "morok.win.attach.selfdbg.waitsingle");
     foldState(RB, State, remoteBreakin, rng.next(),
               "morok.win.attach.remote.breakin.mix");
     foldState(RB, State, dbgBreak, rng.next(),
@@ -19132,6 +19808,51 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
     foldState(RB, State, setUef, rng.next(), "morok.win.attach.uef.set.mix");
     foldState(RB, State, raiseException, rng.next(),
               "morok.win.attach.uef.raise.mix");
+    foldState(RB, State, ntQip, rng.next(),
+              "morok.win.attach.selfdbg.ntqip.mix");
+    foldState(RB, State, createProcess, rng.next(),
+              "morok.win.attach.selfdbg.createprocess.mix");
+    foldState(RB, State, debugActiveProcess, rng.next(),
+              "morok.win.attach.selfdbg.debugactive.mix");
+    Value *selfDebugResult = RB.CreateCall(
+        selfDebug,
+        {getCommandLine, getModuleFileName, createProcess, getCurrentProcessId,
+         debugActiveProcess, waitForDebugEvent, continueDebugEvent, sleep,
+         waitForSingleObject, ntQip, closeHandle, exitProcess},
+        "morok.win.attach.selfdbg.result");
+    Value *selfDebugReady = RB.CreateICmpNE(
+        RB.CreateAnd(selfDebugResult, ConstantInt::get(i64, 1),
+                     "morok.win.attach.selfdbg.ready.bit"),
+        ConstantInt::get(i64, 0), "morok.win.attach.selfdbg.ready");
+    Value *selfDebugAttached = RB.CreateICmpNE(
+        RB.CreateAnd(selfDebugResult, ConstantInt::get(i64, 4),
+                     "morok.win.attach.selfdbg.attached.bit"),
+        ConstantInt::get(i64, 0), "morok.win.attach.selfdbg.attached");
+    Value *selfDebugDead = RB.CreateICmpNE(
+        RB.CreateAnd(selfDebugResult, ConstantInt::get(i64, 8),
+                     "morok.win.attach.selfdbg.dead.bit"),
+        ConstantInt::get(i64, 0), "morok.win.attach.selfdbg.dead");
+    Value *selfDebugHandle =
+        RB.CreateAnd(RB.CreateLShr(selfDebugResult, ConstantInt::get(i64, 32),
+                                   "morok.win.attach.selfdbg.handle.shift"),
+                     ConstantInt::get(i64, 0xFFFF),
+                     "morok.win.attach.selfdbg.handle.fragment");
+    Value *selfDebugMissing =
+        RB.CreateAnd(selfDebugReady,
+                     RB.CreateNot(selfDebugAttached,
+                                  "morok.win.attach.selfdbg.not.attached"),
+                     "morok.win.attach.selfdbg.missing");
+    foldState(RB, State, selfDebugResult, rng.next(),
+              "morok.win.attach.selfdbg.result.mix");
+    foldState(RB, State, selfDebugHandle, rng.next(),
+              "morok.win.attach.selfdbg.handle.mix");
+    foldFlag(RB, State,
+             RB.CreateNot(selfDebugReady, "morok.win.attach.selfdbg.not.ready"),
+             0x4CC8B7319D6EA215ULL, "morok.win.attach.selfdbg.not.ready");
+    foldFlag(RB, State, selfDebugDead, 0x71BBE420C6815D09ULL,
+             "morok.win.attach.selfdbg.child.dead");
+    foldEnforcedFlag(RB, State, selfDebugMissing, 0xD68952704A3EC91BULL,
+                     "morok.win.attach.selfdbg.missing");
     Value *remoteStatus = RB.CreateCall(
         patchRemote, {remoteBreakin, exitProcess, ntProtect},
         "morok.win.attach.patch.remote.status");

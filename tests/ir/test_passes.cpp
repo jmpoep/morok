@@ -18837,6 +18837,7 @@ define i32 @main() { ret i32 0 }
     Function *InvalidVeh =
         M->getFunction("morok.win.attach.invalid.exception.handler");
     Function *Uef = M->getFunction("morok.win.attach.uef.filter");
+    Function *SelfDbg = M->getFunction("morok.win.attach.selfdbg");
     Function *Watcher = M->getFunction("morok.win.attach.watch.thread");
     Function *Direct11 = M->getFunction("morok.win.sys.direct11");
     Function *Resolve = M->getFunction("morok.win.pe.resolve");
@@ -18847,6 +18848,7 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Invalid != nullptr);
     REQUIRE(InvalidVeh != nullptr);
     REQUIRE(Uef != nullptr);
+    REQUIRE(SelfDbg != nullptr);
     REQUIRE(Watcher != nullptr);
     REQUIRE(Direct11 != nullptr);
     REQUIRE(Resolve != nullptr);
@@ -18888,6 +18890,16 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getFunction("RtlRemoveVectoredExceptionHandler") == nullptr);
     CHECK(M->getFunction("SetUnhandledExceptionFilter") == nullptr);
     CHECK(M->getFunction("RaiseException") == nullptr);
+    CHECK(M->getFunction("GetCommandLineW") == nullptr);
+    CHECK(M->getFunction("GetModuleFileNameW") == nullptr);
+    CHECK(M->getFunction("CreateProcessW") == nullptr);
+    CHECK(M->getFunction("GetCurrentProcessId") == nullptr);
+    CHECK(M->getFunction("DebugActiveProcess") == nullptr);
+    CHECK(M->getFunction("WaitForDebugEvent") == nullptr);
+    CHECK(M->getFunction("ContinueDebugEvent") == nullptr);
+    CHECK(M->getFunction("WaitForSingleObject") == nullptr);
+    CHECK(M->getFunction("Sleep") == nullptr);
+    CHECK(M->getFunction("NtQueryInformationProcess") == nullptr);
     CHECK(hasInlineAsmCall(*Direct11));
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.remote.breakin") >=
           1u);
@@ -18943,6 +18955,43 @@ define i32 @main() { ret i32 0 }
               *Probe, "morok.win.attach.kernelbase.raiseexception") >= 1u);
     CHECK(countNamedInstructions(
               *Probe, "morok.win.attach.kernel32.raiseexception") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.selfdbg.kernelbase.getcmd") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.selfdbg.kernel32.getcmd") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.selfdbg.kernelbase.getmodule") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.selfdbg.kernel32.getmodule") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.selfdbg.kernelbase.createprocess") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.selfdbg.kernel32.createprocess") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.selfdbg.kernelbase.debugactive") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.selfdbg.kernel32.debugactive") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.selfdbg.kernelbase.waitdebug") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.selfdbg.kernel32.waitdebug") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.selfdbg.kernelbase.continuedebug") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.selfdbg.kernel32.continuedebug") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.attach.selfdbg.ntqip") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.attach.selfdbg.result") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.attach.selfdbg.missing") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.selfdbg.handle.fragment") >=
+          1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.exitprocess") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.closehandle") >= 1u);
     CHECK(countNamedInstructions(*Probe,
@@ -18961,6 +19010,22 @@ define i32 @main() { ret i32 0 }
                                  "morok.win.attach.uef.routing.missed") >= 1u);
     CHECK(countNamedInstructions(*Uef,
                                  "morok.win.attach.uef.reached.marker") >= 1u);
+    CHECK(countNamedInstructions(
+              *SelfDbg, "morok.win.attach.selfdbg.child.debugactive") >= 1u);
+    CHECK(countNamedInstructions(*SelfDbg,
+                                 "morok.win.attach.selfdbg.child.wait") >= 1u);
+    CHECK(countNamedInstructions(
+              *SelfDbg, "morok.win.attach.selfdbg.child.continue") >= 1u);
+    CHECK(countNamedInstructions(
+              *SelfDbg, "morok.win.attach.selfdbg.createprocess") >= 1u);
+    CHECK(countNamedInstructions(
+              *SelfDbg, "morok.win.attach.selfdbg.ntqip.status") >= 1u);
+    CHECK(countNamedInstructions(
+              *SelfDbg, "morok.win.attach.selfdbg.debug.object.present") >= 1u);
+    CHECK(countNamedInstructions(
+              *SelfDbg, "morok.win.attach.selfdbg.child.alive") >= 1u);
+    CHECK(countNamedInstructions(
+              *SelfDbg, "morok.win.attach.selfdbg.close.process.status") >= 1u);
     // #221: the process-wide UEF callback must inspect EXCEPTION_RECORD.
     // ExceptionCode (loaded via the record), compare it against the probe's
     // private code 0xE0424D4F, and return EXCEPTION_CONTINUE_SEARCH (ret i32 0)
@@ -18997,6 +19062,16 @@ define i32 @main() { ret i32 0 }
         findNamedInstruction(*Probe, "morok.win.attach.uef.routing.missed");
     REQUIRE(UefMissed != nullptr);
     CHECK(valueFeedsNamedInstruction(UefMissed, "morok.seal.fold.anti_debug"));
+    Instruction *SelfDebugMissing =
+        findNamedInstruction(*Probe, "morok.win.attach.selfdbg.missing");
+    REQUIRE(SelfDebugMissing != nullptr);
+    CHECK(valueFeedsNamedInstruction(SelfDebugMissing,
+                                     "morok.seal.fold.anti_debug"));
+    Instruction *SelfDebugHandle =
+        findNamedInstruction(*Probe, "morok.win.attach.selfdbg.handle.fragment");
+    REQUIRE(SelfDebugHandle != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(SelfDebugHandle,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Invalid,
                                  "morok.win.attach.ntclose.invalid") >= 1u);
     CHECK(countNamedInstructions(*Invalid,
