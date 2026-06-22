@@ -18500,6 +18500,15 @@ entry:
     CHECK(M->getFunction("dlopen") != nullptr);
     CHECK(M->getFunction("dlsym") != nullptr);
     CHECK(M->getFunction("getenv") != nullptr);
+    CHECK(M->getFunction("_NSGetEnviron") != nullptr);
+    Function *RawEnv = M->getFunction("morok.antidbg.rawenv.contains");
+    REQUIRE(RawEnv != nullptr);
+    CHECK(countNamedInstructions(*RawEnv, "morok.antidbg.rawenv.eq.sign") >=
+          1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antidbg.dyld.raw.found") >= 8u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antidbg.dyld.coherence") >= 8u);
+    CHECK(countNamedInstructions(*Ctor, "morok.imgcensus.library.apple") >=
+          1u);
     CHECK(countNamedInstructions(*Ctor, "morok.antidbg.exc.task_ports") >= 1u);
     CHECK(countNamedInstructions(*Ctor,
                                  "morok.antidbg.exc.task_ports.import") == 0u);
@@ -18561,6 +18570,7 @@ entry:
     CHECK(M->getFunction("pthread_detach") != nullptr);
     CHECK(M->getFunction("sleep") != nullptr);
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_INSERT_LIBRARIES"));
+    CHECK_FALSE(hasReadableByteString(*M, "/Library/Apple"));
     CHECK_FALSE(hasReadableByteString(*M, "get-task-allow"));
     auto [cloakStores, opaqueCloakStores] =
         countStoresToBaseWithOpaqueSource(*M, "morok.cloak.buf");
@@ -18746,6 +18756,17 @@ entry:
     CHECK(M->getFunction("csops") == nullptr);
     CHECK(M->getFunction("task_get_exception_ports") == nullptr);
     CHECK(M->getFunction("getenv") != nullptr);
+    CHECK(M->getFunction("_NSGetEnviron") != nullptr);
+    Function *RawEnv = M->getFunction("morok.antidbg.rawenv.contains");
+    REQUIRE(RawEnv != nullptr);
+    CHECK(countNamedInstructions(*RawEnv, "morok.antidbg.rawenv.eq.sign") >=
+          1u);
+    CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
+                                 "morok.antidbg.dyld.raw.found") >= 8u);
+    CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
+                                 "morok.antidbg.dyld.coherence") >= 8u);
+    CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
+                                 "morok.imgcensus.library.apple") >= 1u);
     // M2 direct syscall fallback: no imported MAP_JIT/icache helper can
     // interpose or patch a mutable syscall thunk before checks execute.
     CHECK(M->getGlobalVariable("morok.svc.thunk", true) == nullptr);
@@ -18803,6 +18824,7 @@ entry:
     CHECK(countGlobals(*M, "morok.cloak.c") >= 8u);
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_INSERT_LIBRARIES"));
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_PRINT"));
+    CHECK_FALSE(hasReadableByteString(*M, "/Library/Apple"));
     CHECK_FALSE(hasReadableByteString(*M, "get-task-allow"));
     auto [cloakStores, opaqueCloakStores] =
         countStoresToBaseWithOpaqueSource(*M, "morok.cloak.buf");

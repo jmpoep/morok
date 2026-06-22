@@ -3659,12 +3659,135 @@ Value *emitDarwinExceptionPortProbe(IRBuilder<> &B, Module &M,
     return tripped;
 }
 
+Function *darwinRawEnvContainsHelper(Module &M) {
+    if (Function *existing = M.getFunction("morok.antidbg.rawenv.contains"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    constexpr std::uint32_t kMaxEnvEntries = 1024;
+
+    auto *fn = Function::Create(FunctionType::get(i1, {ptr, i32}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antidbg.rawenv.contains", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    auto argIt = fn->arg_begin();
+    Value *needle = &*argIt++;
+    needle->setName("needle");
+    Value *needleLen = &*argIt++;
+    needleLen->setName("needle.len");
+
+    FunctionCallee nsGetEnviron =
+        M.getOrInsertFunction("_NSGetEnviron", FunctionType::get(ptr, false));
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loadEnvBB = BasicBlock::Create(ctx, "load.env", fn);
+    auto *envLoopBB = BasicBlock::Create(ctx, "env.loop", fn);
+    auto *cmpLoopBB = BasicBlock::Create(ctx, "cmp.loop", fn);
+    auto *cmpBodyBB = BasicBlock::Create(ctx, "cmp.body", fn);
+    auto *cmpNextBB = BasicBlock::Create(ctx, "cmp.next", fn);
+    auto *eqGateBB = BasicBlock::Create(ctx, "eq.gate", fn);
+    auto *envNextBB = BasicBlock::Create(ctx, "env.next", fn);
+    auto *retTrueBB = BasicBlock::Create(ctx, "ret.true", fn);
+    auto *retFalseBB = BasicBlock::Create(ctx, "ret.false", fn);
+
+    IRBuilder<> B(entry);
+    Value *envSlot = B.CreateCall(nsGetEnviron, {},
+                                  "morok.antidbg.rawenv.environ.slot");
+    B.CreateCondBr(B.CreateICmpNE(envSlot, ConstantPointerNull::get(ptr),
+                                  "morok.antidbg.rawenv.slot.present"),
+                   loadEnvBB, retFalseBB);
+
+    IRBuilder<> EB(loadEnvBB);
+    Value *envp = EB.CreateLoad(ptr, envSlot, "morok.antidbg.rawenv.envp");
+    EB.CreateCondBr(EB.CreateICmpNE(envp, ConstantPointerNull::get(ptr),
+                                    "morok.antidbg.rawenv.envp.present"),
+                    envLoopBB, retFalseBB);
+
+    IRBuilder<> EL(envLoopBB);
+    PHINode *envIdx = EL.CreatePHI(i32, 2, "morok.antidbg.rawenv.idx");
+    envIdx->addIncoming(ConstantInt::get(i32, 0), loadEnvBB);
+    Value *envOff =
+        EL.CreateMul(EL.CreateZExt(envIdx, ip, "morok.antidbg.rawenv.idx.ip"),
+                     ConstantInt::get(ip, M.getDataLayout().getPointerSize()),
+                     "morok.antidbg.rawenv.entry.off");
+    Value *entrySlot =
+        gepI8(EL, M, envp, envOff, "morok.antidbg.rawenv.entry.slot");
+    Value *entryPtr =
+        EL.CreateLoad(ptr, entrySlot, "morok.antidbg.rawenv.entry");
+    EL.CreateCondBr(EL.CreateICmpNE(entryPtr, ConstantPointerNull::get(ptr),
+                                    "morok.antidbg.rawenv.entry.present"),
+                    cmpLoopBB, retFalseBB);
+
+    IRBuilder<> CL(cmpLoopBB);
+    PHINode *cmpIdx = CL.CreatePHI(i32, 2, "morok.antidbg.rawenv.cmp.idx");
+    cmpIdx->addIncoming(ConstantInt::get(i32, 0), envLoopBB);
+    CL.CreateCondBr(CL.CreateICmpULT(cmpIdx, needleLen,
+                                     "morok.antidbg.rawenv.cmp.more"),
+                    cmpBodyBB, eqGateBB);
+
+    IRBuilder<> CB(cmpBodyBB);
+    Value *cmpOff = CB.CreateZExt(cmpIdx, ip, "morok.antidbg.rawenv.cmp.ip");
+    Value *entryCh =
+        CB.CreateLoad(i8, gepI8(CB, M, entryPtr, cmpOff,
+                                "morok.antidbg.rawenv.entry.ch.ptr"),
+                      "morok.antidbg.rawenv.entry.ch");
+    Value *needleCh =
+        CB.CreateLoad(i8, gepI8(CB, M, needle, cmpOff,
+                                "morok.antidbg.rawenv.needle.ch.ptr"),
+                      "morok.antidbg.rawenv.needle.ch");
+    CB.CreateCondBr(CB.CreateICmpEQ(entryCh, needleCh,
+                                    "morok.antidbg.rawenv.byte.eq"),
+                    cmpNextBB, envNextBB);
+
+    IRBuilder<> CN(cmpNextBB);
+    Value *nextCmpIdx =
+        CN.CreateAdd(cmpIdx, ConstantInt::get(i32, 1),
+                     "morok.antidbg.rawenv.cmp.next");
+    CN.CreateBr(cmpLoopBB);
+    cmpIdx->addIncoming(nextCmpIdx, cmpNextBB);
+
+    IRBuilder<> EG(eqGateBB);
+    Value *eqOff =
+        EG.CreateZExt(needleLen, ip, "morok.antidbg.rawenv.eq.ip");
+    Value *suffix =
+        EG.CreateLoad(i8, gepI8(EG, M, entryPtr, eqOff,
+                                "morok.antidbg.rawenv.eq.ptr"),
+                      "morok.antidbg.rawenv.eq.ch");
+    EG.CreateCondBr(EG.CreateICmpEQ(suffix, ConstantInt::get(i8, '='),
+                                    "morok.antidbg.rawenv.eq.sign"),
+                    retTrueBB, envNextBB);
+
+    IRBuilder<> EN(envNextBB);
+    Value *nextEnvIdx =
+        EN.CreateAdd(envIdx, ConstantInt::get(i32, 1),
+                     "morok.antidbg.rawenv.next");
+    EN.CreateCondBr(EN.CreateICmpULT(nextEnvIdx,
+                                     ConstantInt::get(i32, kMaxEnvEntries),
+                                     "morok.antidbg.rawenv.more"),
+                    envLoopBB, retFalseBB);
+    envIdx->addIncoming(nextEnvIdx, envNextBB);
+
+    IRBuilder<> RT(retTrueBB);
+    RT.CreateRet(ConstantInt::getTrue(ctx));
+    IRBuilder<> RF(retFalseBB);
+    RF.CreateRet(ConstantInt::getFalse(ctx));
+    return fn;
+}
+
 void emitDarwinDyldCensus(IRBuilder<> &B, Module &M, GlobalVariable *State,
                           ir::IRRandom &rng) {
     LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
     auto *ptr = PointerType::getUnqual(ctx);
     FunctionCallee getenv =
         M.getOrInsertFunction("getenv", FunctionType::get(ptr, {ptr}, false));
+    Function *rawEnvContains = darwinRawEnvContainsHelper(M);
 
     constexpr std::array<StringLiteral, 8> names = {
         StringLiteral("DYLD_INSERT_LIBRARIES"),
@@ -3684,22 +3807,38 @@ void emitDarwinDyldCensus(IRBuilder<> &B, Module &M, GlobalVariable *State,
 
     for (std::size_t i = 0; i < names.size(); ++i) {
         Value *name = ir::emitCloakedSymbol(B, M, names[i], rng);
-        Value *found = B.CreateICmpNE(B.CreateCall(getenv, {name}),
-                                      ConstantPointerNull::get(ptr));
+        Value *getenvFound = B.CreateICmpNE(
+            B.CreateCall(getenv, {name}, "morok.antidbg.dyld.getenv.value"),
+            ConstantPointerNull::get(ptr), "morok.antidbg.dyld.getenv.found");
+        Value *rawFound = B.CreateCall(
+            rawEnvContains,
+            {name, ConstantInt::get(
+                       i32, static_cast<std::uint32_t>(names[i].size()))},
+            "morok.antidbg.dyld.raw.found");
+        Value *found =
+            B.CreateOr(getenvFound, rawFound, "morok.antidbg.dyld.found");
+        Value *coherence = B.CreateXor(getenvFound, rawFound,
+                                       "morok.antidbg.dyld.coherence");
         foldFlag(B, State, found, salts[i], "morok.antidbg.dyld");
         foldPoisonFlag(B, found, salts[i] ^ 0x7DA3B94C6E1025F1ULL,
                        "morok.antianalysis.dyld");
         // Any DYLD_* instrumentation var is absent on a clean run, so binding it
         // into the verdict seal is safe and corrupts an injected/keygen run.
         sealFold(B, found, salts[i]);
+        foldFlag(B, State, coherence, salts[i] ^ 0xA6D3674B9C12F0E5ULL,
+                 "morok.antidbg.dyld.coherence");
+        foldPoisonFlag(B, coherence, salts[i] ^ 0xDB709F079272D514ULL,
+                       "morok.antianalysis.dyld.coherence");
+        sealFold(B, coherence, salts[i] ^ 0xA6D3674B9C12F0E5ULL);
     }
 }
 
 // M3: enumerate loaded images and flag any that is NOT the main executable
-// (index 0) and whose path is not under /usr/lib/ or /System/Library/.  An
-// injected dylib (the keygen ships one via DYLD_INSERT_LIBRARIES) loads from an
-// arbitrary path and is caught even if the attacker scrubs the DYLD_* env var.
-// Folded into the seal so the foreign image silently poisons the verdict.
+// (index 0) and whose path is not under /usr/lib/, /System/Library/, or
+// Rosetta's /Library/Apple/ runtime prefix.  An injected dylib (the keygen ships
+// one via DYLD_INSERT_LIBRARIES) loads from an arbitrary path and is caught even
+// if the attacker scrubs the DYLD_* env var.  Folded into the seal so the
+// foreign image silently poisons the verdict.
 void emitDarwinImageCensus(IRBuilder<> &B, Module &M, GlobalVariable *State) {
     LLVMContext &ctx = M.getContext();
     auto *i32 = Type::getInt32Ty(ctx);
@@ -3722,14 +3861,30 @@ void emitDarwinImageCensus(IRBuilder<> &B, Module &M, GlobalVariable *State) {
     PHINode *i = LB.CreatePHI(i32, 2, "morok.imgcensus.i");
     i->addIncoming(ConstantInt::get(i32, 1), pre);
     Value *name = LB.CreateCall(imgName, {i}, "morok.imgcensus.name");
-    // First 8 bytes of the path; dyld paths are long, so an 8-byte read is in
-    // bounds within the contiguous load-command string table.
+    // dyld image paths are long, so these reads stay in bounds within the
+    // contiguous load-command string table.  The second read keeps
+    // /Library/<non-Apple> foreign while allowing Rosetta's /Library/Apple/.
     Value *first8 = LB.CreateAlignedLoad(i64, name, Align(1));
+    Value *second8 =
+        loadAt(LB, M, i64, name, 8ULL, "morok.imgcensus.path.second8");
     Value *isUsrLib = // "/usr/lib"
         LB.CreateICmpEQ(first8, ConstantInt::get(i64, 0x62696c2f7273752fULL));
     Value *isSystem = // "/System/"
         LB.CreateICmpEQ(first8, ConstantInt::get(i64, 0x2f6d65747379532fULL));
-    Value *foreign = LB.CreateNot(LB.CreateOr(isUsrLib, isSystem));
+    Value *isLibrary = // "/Library"
+        LB.CreateICmpEQ(first8, ConstantInt::get(i64, 0x7972617262694C2FULL),
+                        "morok.imgcensus.library.prefix");
+    Value *isApple = // "/Apple/"
+        LB.CreateICmpEQ(
+            LB.CreateAnd(second8, ConstantInt::get(i64, 0x00FFFFFFFFFFFFFFULL),
+                         "morok.imgcensus.apple.masked"),
+            ConstantInt::get(i64, 0x2F656C7070412FULL),
+            "morok.imgcensus.apple.prefix");
+    Value *isLibraryApple =
+        LB.CreateAnd(isLibrary, isApple, "morok.imgcensus.library.apple");
+    Value *foreign = LB.CreateNot(
+        LB.CreateOr(LB.CreateOr(isUsrLib, isSystem),
+                    isLibraryApple, "morok.imgcensus.system.prefixes"));
     foldFlag(LB, State, foreign, 0x2D9E64B0A7135CC1ULL, "morok.antidbg.image");
     foldPoisonFlag(LB, foreign, 0xE57A2C6819D403BFULL,
                    "morok.antianalysis.image");
