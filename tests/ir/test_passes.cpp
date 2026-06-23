@@ -480,6 +480,13 @@ void checkDarwinCsrPolicySignals(Module &M, Function &F) {
     CHECK(countNamedInstructions(*Csr, "morok.antidbg.csr.resolve") >= 1u);
     CHECK(countNamedInstructions(*Csr, "morok.antidbg.csr.call") >= 1u);
     CHECK(countNamedInstructions(*Csr, "morok.antidbg.csr.debug.bits") >= 1u);
+    // #266: the SIP debug-policy mask must be CSR_ALLOW_TASK_FOR_PID (0x4) |
+    // CSR_ALLOW_KERNEL_DEBUGGER (0x8) = 0xC, not the old 0x18 (which tested the
+    // unrelated APPLE_INTERNAL and never tested TASK_FOR_PID).
+    CHECK(instructionHasConstantOperand(
+        findNamedInstruction(*Csr, "morok.antidbg.csr.debug.bits"), 0xCu));
+    CHECK_FALSE(instructionHasConstantOperand(
+        findNamedInstruction(*Csr, "morok.antidbg.csr.debug.bits"), 0x18u));
     CHECK(countNamedInstructions(*Csr,
                                  "morok.antidbg.csr.task_kernel_debug") >= 1u);
     CHECK(countNamedInstructions(*Csr, "morok.antidbg.csr.full_disabled") >=

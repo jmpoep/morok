@@ -6977,7 +6977,13 @@ Function *darwinCsrPolicyProbe(Module &M, ir::IRRandom &rng) {
         readBB, ret0BB);
 
     IRBuilder<> VB(readBB);
-    constexpr std::uint32_t kCsrDebugMask = 0x18;
+    // #266: XNU bsd/sys/csr.h: CSR_ALLOW_TASK_FOR_PID = (1<<2) = 0x4,
+    // CSR_ALLOW_KERNEL_DEBUGGER = (1<<3) = 0x8, CSR_ALLOW_APPLE_INTERNAL =
+    // (1<<4) = 0x10. The debug-policy mask must test the two debug-relaxation
+    // bits; the old 0x18 (=0x8|0x10) tested KERNEL_DEBUGGER plus the unrelated
+    // APPLE_INTERNAL and NEVER tested TASK_FOR_PID, so a host SIP-relaxed for
+    // task debugging only (csrutil enable --without debug) evaded the seal.
+    constexpr std::uint32_t kCsrDebugMask = 0x4 | 0x8; // TASK_FOR_PID|KERNEL_DEBUGGER
     constexpr std::uint32_t kCsrFullDisableMask = 0x77f;
     Value *value = VB.CreateLoad(i32, config, "morok.antidbg.csr.value");
     Value *debugBits =
