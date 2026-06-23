@@ -13810,7 +13810,13 @@ Function *emulationDivergenceProbe(Module &M, const Triple &TT) {
         B.CreateExtractValue(fullFlags, {0}, "morok.antihook.emu.eflags.after");
     Value *fullBefore = B.CreateExtractValue(
         fullFlags, {1}, "morok.antihook.emu.eflags.before");
-    constexpr std::uint64_t kFullEflagsMask = 0x003F7FD5ULL;
+    // AF (bit 4) is architecturally UNDEFINED after a logical op like XOR
+    // (Intel SDM), so a conforming CPU/emulator/hypervisor may leave AF=1 on a
+    // perfectly clean run. Excluding it from the enforced full-flags mask keeps
+    // this verdict zero-on-clean (it would otherwise sealFold into the consumed
+    // anti_debug seal and poison clean x86_64 hosts), mirroring the sibling
+    // short probe's kStableXorFlagMask which already omits AF (#246).
+    constexpr std::uint64_t kFullEflagsMask = 0x003F7FD5ULL & ~(1ull << 4);
     constexpr std::uint64_t kArithmeticFlagMask =
         (1ull << 0) | (1ull << 2) | (1ull << 4) | (1ull << 6) |
         (1ull << 7) | (1ull << 11);

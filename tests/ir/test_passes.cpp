@@ -17280,7 +17280,13 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Emu,
                                  "morok.antihook.emu.eflags.mismatch") >= 1u);
-    CHECK(functionHasConstantInt(*Emu, 0x003F7FD5u));
+    // #246: AF (bit 4) is architecturally undefined after XOR, so it must be
+    // excluded from the ENFORCED full-flags mask, else a clean host leaving
+    // AF=1 poisons the consumed anti_debug seal. The enforced mask must be
+    // 0x003F7FD5 & ~(1<<4) = 0x003F7FC5; the AF-including 0x003F7FD5 must NOT
+    // appear in the probe.
+    CHECK(functionHasConstantInt(*Emu, 0x003F7FC5u));
+    CHECK_FALSE(functionHasConstantInt(*Emu, 0x003F7FD5u));
     CHECK(countNamedInstructions(*Emu,
                                  "morok.antihook.emu.cmp.flags.mismatch") >=
           1u);
@@ -18399,7 +18405,13 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Emu,
                                  "morok.antihook.emu.eflags.mismatch") >= 1u);
-    CHECK(functionHasConstantInt(*Emu, 0x003F7FD5u));
+    // #246: AF (bit 4) is architecturally undefined after XOR, so it must be
+    // excluded from the ENFORCED full-flags mask, else a clean host leaving
+    // AF=1 poisons the consumed anti_debug seal. The enforced mask must be
+    // 0x003F7FD5 & ~(1<<4) = 0x003F7FC5; the AF-including 0x003F7FD5 must NOT
+    // appear in the probe.
+    CHECK(functionHasConstantInt(*Emu, 0x003F7FC5u));
+    CHECK_FALSE(functionHasConstantInt(*Emu, 0x003F7FD5u));
     CHECK(countNamedInstructions(*Emu,
                                  "morok.antihook.emu.cmp.flags.mismatch") >=
           1u);
