@@ -17418,6 +17418,383 @@ Function *negativeTimingProbe(Module &M, ir::IRRandom &rng, const Triple &TT) {
     return fn;
 }
 
+std::uint64_t powRotR(std::uint64_t X, unsigned R) {
+    R &= 63U;
+    return (X >> R) | (X << ((64U - R) & 63U));
+}
+
+std::uint64_t powConstMix(std::uint64_t X) {
+    X ^= X >> 32;
+    X *= 0xD6E8FEB86659FD93ULL;
+    X ^= X >> 29;
+    X *= 0xA0761D6478BD642FULL;
+    return X ^ (X >> 31);
+}
+
+GlobalVariable *powConstantKey(Module &M, std::uint64_t Seed) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.antihook.pow.const.key",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i64, Seed), "morok.antihook.pow.const.key");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(8));
+    return gv;
+}
+
+Value *emitPowConstMix(IRBuilder<> &B, Value *X, const Twine &Name) {
+    auto *i64 = B.getInt64Ty();
+    X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(i64, 32)),
+                    Name + ".fold32");
+    X = B.CreateMul(X, ConstantInt::get(i64, 0xD6E8FEB86659FD93ULL),
+                    Name + ".mul0");
+    X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(i64, 29)),
+                    Name + ".fold29");
+    X = B.CreateMul(X, ConstantInt::get(i64, 0xA0761D6478BD642FULL),
+                    Name + ".mul1");
+    return B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(i64, 31)),
+                       Name + ".fold31");
+}
+
+Value *decodePowConstant(IRBuilder<> &B, GlobalVariable *Key,
+                         std::uint64_t Plain, std::uint64_t Tag,
+                         const Twine &Name) {
+    auto *i64 = B.getInt64Ty();
+    auto *loaded = B.CreateLoad(i64, Key, Name + ".key");
+    loaded->setVolatile(true);
+    loaded->setAlignment(Align(8));
+    constexpr std::uint64_t kDefaultSeed = 0xA53C9E721D48B60FULL;
+    std::uint64_t seed = kDefaultSeed;
+    if (Key && Key->hasInitializer())
+        if (auto *CI = dyn_cast<ConstantInt>(Key->getInitializer()))
+            seed = CI->getZExtValue();
+    const unsigned rot = 11U + static_cast<unsigned>((Tag >> 59) & 31U);
+    const std::uint64_t mask = powConstMix(seed ^ Tag);
+    const std::uint64_t encoded = powRotR(Plain ^ mask, rot);
+    Value *mixed =
+        emitPowConstMix(B,
+                        B.CreateXor(loaded, ConstantInt::get(i64, Tag),
+                                    Name + ".tag"),
+                        Name + ".mix");
+    Value *unrot = ConstantInt::get(i64, encoded);
+    unrot = B.CreateOr(
+        B.CreateShl(unrot, ConstantInt::get(i64, rot), Name + ".rot.lo"),
+        B.CreateLShr(unrot, ConstantInt::get(i64, 64U - rot),
+                     Name + ".rot.hi"),
+        Name + ".rot");
+    return B.CreateXor(unrot, mixed, Name);
+}
+
+void emitPowScalarSpan(IRBuilder<> &B, AllocaInst *Acc, std::uint64_t Salt,
+                       const Twine &Name) {
+    auto *i64 = B.getInt64Ty();
+    for (unsigned i = 0; i < 96; ++i) {
+        auto *old = B.CreateLoad(i64, Acc, Name + ".load");
+        old->setVolatile(true);
+        Value *a =
+            B.CreateXor(B.CreateShl(old, ConstantInt::get(i64, (i % 19) + 3)),
+                        B.CreateLShr(old,
+                                     ConstantInt::get(i64, (i % 23) + 5)),
+                        Name + ".spread");
+        Value *b = B.CreateAdd(
+            a, ConstantInt::get(i64, Salt ^ (0x9E3779B97F4A7C15ULL * (i + 1))),
+            Name + ".add");
+        Value *c = B.CreateMul(
+            B.CreateXor(b, old, Name + ".xor"),
+            ConstantInt::get(i64,
+                             (Salt + 0xD1B54A32D192ED03ULL * (i + 7)) | 1ULL),
+            Name + ".mul");
+        auto *st = B.CreateStore(
+            B.CreateXor(c, B.CreateLShr(c, ConstantInt::get(i64, 31)),
+                        Name + ".fold"),
+            Acc);
+        st->setVolatile(true);
+    }
+}
+
+Value *emitPowAesSpan(IRBuilder<> &B, Module &M, const Twine &Name) {
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *asmTy = FunctionType::get(i32, false);
+    InlineAsm *aes = InlineAsm::get(
+        asmTy,
+        "xorl %eax, %eax\n\t"
+        "pxor %xmm0, %xmm0\n\t"
+        "pcmpeqd %xmm1, %xmm1\n\t"
+        "movl $$96, %ecx\n\t"
+        "0:\n\t"
+        ".byte 0x66,0x0f,0x38,0xdc,0xc1\n\t"
+        ".byte 0x66,0x0f,0x38,0xdc,0xc1\n\t"
+        ".byte 0x66,0x0f,0x38,0xdc,0xc1\n\t"
+        ".byte 0x66,0x0f,0x38,0xdc,0xc1\n\t"
+        "paddq %xmm1, %xmm0\n\t"
+        "decl %ecx\n\t"
+        "jnz 0b\n\t"
+        "pmovmskb %xmm0, %eax",
+        "={eax},~{ecx},~{xmm0},~{xmm1},~{memory},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    return B.CreateZExt(B.CreateCall(asmTy, aes, {}, Name + ".raw"), i64,
+                        Name + ".digest");
+}
+
+Value *mixPowRuntimeWord(IRBuilder<> &B, Value *X, std::uint64_t Salt,
+                         const Twine &Name) {
+    auto *i64 = B.getInt64Ty();
+    X = B.CreateXor(X, ConstantInt::get(i64, Salt), Name + ".salt");
+    X = B.CreateAdd(
+        X, B.CreateOr(B.CreateShl(X, ConstantInt::get(i64, 17)),
+                      B.CreateLShr(X, ConstantInt::get(i64, 47)),
+                      Name + ".rot"),
+        Name + ".add");
+    X = B.CreateMul(X, ConstantInt::get(i64, (Salt ^ 0x9E3779B97F4A7C15ULL) |
+                                                 1ULL),
+                    Name + ".mul");
+    return B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(i64, 33)),
+                       Name + ".fold");
+}
+
+bool linuxPowNanosleepSyscall(const Triple &TT, std::uint32_t &Nanosleep) {
+    if (TT.getArch() != Triple::x86_64)
+        return false;
+    Nanosleep = 35;
+    return true;
+}
+
+struct PowSleepSample {
+    Value *bad = nullptr;
+    Value *word = nullptr;
+};
+
+PowSleepSample emitLinuxPowSleepCoherence(IRBuilder<> &B, Module &M,
+                                          const Triple &TT,
+                                          GlobalVariable *ConstKey,
+                                          const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    PowSleepSample out{ConstantInt::getFalse(ctx), ConstantInt::get(i64, 0)};
+    if (!TT.isOSLinux() || intPtrTy(M)->getBitWidth() != 64 ||
+        !useDirectLinuxSyscalls(M, TT))
+        return out;
+    std::uint32_t nanosleepNr = 0;
+    if (!linuxPowNanosleepSyscall(TT, nanosleepNr))
+        return out;
+
+    auto *tsTy = StructType::get(ctx, {i64, i64});
+    auto *req = B.CreateAlloca(tsTy, nullptr, Name + ".req");
+    B.CreateStore(ConstantInt::get(i64, 0), B.CreateStructGEP(tsTy, req, 0))
+        ->setVolatile(true);
+    Value *reqNsec =
+        decodePowConstant(B, ConstKey, 5000000ULL, 0xA3865C9217D0E4BFULL,
+                          Name + ".req.nsec");
+    B.CreateStore(reqNsec, B.CreateStructGEP(tsTy, req, 1))
+        ->setVolatile(true);
+
+    LinuxClockSample wall0 =
+        emitLinuxRawClockGettimeNanos(B, M, TT, 1, Name + ".wall.start");
+    Value *cycle0 = emitRdtscp(B, M);
+    Value *rc = emitLinuxSyscall(
+        B, M, TT, nanosleepNr,
+        {req, ConstantPointerNull::get(ptr)});
+    rc->setName(Name + ".nanosleep.rc");
+    Value *cycle1 = emitRdtscp(B, M);
+    LinuxClockSample wall1 =
+        emitLinuxRawClockGettimeNanos(B, M, TT, 1, Name + ".wall.end");
+
+    Value *wallDelta =
+        B.CreateSub(wall1.nanos, wall0.nanos, Name + ".wall.delta");
+    Value *cycleDelta =
+        B.CreateSub(cycle1, cycle0, Name + ".cycle.delta");
+    Value *wallReady =
+        B.CreateAnd(wall0.ready, wall1.ready, Name + ".wall.ready");
+    Value *clockOk = B.CreateAnd(
+        wallReady,
+        B.CreateAnd(B.CreateICmpUGT(wall1.nanos, wall0.nanos,
+                                    Name + ".wall.forward"),
+                    B.CreateICmpUGT(cycle1, cycle0, Name + ".cycle.forward"),
+                    Name + ".cycle.ready"),
+        Name + ".clock.ok");
+    Value *wallSkipLimit =
+        decodePowConstant(B, ConstKey, 1000000ULL, 0x5E4A9C2D71B603F8ULL,
+                          Name + ".wall.skip.limit");
+    Value *wallSleepFloor =
+        decodePowConstant(B, ConstKey, 3000000ULL, 0xC90E7A31D4B6825FULL,
+                          Name + ".wall.sleep.floor");
+    Value *cycleSkipLimit =
+        decodePowConstant(B, ConstKey, 100000ULL, 0x7D12C8E5A43B90F6ULL,
+                          Name + ".cycle.skip.limit");
+    Value *cycleSleepFloor =
+        decodePowConstant(B, ConstKey, 250000ULL, 0xE2B45F08C9176A3DULL,
+                          Name + ".cycle.sleep.floor");
+    Value *wallSkipped =
+        B.CreateICmpULT(wallDelta, wallSkipLimit, Name + ".wall.skipped");
+    Value *cycleSkipped =
+        B.CreateICmpULT(cycleDelta, cycleSkipLimit, Name + ".cycle.skipped");
+    Value *wallSlept =
+        B.CreateICmpUGT(wallDelta, wallSleepFloor, Name + ".wall.slept");
+    Value *cycleSlept =
+        B.CreateICmpUGT(cycleDelta, cycleSleepFloor, Name + ".cycle.slept");
+    Value *bothSkipped =
+        B.CreateAnd(wallSkipped, cycleSkipped, Name + ".both.skipped");
+    Value *crossMismatch = B.CreateOr(
+        B.CreateAnd(wallSkipped, cycleSlept, Name + ".wall.skip.cycle.slept"),
+        B.CreateAnd(wallSlept, cycleSkipped, Name + ".wall.slept.cycle.skip"),
+        Name + ".cross.mismatch");
+    Value *rcOk = B.CreateICmpEQ(rc, ConstantInt::get(ip, 0), Name + ".rc.ok");
+    out.bad = B.CreateAnd(
+        B.CreateAnd(rcOk, clockOk, Name + ".ready"),
+        B.CreateOr(bothSkipped, crossMismatch, Name + ".bad.raw"), Name + ".bad");
+    Value *raw = mixPowRuntimeWord(
+        B, B.CreateXor(wallDelta, cycleDelta, Name + ".word.delta"),
+        0xA9E316C45B72D08FULL, Name + ".word.mix");
+    out.word = B.CreateSelect(out.bad, raw, ConstantInt::get(i64, 0),
+                              Name + ".word");
+    return out;
+}
+
+Function *powResourceAsymmetryProbe(Module &M, ir::IRRandom &rng,
+                                    const Triple &TT) {
+    if (intPtrTy(M)->getBitWidth() != 64 || !isX86Target(TT))
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.pow"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.pow", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    const std::uint64_t seed = rng.next() | 1ULL;
+    GlobalVariable *constKey = powConstantKey(M, rng.next() | 1ULL);
+    auto derive = [seed](std::uint64_t tag) {
+        return powConstMix(seed ^ (0xD1B54A32D192ED03ULL * (tag + 1)));
+    };
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    AllocaInst *acc = B.CreateAlloca(i64, nullptr, "morok.antihook.pow.acc");
+    B.CreateStore(ConstantInt::get(i64, derive(0x10)), acc)->setVolatile(true);
+
+    Value *leaf1 = emitCpuid(B, M, ConstantInt::get(i32, 1),
+                             ConstantInt::get(i32, 0));
+    Value *ecx = cpuidReg(B, leaf1, 2, "morok.antihook.pow.cpuid.ecx");
+    Value *aesBit =
+        B.CreateAnd(ecx, ConstantInt::get(i32, 1u << 25),
+                    "morok.antihook.pow.cpuid.aes");
+    Value *hasAes =
+        B.CreateICmpNE(aesBit, ConstantInt::get(i32, 0),
+                       "morok.antihook.pow.aes.supported");
+
+    Value *scalarStart =
+        emitRdtscp(B, M);
+    emitPowScalarSpan(B, acc, derive(0x20), "morok.antihook.pow.scalar");
+    Value *scalarEnd =
+        emitRdtscp(B, M);
+    Value *scalarDelta =
+        B.CreateSub(scalarEnd, scalarStart,
+                    "morok.antihook.pow.scalar.delta");
+    Value *scalarClockOk =
+        B.CreateICmpUGT(scalarEnd, scalarStart,
+                        "morok.antihook.pow.scalar.clock.ok");
+
+    BasicBlock *preAesBB = B.GetInsertBlock();
+    auto *aesBB = BasicBlock::Create(ctx, "morok.antihook.pow.aes", fn);
+    auto *afterAesBB =
+        BasicBlock::Create(ctx, "morok.antihook.pow.after.aes", fn);
+    B.CreateCondBr(hasAes, aesBB, afterAesBB);
+
+    IRBuilder<> AB(aesBB);
+    Value *aesStart = emitRdtscp(AB, M);
+    Value *aesDigest = emitPowAesSpan(AB, M, "morok.antihook.pow.aes");
+    Value *aesEnd = emitRdtscp(AB, M);
+    Value *aesDelta =
+        AB.CreateSub(aesEnd, aesStart, "morok.antihook.pow.aes.delta");
+    Value *aesClockOk =
+        AB.CreateAnd(scalarClockOk,
+                     AB.CreateICmpUGT(aesEnd, aesStart,
+                                      "morok.antihook.pow.aes.clock.ok"),
+                     "morok.antihook.pow.clock.ok");
+    Value *floor =
+        decodePowConstant(AB, constKey, 50000000ULL,
+                          0x6BD81E5F0C24A973ULL,
+                          "morok.antihook.pow.aes.floor");
+    Value *scaled =
+        AB.CreateAdd(AB.CreateShl(scalarDelta, ConstantInt::get(i64, 12),
+                                  "morok.antihook.pow.scalar.scaled"),
+                     floor, "morok.antihook.pow.aes.limit");
+    Value *aesSlow =
+        AB.CreateICmpUGT(aesDelta, scaled, "morok.antihook.pow.aes.slow");
+    Value *powBad =
+        AB.CreateAnd(aesClockOk, aesSlow, "morok.antihook.pow.aes.bad");
+    Value *powRawWord = mixPowRuntimeWord(
+        AB,
+        AB.CreateXor(
+            aesDigest,
+            AB.CreateXor(AB.CreateMul(aesDelta,
+                                      ConstantInt::get(i64, derive(0x30) | 1ULL),
+                                      "morok.antihook.pow.aes.delta.mix"),
+                         scalarDelta,
+                         "morok.antihook.pow.aes.scalar.mix"),
+            "morok.antihook.pow.aes.word.raw"),
+        derive(0x31), "morok.antihook.pow.aes.word.mix");
+    Value *powWord =
+        AB.CreateSelect(powBad, powRawWord, ConstantInt::get(i64, 0),
+                        "morok.antihook.pow.aes.word");
+    AB.CreateBr(afterAesBB);
+
+    B.SetInsertPoint(afterAesBB);
+    auto *powFlagPhi =
+        B.CreatePHI(Type::getInt1Ty(ctx), 2, "morok.antihook.pow.flag");
+    powFlagPhi->addIncoming(ConstantInt::getFalse(ctx), preAesBB);
+    powFlagPhi->addIncoming(powBad, aesBB);
+    auto *powWordPhi =
+        B.CreatePHI(i64, 2, "morok.antihook.pow.word.phi");
+    powWordPhi->addIncoming(ConstantInt::get(i64, 0), preAesBB);
+    powWordPhi->addIncoming(powWord, aesBB);
+
+    PowSleepSample sleep =
+        emitLinuxPowSleepCoherence(B, M, TT, constKey,
+                                   "morok.antihook.pow.sleep");
+    Value *flags = B.CreateOr(
+        B.CreateZExt(sleep.bad, i64, "morok.antihook.pow.sleep.bit"),
+        B.CreateShl(B.CreateZExt(powFlagPhi, i64,
+                                  "morok.antihook.pow.aes.bit"),
+                    ConstantInt::get(i64, 1),
+                    "morok.antihook.pow.aes.bit.shift"),
+        "morok.antihook.pow.flags");
+    Value *active =
+        B.CreateICmpNE(flags, ConstantInt::get(i64, 0),
+                       "morok.antihook.pow.active");
+    Value *combined = B.CreateXor(
+        B.CreateXor(powWordPhi, sleep.word, "morok.antihook.pow.word.xor"),
+        B.CreateMul(flags, ConstantInt::get(i64, derive(0x40) | 1ULL),
+                    "morok.antihook.pow.flag.mix"),
+        "morok.antihook.pow.word.input");
+    Value *mixedWord =
+        mixPowRuntimeWord(B, combined, derive(0x41),
+                          "morok.antihook.pow.word.final");
+    Value *word =
+        B.CreateSelect(active, mixedWord, ConstantInt::get(i64, 0),
+                       "morok.antihook.pow.word");
+    Value *packed = B.CreateOr(
+        flags,
+        B.CreateShl(
+            B.CreateAnd(word, ConstantInt::get(i64, 0x00FFFFFFFFFFFFFFULL),
+                        "morok.antihook.pow.word.low"),
+            ConstantInt::get(i64, 8), "morok.antihook.pow.word.shift"),
+        "morok.antihook.pow.ret");
+    B.CreateRet(packed);
+    return fn;
+}
+
 void emitDbiOverheadLinearSpan(IRBuilder<> &B, AllocaInst *Acc,
                                std::uint64_t Salt, const Twine &Name) {
     auto *i64 = B.getInt64Ty();
@@ -31129,6 +31506,34 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         // consumed anti_debug seal (#147).
         foldFlag(B, state, changed, 0x8A6357D1C49E20BFULL,
                  "morok.negative.timing.changed");
+    }
+    if (Function *pow = powResourceAsymmetryProbe(M, rng, tt)) {
+        Value *sample = B.CreateCall(pow, {}, "morok.antihook.pow.sample");
+        Value *sleepBad = B.CreateICmpNE(
+            B.CreateAnd(sample, ConstantInt::get(B.getInt64Ty(), 1),
+                        "morok.antihook.pow.sleep.bits"),
+            ConstantInt::get(B.getInt64Ty(), 0),
+            "morok.corroborate.pow.sleep.changed");
+        Value *powBad = B.CreateICmpNE(
+            B.CreateAnd(sample, ConstantInt::get(B.getInt64Ty(), 2),
+                        "morok.antihook.pow.aes.bits"),
+            ConstantInt::get(B.getInt64Ty(), 0),
+            "morok.corroborate.pow.changed");
+        Value *word = B.CreateLShr(sample, ConstantInt::get(B.getInt64Ty(), 8),
+                                   "morok.antihook.pow.kdf.word");
+        addHardGateSignal(B, gate, sleepBad, 3, 0x4D8B23E6C197A50FULL,
+                          "morok.gate.pow.sleep");
+        addSoftGateSignal(B, gate, powBad, 1, 0xB9627A1C50E43D8FULL,
+                          "morok.gate.pow");
+        foldState(B, state, sample, 0x72D1A8C46E39B05FULL,
+                  "morok.antihook.pow");
+        foldEnforcedFlag(B, state, sleepBad, 0x2A94C73E15D608BFULL,
+                         "morok.antihook.pow.sleep.changed");
+        foldFlag(B, state, powBad, 0xE39A10C7B65D42F8ULL,
+                 "morok.antihook.pow.changed");
+        runtime_seal::foldWord(B, runtime_seal::kAntiDebugChannel, word,
+                               0x6C21F58A934DE0B7ULL,
+                               "morok.antihook.pow.kdf");
     }
     Function *stackCheck = stackOriginCheck(M);
     if (stackCheck) {

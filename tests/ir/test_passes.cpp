@@ -17005,6 +17005,8 @@ entry:
     REQUIRE(AntiDump != nullptr);
     Function *NegativeTiming = M->getFunction("morok.negative.timing");
     REQUIRE(NegativeTiming != nullptr);
+    Function *Pow = M->getFunction("morok.antihook.pow");
+    REQUIRE(Pow != nullptr);
     Function *Ctor = M->getFunction("morok.antihook");
     REQUIRE(Ctor != nullptr);
     GlobalVariable *Dynamic = M->getGlobalVariable("_DYNAMIC");
@@ -17061,6 +17063,8 @@ entry:
           nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.emu.sig.mask", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.emu.fault.addr", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.antihook.pow.const.key", true) !=
           nullptr);
     CHECK(Dynamic->hasExternalWeakLinkage());
     CHECK(hasGuardedDlsymBlock);
@@ -17604,6 +17608,27 @@ entry:
               *DbiOverhead, "morok.antihook.dbi.overhead.distribution") >= 1u);
     CHECK(countNamedInstructions(*NegativeTiming,
                                  "morok.negative.timing.slow") >= 1u);
+    CHECK(hasInlineAsmCall(*Pow));
+    CHECK(countCallsTo(*Pow, "morok.timing.tsc.read") >= 4u);
+    CHECK(countNamedInstructions(*Pow,
+                                 "morok.antihook.pow.scalar.delta") >= 1u);
+    CHECK(countNamedInstructions(*Pow,
+                                 "morok.antihook.pow.aes.supported") >= 1u);
+    CHECK(countNamedInstructions(*Pow, "morok.antihook.pow.aes.slow") >= 1u);
+    CHECK(countNamedInstructions(*Pow,
+                                 "morok.antihook.pow.sleep.wall.start.rc") >=
+          1u);
+    CHECK(countNamedInstructions(*Pow,
+                                 "morok.antihook.pow.sleep.nanosleep.rc") >=
+          1u);
+    CHECK(countNamedInstructions(*Pow,
+                                 "morok.antihook.pow.sleep.cross.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Pow, "morok.antihook.pow.word") >= 1u);
+    CHECK_FALSE(functionHasConstantInt(*Pow, 5000000u));
+    CHECK_FALSE(functionHasConstantInt(*Pow, 1000000u));
+    CHECK_FALSE(functionHasConstantInt(*Pow, 3000000u));
+    CHECK_FALSE(functionHasConstantInt(*Pow, 50000000u));
     CHECK(countNamedInstructions(*Ctor, "morok.antihook.dynamic.present") >=
           1u);
     CHECK(countNamedInstructions(*Ctor, "morok.antihook.hooked") >= 1u);
@@ -17616,6 +17641,8 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.gate.negative.timing.soft") >=
           1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.dbi.overhead.soft") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.pow.sleep.hard") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.pow.soft") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.dbi.jit.soft") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.loader.bias.soft") >= 1u);
     CHECK(countNamedInstructions(*Ctor,
@@ -17655,6 +17682,20 @@ entry:
     REQUIRE(NegativeTimingChanged != nullptr);
     CHECK_FALSE(valueFeedsNamedInstruction(NegativeTimingChanged,
                                            "morok.seal.fold.anti_debug"));
+    Instruction *PowSleepChanged = findNamedInstruction(
+        *Ctor, "morok.corroborate.pow.sleep.changed");
+    REQUIRE(PowSleepChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(PowSleepChanged,
+                                     "morok.seal.fold.anti_debug"));
+    Instruction *PowChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.pow.changed");
+    REQUIRE(PowChanged != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(PowChanged,
+                                           "morok.seal.fold.anti_debug"));
+    Instruction *PowKdfWord =
+        findNamedInstruction(*Ctor, "morok.antihook.pow.kdf.word");
+    REQUIRE(PowKdfWord != nullptr);
+    CHECK(valueFeedsNamedInstruction(PowKdfWord, "morok.antihook.pow.kdf"));
     CHECK(countCallsTo(*Ctor, "morok.antihook.loader.auxv") == 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.antihook.loader.bias.byte") >=
           1u);
