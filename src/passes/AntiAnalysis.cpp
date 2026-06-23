@@ -33775,7 +33775,7 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         Value *changed =
             B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0),
                            "morok.corroborate.dbi.smc.changed");
-        addHardGateSignal(B, gate, changed, 3, 0x7E40B2C95D18A36FULL,
+        addSoftGateSignal(B, gate, changed, 1, 0x7E40B2C95D18A36FULL,
                           "morok.gate.dbi.smc");
         foldState(B, state, diff, 0xE62D41B98A3F570CULL,
                   "morok.antihook.dbi.smc");

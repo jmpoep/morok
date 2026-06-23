@@ -17642,6 +17642,10 @@ entry:
     REQUIRE(SmcChanged != nullptr);
     CHECK_FALSE(valueFeedsNamedInstruction(SmcChanged,
                                            "morok.seal.fold.anti_debug"));
+    CHECK(valueFeedsNamedInstruction(SmcChanged,
+                                     "morok.gate.dbi.smc.soft.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(SmcChanged,
+                                           "morok.gate.dbi.smc.hard.next"));
     CHECK(countNamedInstructions(*Smc, "morok.antihook.dbi.smc.gate.arm") >=
           1u);
     std::size_t smcGateStores = 0;
@@ -18557,6 +18561,8 @@ entry:
 
     Function *Ctor = M->getFunction("morok.antihook");
     REQUIRE(Ctor != nullptr);
+    Function *Smc = M->getFunction("morok.antihook.dbi.smc");
+    REQUIRE(Smc != nullptr);
     CHECK(M->getFunction("morok.antihook.schro") != nullptr);
     CHECK(M->getFunction("morok.antihook.schro.handler") != nullptr);
     CHECK(M->getFunction("morok.negative.timing") != nullptr);
@@ -18564,6 +18570,13 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.gate.dbi.overhead.soft") == 0u);
     CHECK(countNamedInstructions(
               *Ctor, "morok.corroborate.dbi.overhead.changed") == 0u);
+    Instruction *SmcChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.dbi.smc.changed");
+    REQUIRE(SmcChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(SmcChanged,
+                                     "morok.gate.dbi.smc.soft.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(SmcChanged,
+                                           "morok.gate.dbi.smc.hard.next"));
     CHECK(countNamedInstructions(*Ctor, "morok.antihook.stub.getpid.hit") ==
           0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
