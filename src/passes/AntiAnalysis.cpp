@@ -4594,6 +4594,53 @@ GlobalVariable *linuxSigtrapRoutingOldAction(Module &M) {
     return gv;
 }
 
+GlobalVariable *linuxSigtrapRoutingInFlight(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.antidbg.sigtrap.inflight",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i32, 0), "morok.antidbg.sigtrap.inflight");
+    gv->setAlignment(Align(4));
+    gv->setDSOLocal(true);
+    return gv;
+}
+
+GlobalVariable *linuxSigtrapRoutingContextStorage(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.antidbg.sigtrap.context.storage",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    auto *storageTy = ArrayType::get(i8, 24);
+    auto *gv = new GlobalVariable(
+        M, storageTy, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        Constant::getNullValue(storageTy),
+        "morok.antidbg.sigtrap.context.storage");
+    gv->setAlignment(Align(8));
+    gv->setDSOLocal(true);
+    return gv;
+}
+
+GlobalVariable *linuxSigtrapRoutingOldActionStorage(Module &M,
+                                                    std::uint64_t ActionSize) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.antidbg.sigtrap.old_action.storage",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    auto *storageTy = ArrayType::get(i8, ActionSize);
+    auto *gv = new GlobalVariable(
+        M, storageTy, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        Constant::getNullValue(storageTy),
+        "morok.antidbg.sigtrap.old_action.storage");
+    gv->setAlignment(Align(8));
+    gv->setDSOLocal(true);
+    return gv;
+}
+
 struct LinuxSigtrapRoutingContextLayout {
     std::uint64_t pcSlotOffset = 0;
 };
@@ -4648,6 +4695,11 @@ Function *linuxSigtrapRoutingHandler(Module &M,
     auto *retBB = BasicBlock::Create(ctx, "ret", fn);
 
     IRBuilder<> B(entry);
+    auto *entered = B.CreateAtomicRMW(
+        AtomicRMWInst::Add, linuxSigtrapRoutingInFlight(M),
+        ConstantInt::get(i32, 1), Align(4), AtomicOrdering::AcquireRelease);
+    entered->setVolatile(true);
+    entered->setName("morok.antidbg.sigtrap.inflight.enter");
     Value *sigOk =
         B.CreateICmpEQ(sig, ConstantInt::getSigned(i32, 5),
                        "morok.antidbg.sigtrap.sig.match");
@@ -4737,11 +4789,17 @@ Function *linuxSigtrapRoutingHandler(Module &M,
     COB.CreateBr(retBB);
 
     IRBuilder<> RB(retBB);
+    auto *left = RB.CreateAtomicRMW(AtomicRMWInst::Sub,
+                                   linuxSigtrapRoutingInFlight(M),
+                                   ConstantInt::get(i32, 1), Align(4),
+                                   AtomicOrdering::Release);
+    left->setVolatile(true);
+    left->setName("morok.antidbg.sigtrap.inflight.leave");
     RB.CreateRetVoid();
     return fn;
 }
 
-void zeroRawSigaction(IRBuilder<> &B, Module &M, AllocaInst *Action,
+void zeroRawSigaction(IRBuilder<> &B, Module &M, Value *Action,
                       const LinuxRawSigactionLayout &Layout,
                       const Twine &Name) {
     auto *i8 = Type::getInt8Ty(M.getContext());
@@ -4750,7 +4808,7 @@ void zeroRawSigaction(IRBuilder<> &B, Module &M, AllocaInst *Action,
                       gepI8(B, M, Action, constIp(M, i), Name + ".zero"));
 }
 
-void storeRawSiginfoAction(IRBuilder<> &B, Module &M, AllocaInst *Action,
+void storeRawSiginfoAction(IRBuilder<> &B, Module &M, Value *Action,
                            Function *Handler,
                            const LinuxRawSigactionLayout &Layout,
                            std::uint64_t ExtraFlags, const Twine &Name) {
@@ -4882,7 +4940,10 @@ Function *linuxSigtrapRoutingProbe(Module &M, ir::IRRandom &rng,
     auto *restoreOldBB = BasicBlock::Create(ctx, "restore.old", fn);
     auto *releaseBitsBB = BasicBlock::Create(ctx, "release.bits", fn);
     auto *release0BB = BasicBlock::Create(ctx, "release0", fn);
+    auto *quiesceBitsBB = BasicBlock::Create(ctx, "quiesce.bits", fn);
+    auto *quiesce0BB = BasicBlock::Create(ctx, "quiesce0", fn);
     auto *retInstalledBB = BasicBlock::Create(ctx, "ret.installed", fn);
+    auto *retReleased0BB = BasicBlock::Create(ctx, "ret0.released", fn);
     auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
 
     IRBuilder<> GB(entry);
@@ -4906,36 +4967,43 @@ Function *linuxSigtrapRoutingProbe(Module &M, ir::IRRandom &rng,
 
     IRBuilder<> B(installBB);
     auto *actionTy = ArrayType::get(i8, rawLayout.actionSize);
-    auto *ctxTy = ArrayType::get(i8, 24);
     AllocaInst *action =
         B.CreateAlloca(actionTy, nullptr, "morok.antidbg.sigtrap.sa");
-    AllocaInst *oldAction =
-        B.CreateAlloca(actionTy, nullptr, "morok.antidbg.sigtrap.old.sa");
     AllocaInst *curAction =
         B.CreateAlloca(actionTy, nullptr, "morok.antidbg.sigtrap.cur.sa");
-    AllocaInst *routingCtx =
-        B.CreateAlloca(ctxTy, nullptr, "morok.antidbg.sigtrap.ctx");
+    GlobalVariable *oldActionStorage =
+        linuxSigtrapRoutingOldActionStorage(M, rawLayout.actionSize);
+    GlobalVariable *routingCtxStorage = linuxSigtrapRoutingContextStorage(M);
     action->setAlignment(Align(8));
-    oldAction->setAlignment(Align(8));
     curAction->setAlignment(Align(8));
-    routingCtx->setAlignment(Align(8));
-    storeAt(B, M, routingCtx, 0ULL, ConstantInt::get(i64, 0),
+    storeAt(B, M, routingCtxStorage, 0ULL, ConstantInt::get(i64, 0),
             "morok.antidbg.sigtrap.ctx.token.clear");
-    storeAt(B, M, routingCtx, 8ULL, ConstantInt::get(i64, 0),
+    storeAt(B, M, routingCtxStorage, 8ULL, ConstantInt::get(i64, 0),
             "morok.antidbg.sigtrap.ctx.sentinel.clear");
-    storeAt(B, M, routingCtx, 16ULL, ConstantInt::get(ip, 0),
+    storeAt(B, M, routingCtxStorage, 16ULL, ConstantInt::get(ip, 0),
             "morok.antidbg.sigtrap.ctx.expected.clear");
-    zeroRawSigaction(B, M, oldAction, rawLayout,
+    zeroRawSigaction(B, M, oldActionStorage, rawLayout,
                      "morok.antidbg.sigtrap.old.sa");
     zeroRawSigaction(B, M, curAction, rawLayout,
                      "morok.antidbg.sigtrap.cur.sa");
-    auto *contextStore = B.CreateStore(routingCtx, linuxSigtrapRoutingContext(M));
+    auto *contextStore =
+        B.CreateStore(routingCtxStorage, linuxSigtrapRoutingContext(M));
     contextStore->setVolatile(true);
     contextStore->setAlignment(Align(8));
     auto *oldActionStore =
-        B.CreateStore(oldAction, linuxSigtrapRoutingOldAction(M));
+        B.CreateStore(oldActionStorage, linuxSigtrapRoutingOldAction(M));
     oldActionStore->setVolatile(true);
     oldActionStore->setAlignment(Align(8));
+    Value *routingCtx =
+        B.CreateLoad(ptr, linuxSigtrapRoutingContext(M),
+                     "morok.antidbg.sigtrap.context.local");
+    cast<LoadInst>(routingCtx)->setVolatile(true);
+    cast<LoadInst>(routingCtx)->setAlignment(Align(8));
+    Value *oldAction =
+        B.CreateLoad(ptr, linuxSigtrapRoutingOldAction(M),
+                     "morok.antidbg.sigtrap.old_action.local");
+    cast<LoadInst>(oldAction)->setVolatile(true);
+    cast<LoadInst>(oldAction)->setAlignment(Align(8));
     storeRawSiginfoAction(B, M, action, handler, rawLayout, 0,
                           "morok.antidbg.sigtrap.sa");
     if (rawLayout.needsRestorer)
@@ -5026,23 +5094,53 @@ Function *linuxSigtrapRoutingProbe(Module &M, ir::IRRandom &rng,
             ConstantPointerNull::get(ptr), linuxSigtrapRoutingOldAction(M));
         oldActionClear->setVolatile(true);
         oldActionClear->setAlignment(Align(8));
-        auto *releaseBusy = Builder.CreateStore(ConstantInt::get(i32, 0),
-                                                linuxSigtrapRoutingBusy(M));
-        releaseBusy->setVolatile(true);
-        releaseBusy->setAtomic(AtomicOrdering::Release);
-        releaseBusy->setAlignment(Align(4));
+    };
+
+    auto releaseBusy = [&](IRBuilder<> &Builder) {
+        auto *releaseBusyStore = Builder.CreateStore(
+            ConstantInt::get(i32, 0), linuxSigtrapRoutingBusy(M));
+        releaseBusyStore->setVolatile(true);
+        releaseBusyStore->setAtomic(AtomicOrdering::Release);
+        releaseBusyStore->setAlignment(Align(4));
     };
 
     IRBuilder<> RBB(releaseBitsBB);
     clearRoutingGlobals(RBB);
-    RBB.CreateBr(retInstalledBB);
+    RBB.CreateBr(quiesceBitsBB);
+
+    IRBuilder<> QBB(quiesceBitsBB);
+    auto *inFlight = QBB.CreateLoad(i32, linuxSigtrapRoutingInFlight(M),
+                                    "morok.antidbg.sigtrap.inflight.wait");
+    inFlight->setVolatile(true);
+    inFlight->setAtomic(AtomicOrdering::Acquire);
+    inFlight->setAlignment(Align(4));
+    QBB.CreateCondBr(
+        QBB.CreateICmpEQ(inFlight, ConstantInt::get(i32, 0),
+                         "morok.antidbg.sigtrap.inflight.idle"),
+        retInstalledBB, quiesceBitsBB);
 
     IRBuilder<> R0B(release0BB);
     clearRoutingGlobals(R0B);
-    R0B.CreateBr(ret0BB);
+    R0B.CreateBr(quiesce0BB);
+
+    IRBuilder<> Q0B(quiesce0BB);
+    auto *inFlight0 = Q0B.CreateLoad(i32, linuxSigtrapRoutingInFlight(M),
+                                     "morok.antidbg.sigtrap.inflight.wait0");
+    inFlight0->setVolatile(true);
+    inFlight0->setAtomic(AtomicOrdering::Acquire);
+    inFlight0->setAlignment(Align(4));
+    Q0B.CreateCondBr(
+        Q0B.CreateICmpEQ(inFlight0, ConstantInt::get(i32, 0),
+                         "morok.antidbg.sigtrap.inflight.idle0"),
+        retReleased0BB, quiesce0BB);
 
     IRBuilder<> RIB(retInstalledBB);
+    releaseBusy(RIB);
     RIB.CreateRet(bits);
+
+    IRBuilder<> R0Rel(retReleased0BB);
+    releaseBusy(R0Rel);
+    R0Rel.CreateRet(ConstantInt::get(i32, 0));
 
     IRBuilder<> R0(ret0BB);
     R0.CreateRet(ConstantInt::get(i32, 0));

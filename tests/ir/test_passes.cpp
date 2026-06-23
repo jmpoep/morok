@@ -792,6 +792,39 @@ bool hasVolatileAtomicXchgTo(Function &F, GlobalVariable *GV,
     return false;
 }
 
+std::size_t countVolatileAtomicRMWTo(Function &F, GlobalVariable *GV,
+                                     AtomicRMWInst::BinOp Op,
+                                     AtomicOrdering Ordering,
+                                     Align Alignment) {
+    std::size_t n = 0;
+    for (Instruction &I : instructions(F)) {
+        auto *RMW = dyn_cast<AtomicRMWInst>(&I);
+        if (!RMW)
+            continue;
+        if (RMW->isVolatile() && RMW->getOperation() == Op &&
+            RMW->getOrdering() == Ordering && RMW->getAlign() == Alignment &&
+            pointerReferencesGlobal(RMW->getPointerOperand(), GV))
+            ++n;
+    }
+    return n;
+}
+
+std::size_t countVolatileAtomicLoadsFrom(Function &F, GlobalVariable *GV,
+                                         AtomicOrdering Ordering,
+                                         Align Alignment) {
+    std::size_t n = 0;
+    for (Instruction &I : instructions(F)) {
+        auto *LI = dyn_cast<LoadInst>(&I);
+        if (!LI)
+            continue;
+        if (LI->isVolatile() && LI->isAtomic() &&
+            LI->getOrdering() == Ordering && LI->getAlign() == Alignment &&
+            pointerReferencesGlobal(LI->getPointerOperand(), GV))
+            ++n;
+    }
+    return n;
+}
+
 std::size_t countVolatileAtomicStoresTo(Function &F, GlobalVariable *GV,
                                         AtomicOrdering Ordering,
                                         Align Alignment) {
@@ -19233,6 +19266,12 @@ entry:
           nullptr);
     CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.old_action", true) !=
           nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.inflight", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.context.storage", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.old_action.storage",
+                               true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antidbg.faultcf.enabled", true) !=
           nullptr);
     CHECK(M->getGlobalVariable("morok.seal.root.tracer", true) != nullptr);
@@ -19754,12 +19793,38 @@ entry:
     GlobalVariable *SigtrapBusy =
         M->getGlobalVariable("morok.antidbg.sigtrap.busy", true);
     REQUIRE(SigtrapBusy != nullptr);
+    GlobalVariable *SigtrapInflight =
+        M->getGlobalVariable("morok.antidbg.sigtrap.inflight", true);
+    REQUIRE(SigtrapInflight != nullptr);
+    CHECK(countNamedAllocas(*Sigtrap, "morok.antidbg.sigtrap.ctx") == 0u);
+    CHECK(countNamedAllocas(*Sigtrap, "morok.antidbg.sigtrap.old.sa") == 0u);
+    CHECK(storesNamedValueToGlobalPrefix(
+        *Sigtrap, "morok.antidbg.sigtrap.context",
+        "morok.antidbg.sigtrap.context.storage"));
+    CHECK(storesNamedValueToGlobalPrefix(
+        *Sigtrap, "morok.antidbg.sigtrap.old_action",
+        "morok.antidbg.sigtrap.old_action.storage"));
+    CHECK(namedInstructionDependsOnGlobalPrefix(
+        *Sigtrap, "morok.antidbg.sigtrap.expected.slot",
+        "morok.antidbg.sigtrap.context"));
     CHECK(hasVolatileAtomicXchgTo(*Sigtrap, SigtrapBusy,
                                   AtomicOrdering::AcquireRelease, Align(4)));
     CHECK(countVolatileAtomicStoresTo(*Sigtrap, SigtrapBusy,
                                       AtomicOrdering::Release, Align(4)) >= 2u);
+    CHECK(countVolatileAtomicLoadsFrom(*Sigtrap, SigtrapInflight,
+                                       AtomicOrdering::Acquire, Align(4)) >=
+          2u);
+    CHECK(countNamedInstructions(*Sigtrap,
+                                 "morok.antidbg.sigtrap.inflight.idle") >= 1u);
     CHECK(countNamedInstructions(
               *SigtrapHandler, "morok.antidbg.sigtrap.sig.match") >= 1u);
+    CHECK(countVolatileAtomicRMWTo(*SigtrapHandler, SigtrapInflight,
+                                   AtomicRMWInst::Add,
+                                   AtomicOrdering::AcquireRelease,
+                                   Align(4)) >= 1u);
+    CHECK(countVolatileAtomicRMWTo(*SigtrapHandler, SigtrapInflight,
+                                   AtomicRMWInst::Sub, AtomicOrdering::Release,
+                                   Align(4)) >= 1u);
     CHECK(countNamedInstructions(*SigtrapHandler,
                                  "morok.antidbg.sigtrap.context.v") >= 1u);
     CHECK(countNamedInstructions(*SigtrapHandler,
@@ -19893,6 +19958,12 @@ define i32 @main() { ret i32 0 }
           nullptr);
     CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.old_action", true) !=
           nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.inflight", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.context.storage", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.old_action.storage",
+                               true) != nullptr);
     CHECK(maxStaticAllocaArrayElements(*Sigtrap,
                                        "morok.antidbg.sigtrap.sa") == 20u);
     CHECK(hasInlineAsmCall(*Sigtrap));
@@ -19909,6 +19980,21 @@ define i32 @main() { ret i32 0 }
                                   AtomicOrdering::AcquireRelease, Align(4)));
     CHECK(countVolatileAtomicStoresTo(*Sigtrap, SigtrapBusy,
                                       AtomicOrdering::Release, Align(4)) >= 2u);
+    GlobalVariable *SigtrapInflight =
+        M->getGlobalVariable("morok.antidbg.sigtrap.inflight", true);
+    REQUIRE(SigtrapInflight != nullptr);
+    CHECK(countNamedAllocas(*Sigtrap, "morok.antidbg.sigtrap.ctx") == 0u);
+    CHECK(countNamedAllocas(*Sigtrap, "morok.antidbg.sigtrap.old.sa") == 0u);
+    CHECK(countVolatileAtomicLoadsFrom(*Sigtrap, SigtrapInflight,
+                                       AtomicOrdering::Acquire, Align(4)) >=
+          2u);
+    CHECK(countVolatileAtomicRMWTo(*SigtrapHandler, SigtrapInflight,
+                                   AtomicRMWInst::Add,
+                                   AtomicOrdering::AcquireRelease,
+                                   Align(4)) >= 1u);
+    CHECK(countVolatileAtomicRMWTo(*SigtrapHandler, SigtrapInflight,
+                                   AtomicRMWInst::Sub, AtomicOrdering::Release,
+                                   Align(4)) >= 1u);
     CHECK(countNamedInstructions(*Sigtrap,
                                  "morok.antidbg.sigtrap.rt_sigaction") >= 1u);
     CHECK(countNamedInstructions(
