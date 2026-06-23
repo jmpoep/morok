@@ -12940,6 +12940,23 @@ GlobalVariable *emuOldIllActionGlobal(Module &M) {
     return emuOldActionGlobal(M, "morok.antihook.emu.old.ill.action");
 }
 
+GlobalVariable *fsGsSignalMaskGlobal(Module &M) {
+    if (auto *existing = M.getGlobalVariable("morok.antihook.fsgs.sig.mask",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i32, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i32, 0),
+                                  "morok.antihook.fsgs.sig.mask");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *fsGsOldIllActionGlobal(Module &M) {
+    return emuOldActionGlobal(M, "morok.antihook.fsgs.old.ill.action");
+}
+
 void storeEmuSiginfoAction(IRBuilder<> &B, Module &M, AllocaInst *Action,
                            Function *Handler, const Twine &Prefix) {
     constexpr std::uint64_t kLinuxX64SigactionSize = 152;
@@ -13099,6 +13116,109 @@ Function *emuLinuxX86SignalHandler(Module &M) {
                   {sig, oldAction, ConstantPointerNull::get(ptr)},
                   "morok.antihook.emu.sig.chain.restore");
     XB.CreateBr(doneBB);
+
+    IRBuilder<> RB(doneBB);
+    RB.CreateRetVoid();
+    return fn;
+}
+
+Function *fsGsLinuxX86SignalHandler(Module &M) {
+    if (Function *existing = M.getFunction("morok.antihook.fsgs.sig.handler"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(
+        FunctionType::get(Type::getVoidTy(ctx), {i32, ptr, ptr}, false),
+        GlobalValue::PrivateLinkage, "morok.antihook.fsgs.sig.handler", &M);
+    fn->setDSOLocal(true);
+    Argument *sig = fn->getArg(0);
+    sig->setName("sig");
+    fn->getArg(1)->setName("info");
+    Argument *uctx = fn->getArg(2);
+    uctx->setName("uctx");
+
+    constexpr std::uint64_t kLinuxX64UcontextRipOffset = 168;
+    constexpr std::uint32_t kFsFaultBit = 1u;
+    constexpr std::uint32_t kGsFaultBit = 2u;
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *decodeBB = BasicBlock::Create(ctx, "decode", fn);
+    auto *knownBB = BasicBlock::Create(ctx, "known", fn);
+    auto *unknownBB = BasicBlock::Create(ctx, "unknown", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "done", fn);
+
+    IRBuilder<> B(entry);
+    B.CreateCondBr(B.CreateICmpNE(uctx, ConstantPointerNull::get(ptr)),
+                   decodeBB, doneBB);
+
+    IRBuilder<> DB(decodeBB);
+    Value *ripSlot = gepI8(DB, M, uctx, constIp(M, kLinuxX64UcontextRipOffset),
+                           "morok.antihook.fsgs.sig.rip.slot");
+    auto *rip = DB.CreateLoad(ip, ripSlot, "morok.antihook.fsgs.sig.rip");
+    rip->setAlignment(Align(1));
+    Value *pc = DB.CreateIntToPtr(rip, ptr, "morok.antihook.fsgs.sig.pc");
+    auto loadOp = [&](std::uint64_t Offset, const Twine &Name) {
+        auto *op = DB.CreateLoad(
+            i8, gepI8(DB, M, pc, constIp(M, Offset), Name + ".ptr"), Name);
+        op->setVolatile(true);
+        op->setAlignment(Align(1));
+        return op;
+    };
+    auto *op0 = loadOp(0, "morok.antihook.fsgs.sig.op0");
+    auto *op1 = loadOp(1, "morok.antihook.fsgs.sig.op1");
+    auto *op2 = loadOp(2, "morok.antihook.fsgs.sig.op2");
+    auto *op3 = loadOp(3, "morok.antihook.fsgs.sig.op3");
+    auto *op4 = loadOp(4, "morok.antihook.fsgs.sig.op4");
+    Value *isIll = DB.CreateICmpEQ(sig, ConstantInt::get(i32, 4),
+                                   "morok.antihook.fsgs.sig.ill");
+    Value *prefix = DB.CreateAnd(
+        DB.CreateAnd(DB.CreateICmpEQ(op0, ConstantInt::get(i8, 0xf3)),
+                     DB.CreateICmpEQ(op1, ConstantInt::get(i8, 0x48))),
+        DB.CreateAnd(DB.CreateICmpEQ(op2, ConstantInt::get(i8, 0x0f)),
+                     DB.CreateICmpEQ(op3, ConstantInt::get(i8, 0xae))),
+        "morok.antihook.fsgs.sig.prefix");
+    Value *fsHit = DB.CreateAnd(
+        isIll, DB.CreateAnd(prefix,
+                            DB.CreateICmpEQ(op4, ConstantInt::get(i8, 0xc0))),
+        "morok.antihook.fsgs.sig.rdfsbase");
+    Value *gsHit = DB.CreateAnd(
+        isIll, DB.CreateAnd(prefix,
+                            DB.CreateICmpEQ(op4, ConstantInt::get(i8, 0xc8))),
+        "morok.antihook.fsgs.sig.rdgsbase");
+    Value *bit = DB.CreateSelect(
+        fsHit, ConstantInt::get(i32, kFsFaultBit),
+        DB.CreateSelect(gsHit, ConstantInt::get(i32, kGsFaultBit),
+                        ConstantInt::get(i32, 0)),
+        "morok.antihook.fsgs.sig.bit");
+    auto *oldMask = DB.CreateLoad(i32, fsGsSignalMaskGlobal(M),
+                                  "morok.antihook.fsgs.sig.mask.old");
+    oldMask->setVolatile(true);
+    DB.CreateStore(DB.CreateOr(oldMask, bit,
+                               "morok.antihook.fsgs.sig.mask.next"),
+                   fsGsSignalMaskGlobal(M))
+        ->setVolatile(true);
+    DB.CreateCondBr(DB.CreateICmpNE(bit, ConstantInt::get(i32, 0),
+                                    "morok.antihook.fsgs.sig.known"),
+                    knownBB, unknownBB);
+
+    IRBuilder<> KB(knownBB);
+    auto *ripStore =
+        KB.CreateStore(KB.CreateAdd(rip, ConstantInt::get(ip, 5),
+                                    "morok.antihook.fsgs.sig.rip.next"),
+                       ripSlot);
+    ripStore->setAlignment(Align(1));
+    KB.CreateBr(doneBB);
+
+    IRBuilder<> UB(unknownBB);
+    UB.CreateCall(sigactionDecl(M),
+                  {sig, fsGsOldIllActionGlobal(M),
+                   ConstantPointerNull::get(ptr)},
+                  "morok.antihook.fsgs.sig.chain.restore");
+    UB.CreateBr(doneBB);
 
     IRBuilder<> RB(doneBB);
     RB.CreateRetVoid();
@@ -13330,6 +13450,190 @@ void emitLinuxX86SemanticGapProbe(IRBuilder<> &B, Module &M, const Triple &TT,
     UB.CreateBr(doneBB);
 
     B.SetInsertPoint(doneBB);
+}
+
+Value *emitFsGsBaseRead(IRBuilder<> &B, bool Gs, const Twine &Name) {
+    auto *i64 = B.getInt64Ty();
+    auto *asmTy = FunctionType::get(i64, false);
+    InlineAsm *IA = InlineAsm::get(
+        asmTy,
+        Gs ? "xorq %rax, %rax\n\t.byte 0xf3,0x48,0x0f,0xae,0xc8"
+           : "xorq %rax, %rax\n\t.byte 0xf3,0x48,0x0f,0xae,0xc0",
+        "={rax},~{memory},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    return B.CreateCall(asmTy, IA, {}, Name);
+}
+
+Value *emitWindowsGsSelfRead(IRBuilder<> &B, const Twine &Name) {
+    auto *i64 = B.getInt64Ty();
+    auto *asmTy = FunctionType::get(i64, false);
+    InlineAsm *IA =
+        InlineAsm::get(asmTy, "movq %gs:0x30, $0",
+                       "=r,~{memory},~{dirflag},~{fpsr},~{flags}",
+                       /*hasSideEffects=*/true);
+    return B.CreateCall(asmTy, IA, {}, Name);
+}
+
+Function *fsGsBaseGapProbe(Module &M, const Triple &TT) {
+    if (TT.getArch() != Triple::x86_64)
+        return nullptr;
+    if (!TT.isOSLinux() && !TT.isOSWindows())
+        return nullptr;
+    if (TT.isOSLinux() && !useDirectLinuxSyscalls(M, TT))
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.fsgs.x86"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.fsgs.x86", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->addFnAttr(Attribute::NoRedZone);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *probeBB = BasicBlock::Create(ctx, "morok.antihook.fsgs.probe", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "morok.antihook.fsgs.done", fn);
+    IRBuilder<> B(entry);
+    AllocaInst *diff = B.CreateAlloca(i64, nullptr, "morok.antihook.fsgs.diff");
+    B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
+
+    Value *leaf7 = emitCpuid(B, M, ConstantInt::get(i32, 7),
+                             ConstantInt::get(i32, 0));
+    Value *ebx7 = cpuidReg(B, leaf7, 1, "morok.antihook.fsgs.cpuid.ebx7");
+    Value *supported = B.CreateICmpNE(
+        B.CreateAnd(ebx7, ConstantInt::get(i32, 1),
+                    "morok.antihook.fsgs.cpuid.fsgsbase"),
+        ConstantInt::get(i32, 0), "morok.antihook.fsgs.supported");
+
+    if (TT.isOSWindows()) {
+        B.CreateCondBr(supported, probeBB, doneBB);
+        IRBuilder<> WB(probeBB);
+        Value *gsBase = emitFsGsBaseRead(WB, /*Gs=*/true,
+                                         "morok.antihook.fsgs.win.rdgsbase");
+        Value *gsSelf =
+            emitWindowsGsSelfRead(WB, "morok.antihook.fsgs.win.gs.self");
+        Value *ready =
+            WB.CreateICmpNE(gsSelf, ConstantInt::get(i64, 0),
+                            "morok.antihook.fsgs.win.gs.ready");
+        Value *mismatch = WB.CreateAnd(
+            ready,
+            WB.CreateICmpNE(gsBase, gsSelf,
+                            "morok.antihook.fsgs.win.gs.base.diff"),
+            "morok.antihook.fsgs.win.gs.mismatch");
+        incrementDiff(WB, diff, mismatch, "morok.antihook.fsgs.win.gs");
+        WB.CreateBr(doneBB);
+
+        IRBuilder<> DB(doneBB);
+        emitRetDiff(DB, diff);
+        return fn;
+    }
+
+    auto *installBB =
+        BasicBlock::Create(ctx, "morok.antihook.fsgs.sig.install", fn);
+    auto *restoreBB =
+        BasicBlock::Create(ctx, "morok.antihook.fsgs.sig.restore", fn);
+    B.CreateCondBr(supported, installBB, doneBB);
+
+    IRBuilder<> IB(installBB);
+    constexpr std::uint64_t kLinuxX64SigactionSize = 152;
+    constexpr std::uint32_t kArchPrctl = 158;
+    constexpr std::uint64_t kArchGetFs = 0x1003;
+    constexpr std::uint64_t kArchGetGs = 0x1004;
+    constexpr std::uint32_t kFsFaultBit = 1u;
+    constexpr std::uint32_t kGsFaultBit = 2u;
+    IB.CreateStore(ConstantInt::get(i32, 0), fsGsSignalMaskGlobal(M))
+        ->setVolatile(true);
+    Function *handler = fsGsLinuxX86SignalHandler(M);
+    auto *actionTy = ArrayType::get(i8, kLinuxX64SigactionSize);
+    AllocaInst *action =
+        IB.CreateAlloca(actionTy, nullptr, "morok.antihook.fsgs.sa");
+    GlobalVariable *oldIll = fsGsOldIllActionGlobal(M);
+    storeEmuSiginfoAction(IB, M, action, handler, "morok.antihook.fsgs.sa");
+    FunctionCallee sigactionFn = sigactionDecl(M);
+    Value *illRc =
+        IB.CreateCall(sigactionFn, {ConstantInt::get(i32, 4), action, oldIll},
+                      "morok.antihook.fsgs.sigaction.ill");
+    IB.CreateCondBr(IB.CreateICmpEQ(illRc, ConstantInt::get(i32, 0),
+                                    "morok.antihook.fsgs.sigaction.ill.ok"),
+                    probeBB, doneBB);
+
+    IRBuilder<> PB(probeBB);
+    AllocaInst *fsSlot =
+        PB.CreateAlloca(ip, nullptr, "morok.antihook.fsgs.fs.slot");
+    AllocaInst *gsSlot =
+        PB.CreateAlloca(ip, nullptr, "morok.antihook.fsgs.gs.slot");
+    PB.CreateStore(ConstantInt::get(ip, 0), fsSlot)->setVolatile(true);
+    PB.CreateStore(ConstantInt::get(ip, 0), gsSlot)->setVolatile(true);
+    Value *fsBase =
+        emitFsGsBaseRead(PB, /*Gs=*/false, "morok.antihook.fsgs.rdfsbase");
+    Value *gsBase =
+        emitFsGsBaseRead(PB, /*Gs=*/true, "morok.antihook.fsgs.rdgsbase");
+    Value *fsRc = emitLinuxSyscall(
+        PB, M, TT, kArchPrctl,
+        {ConstantInt::get(ip, kArchGetFs),
+         PB.CreatePtrToInt(fsSlot, ip, "morok.antihook.fsgs.fs.slot.ip")});
+    fsRc->setName("morok.antihook.fsgs.fs.arch_prctl");
+    Value *gsRc = emitLinuxSyscall(
+        PB, M, TT, kArchPrctl,
+        {ConstantInt::get(ip, kArchGetGs),
+         PB.CreatePtrToInt(gsSlot, ip, "morok.antihook.fsgs.gs.slot.ip")});
+    gsRc->setName("morok.antihook.fsgs.gs.arch_prctl");
+    auto *fsSys = PB.CreateLoad(ip, fsSlot, "morok.antihook.fsgs.fs.sys");
+    fsSys->setVolatile(true);
+    auto *gsSys = PB.CreateLoad(ip, gsSlot, "morok.antihook.fsgs.gs.sys");
+    gsSys->setVolatile(true);
+    auto *mask =
+        PB.CreateLoad(i32, fsGsSignalMaskGlobal(M),
+                      "morok.antihook.fsgs.sig.mask");
+    mask->setVolatile(true);
+    Value *fsTrapped = PB.CreateICmpNE(
+        PB.CreateAnd(mask, ConstantInt::get(i32, kFsFaultBit),
+                     "morok.antihook.fsgs.sig.fs.bit"),
+        ConstantInt::get(i32, 0), "morok.antihook.fsgs.sig.fs.trapped");
+    Value *gsTrapped = PB.CreateICmpNE(
+        PB.CreateAnd(mask, ConstantInt::get(i32, kGsFaultBit),
+                     "morok.antihook.fsgs.sig.gs.bit"),
+        ConstantInt::get(i32, 0), "morok.antihook.fsgs.sig.gs.trapped");
+    Value *fsReady = PB.CreateAnd(
+        PB.CreateICmpEQ(fsRc, ConstantInt::get(ip, 0),
+                        "morok.antihook.fsgs.fs.arch.ok"),
+        PB.CreateNot(fsTrapped), "morok.antihook.fsgs.fs.ready");
+    Value *gsReady = PB.CreateAnd(
+        PB.CreateICmpEQ(gsRc, ConstantInt::get(ip, 0),
+                        "morok.antihook.fsgs.gs.arch.ok"),
+        PB.CreateNot(gsTrapped), "morok.antihook.fsgs.gs.ready");
+    Value *fsMismatch = PB.CreateAnd(
+        fsReady,
+        PB.CreateICmpNE(fsBase, PB.CreateZExtOrTrunc(fsSys, i64),
+                        "morok.antihook.fsgs.fs.base.diff"),
+        "morok.antihook.fsgs.fs.mismatch");
+    Value *gsMismatch = PB.CreateAnd(
+        gsReady,
+        PB.CreateICmpNE(gsBase, PB.CreateZExtOrTrunc(gsSys, i64),
+                        "morok.antihook.fsgs.gs.base.diff"),
+        "morok.antihook.fsgs.gs.mismatch");
+    incrementDiff(PB, diff, PB.CreateOr(fsMismatch, gsMismatch,
+                                        "morok.antihook.fsgs.mismatch"),
+                  "morok.antihook.fsgs.base");
+    PB.CreateBr(restoreBB);
+
+    IRBuilder<> RB(restoreBB);
+    RB.CreateCall(sigactionFn,
+                  {ConstantInt::get(i32, 4), oldIll,
+                   ConstantPointerNull::get(ptr)},
+                  "morok.antihook.fsgs.restore.ill");
+    RB.CreateBr(doneBB);
+
+    IRBuilder<> DB(doneBB);
+    emitRetDiff(DB, diff);
+    return fn;
 }
 
 Function *emulationDivergenceProbe(Module &M, const Triple &TT) {
@@ -32633,6 +32937,18 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         foldState(B, state, diff, 0x7642CDB91E30A58FULL, "morok.antihook.emu");
         foldEnforcedFlag(B, state, changed, 0x1F0E3D2C4B5A6978ULL,
                          "morok.antihook.emu.changed");
+    }
+    if (Function *fsgs = fsGsBaseGapProbe(M, tt)) {
+        Value *diff = B.CreateCall(fsgs, {}, "morok.antihook.fsgs.diff");
+        Value *changed =
+            B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0),
+                           "morok.corroborate.fsgs.changed");
+        addSoftGateSignal(B, gate, changed, 1, 0x83E4B719D05C6A2FULL,
+                          "morok.gate.fsgs");
+        foldState(B, state, diff, 0x31B6D90A7E4C258FULL,
+                  "morok.antihook.fsgs");
+        foldFlag(B, state, changed, 0xAE51C7096D38B24FULL,
+                 "morok.antihook.fsgs.changed", /*ScoreSoftSignal=*/true);
     }
     if (Function *fpu = fpuSimdDivergenceProbe(M, tt)) {
         Value *diff = B.CreateCall(fpu, {}, "morok.antihook.fpu.diff");
