@@ -17806,7 +17806,11 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.gate.negative.timing.soft") >=
           1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.dbi.overhead.soft") >= 1u);
-    CHECK(countNamedInstructions(*Ctor, "morok.gate.pow.sleep.hard") >= 1u);
+    // #251: the host/jitter-sensitive PoW sleep cross-clock verdict must be a
+    // low-weight SOFT gate signal (not a hard one); the seal-demotion is
+    // asserted below where PowSleepChanged is already declared.
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.pow.sleep.soft") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.pow.sleep.hard") == 0u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.pow.soft") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.dbi.jit.soft") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.loader.bias.soft") >= 1u);
@@ -17850,8 +17854,9 @@ entry:
     Instruction *PowSleepChanged = findNamedInstruction(
         *Ctor, "morok.corroborate.pow.sleep.changed");
     REQUIRE(PowSleepChanged != nullptr);
-    CHECK(valueFeedsNamedInstruction(PowSleepChanged,
-                                     "morok.seal.fold.anti_debug"));
+    // #251: demoted to telemetry — must NOT reach the consumed seal.
+    CHECK_FALSE(valueFeedsNamedInstruction(PowSleepChanged,
+                                           "morok.seal.fold.anti_debug"));
     Instruction *PowChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.pow.changed");
     REQUIRE(PowChanged != nullptr);

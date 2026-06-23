@@ -33895,14 +33895,21 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
             "morok.corroborate.pow.changed");
         Value *word = B.CreateLShr(sample, ConstantInt::get(B.getInt64Ty(), 8),
                                    "morok.antihook.pow.kdf.word");
-        addHardGateSignal(B, gate, sleepBad, 3, 0x4D8B23E6C197A50FULL,
+        // PoW sleep cross-clock disagreement is host/jitter-sensitive: on a
+        // non-invariant/paravirt/steal-time TSC host (no constant_tsc/
+        // nonstop_tsc, deep C-states, vCPU pause) a legitimate 5ms sleep yields
+        // wallSlept yet a sub-floor cycleDelta, so sleepBad is TRUE on a clean
+        // run. Keep it a low-weight corroborated soft score + telemetry, never
+        // the consumed anti_debug seal, exactly like negativeTimingProbe
+        // (#147/#153/#251).
+        addSoftGateSignal(B, gate, sleepBad, 1, 0x4D8B23E6C197A50FULL,
                           "morok.gate.pow.sleep");
         addSoftGateSignal(B, gate, powBad, 1, 0xB9627A1C50E43D8FULL,
                           "morok.gate.pow");
         foldState(B, state, sample, 0x72D1A8C46E39B05FULL,
                   "morok.antihook.pow");
-        foldEnforcedFlag(B, state, sleepBad, 0x2A94C73E15D608BFULL,
-                         "morok.antihook.pow.sleep.changed");
+        foldFlag(B, state, sleepBad, 0x2A94C73E15D608BFULL,
+                 "morok.antihook.pow.sleep.changed");
         foldFlag(B, state, powBad, 0xE39A10C7B65D42F8ULL,
                  "morok.antihook.pow.changed");
         runtime_seal::foldWord(B, runtime_seal::kAntiDebugChannel, word,
