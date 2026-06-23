@@ -33700,12 +33700,19 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         Value *changed =
             B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0),
                            "morok.corroborate.wxorx.changed");
-        addHardGateSignal(B, gate, changed, 3, 0x2C8B15D9F0476EA3ULL,
-                          "morok.gate.wxorx");
         foldState(B, state, diff, 0x14E2B7C95A680D3FULL,
                   "morok.antihook.wxorx");
-        foldEnforcedFlag(B, state, changed, 0xD8F31C6A4B927E50ULL,
-                         "morok.antihook.wxorx.changed");
+        if (tt.isOSDarwin()) {
+            addSoftGateSignal(B, gate, changed, 1, 0x2C8B15D9F0476EA3ULL,
+                              "morok.gate.wxorx");
+            foldFlag(B, state, changed, 0xD8F31C6A4B927E50ULL,
+                     "morok.antihook.wxorx.changed");
+        } else {
+            addHardGateSignal(B, gate, changed, 3, 0x2C8B15D9F0476EA3ULL,
+                              "morok.gate.wxorx");
+            foldEnforcedFlag(B, state, changed, 0xD8F31C6A4B927E50ULL,
+                             "morok.antihook.wxorx.changed");
+        }
     }
     if (Function *diverge = methodDivergenceProbe(M, tt, rng)) {
         Value *diff =
@@ -33911,10 +33918,17 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         Value *changed =
             B.CreateICmpEQ(ok, ConstantInt::get(i32, 0),
                            "morok.corroborate.ra.range.changed");
-        addHardGateSignal(B, gate, changed, 3, 0xD86F21B49C0A753EULL,
-                          "morok.gate.ra.range");
-        foldEnforcedFlag(B, state, changed, 0x3C791E5A6B20D48FULL,
-                         "morok.antihook.ra.range.changed");
+        if (tt.isOSDarwin()) {
+            addSoftGateSignal(B, gate, changed, 1, 0xD86F21B49C0A753EULL,
+                              "morok.gate.ra.range");
+            foldFlag(B, state, changed, 0x3C791E5A6B20D48FULL,
+                     "morok.antihook.ra.range.changed");
+        } else {
+            addHardGateSignal(B, gate, changed, 3, 0xD86F21B49C0A753EULL,
+                              "morok.gate.ra.range");
+            foldEnforcedFlag(B, state, changed, 0x3C791E5A6B20D48FULL,
+                             "morok.antihook.ra.range.changed");
+        }
     }
     insertStackOriginChecks(M, stackCheck, state, prologueTargets, rng);
     Function *gotRecheckProbe =

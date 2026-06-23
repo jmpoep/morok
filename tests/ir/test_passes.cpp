@@ -18510,6 +18510,23 @@ entry:
     REQUIRE(NegativeTimingChanged != nullptr);
     CHECK_FALSE(valueFeedsNamedInstruction(NegativeTimingChanged,
                                            "morok.seal.fold.anti_debug"));
+    Instruction *WxChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.wxorx.changed");
+    REQUIRE(WxChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(WxChanged, "morok.gate.wxorx.soft.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(WxChanged,
+                                           "morok.gate.wxorx.hard.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(WxChanged,
+                                           "morok.seal.fold.anti_debug"));
+    Instruction *RaRangeChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.ra.range.changed");
+    REQUIRE(RaRangeChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(RaRangeChanged,
+                                     "morok.gate.ra.range.soft.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(RaRangeChanged,
+                                           "morok.gate.ra.range.hard.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(RaRangeChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.bad") >= 1u);
     checkSealEnforcement(*M, *Work);
@@ -18577,6 +18594,23 @@ entry:
                                      "morok.gate.dbi.smc.soft.next"));
     CHECK_FALSE(valueFeedsNamedInstruction(SmcChanged,
                                            "morok.gate.dbi.smc.hard.next"));
+    Instruction *WxChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.wxorx.changed");
+    REQUIRE(WxChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(WxChanged, "morok.gate.wxorx.soft.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(WxChanged,
+                                           "morok.gate.wxorx.hard.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(WxChanged,
+                                           "morok.seal.fold.anti_debug"));
+    Instruction *RaRangeChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.ra.range.changed");
+    REQUIRE(RaRangeChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(RaRangeChanged,
+                                     "morok.gate.ra.range.soft.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(RaRangeChanged,
+                                           "morok.gate.ra.range.hard.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(RaRangeChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Ctor, "morok.antihook.stub.getpid.hit") ==
           0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
@@ -18938,8 +18972,11 @@ entry:
         findNamedInstruction(*Ctor, "morok.corroborate.ra.range.changed");
     REQUIRE(RaRangeChanged != nullptr);
     CHECK(valueFeedsNamedInstruction(RaRangeChanged,
-                                     "morok.seal.fold.anti_debug"));
-    CHECK(countNamedInstructions(*Ctor, "morok.gate.ra.range.hard") >= 1u);
+                                     "morok.gate.ra.range.soft.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(RaRangeChanged,
+                                           "morok.gate.ra.range.hard.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(RaRangeChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Ctor, "morok.corroborate.antidump.changed") >=
           1u);
     CHECK(M->getFunction("morok.antihook.diverge.posix") == nullptr);
