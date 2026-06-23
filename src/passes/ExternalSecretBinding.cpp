@@ -5,6 +5,7 @@
 #include "morok/passes/ExternalSecretBinding.hpp"
 
 #include "morok/passes/RuntimeSeal.hpp"
+#include "morok/runtime/PlatformRuntime.hpp"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Attributes.h"
@@ -14,6 +15,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
+#include "llvm/TargetParser/Triple.h"
 
 #include <optional>
 
@@ -112,6 +114,26 @@ Function *getApiFunction(Module &M, StringRef Name, FunctionType *Ty) {
     return Function::Create(Ty, GlobalValue::ExternalLinkage, Name, M);
 }
 
+Value *emitRuntimeEpoch(IRBuilder<> &B, Module &M, const Twine &Name) {
+    LLVMContext &Ctx = M.getContext();
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+    const Triple TT(M.getTargetTriple());
+    if (TT.isOSLinux() && TT.getArch() == Triple::x86_64) {
+        Value *Raw = runtime::emitLinuxSyscall(
+            B, M, TT, 201, {ConstantPointerNull::get(Ptr)}, Name + ".linux");
+        return B.CreateZExtOrTrunc(Raw, I64, Name);
+    }
+
+    Type *TimeTy = TT.isArch32Bit() ? static_cast<Type *>(Type::getInt32Ty(Ctx))
+                                    : static_cast<Type *>(I64);
+    FunctionCallee Time = M.getOrInsertFunction(
+        "time", FunctionType::get(TimeTy, {Ptr}, /*isVarArg=*/false));
+    Value *Raw = B.CreateCall(Time, {ConstantPointerNull::get(Ptr)},
+                              Name + ".libc");
+    return B.CreateZExtOrTrunc(Raw, I64, Name);
+}
+
 bool defineFeed(Module &M, GlobalVariable *Accum, GlobalVariable *Mask,
                 GlobalVariable *Seen,
                 bool VirtualizeHelpers) {
@@ -204,7 +226,7 @@ bool defineWindow(Module &M, GlobalVariable *Accum, GlobalVariable *Mask,
                   std::uint64_t NotAfter, bool VirtualizeHelpers) {
     LLVMContext &Ctx = M.getContext();
     auto *I64 = Type::getInt64Ty(Ctx);
-    auto *Ty = FunctionType::get(Type::getVoidTy(Ctx), {I64},
+    auto *Ty = FunctionType::get(Type::getVoidTy(Ctx),
                                  /*isVarArg=*/false);
     Function *Fn = getApiFunction(M, kWindowName, Ty);
     if (!Fn || !Fn->empty())
@@ -212,10 +234,9 @@ bool defineWindow(Module &M, GlobalVariable *Accum, GlobalVariable *Mask,
     Fn->setLinkage(GlobalValue::ExternalLinkage);
     addHelperAttrs(*Fn, VirtualizeHelpers);
 
-    Value *Now = Fn->getArg(0);
-    Now->setName("now_epoch");
     BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
     IRBuilder<> B(Entry);
+    Value *Now = emitRuntimeEpoch(B, M, "morok.proof.window.epoch");
     Value *AfterStart =
         NotBefore == 0
             ? ConstantInt::getTrue(Ctx)

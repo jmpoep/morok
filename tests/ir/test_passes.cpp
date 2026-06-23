@@ -10853,6 +10853,7 @@ entry:
     CHECK(M->getGlobalVariable("morok.proof.seen", true) != nullptr);
     CHECK(M->getFunction("time") == nullptr);
     CHECK(M->getFunction("GetSystemTime") == nullptr);
+    CHECK(M->getFunction("syscall") == nullptr);
 
     Function *Feed = M->getFunction("morok.proof.feed");
     Function *Window = M->getFunction("morok.proof.window");
@@ -10860,11 +10861,16 @@ entry:
     REQUIRE(Feed != nullptr);
     REQUIRE(Window != nullptr);
     REQUIRE(Finish != nullptr);
+    CHECK(Window->arg_size() == 0u);
     CHECK(Feed->hasFnAttribute(Attribute::NoInline));
     CHECK(Window->hasFnAttribute(Attribute::NoInline));
     CHECK(Finish->hasFnAttribute(Attribute::NoInline));
     CHECK(countNamedInstructions(*Feed, "morok.proof.factor.bit") == 1u);
     CHECK(countNamedInstructions(*Feed, "morok.proof.mask.next") == 1u);
+    CHECK(countNamedInstructions(*Window, "now_epoch") == 0u);
+    CHECK(countNamedInstructions(*Window, "morok.proof.window.epoch.linux") ==
+          1u);
+    CHECK(countInlineAsmBodies(*Window, "syscall") == 1u);
     CHECK(countNamedInstructions(*Window, "morok.proof.window.in_range") == 1u);
     CHECK(countNamedInstructions(*Window,
                                  "morok.proof.window.contribution") == 1u);
