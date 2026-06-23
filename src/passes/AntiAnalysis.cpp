@@ -17139,6 +17139,109 @@ Function *timingOracleProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
             "morok.timing.mix");
     }
 
+    if (hasCycleClock) {
+        SmallVector<Value *, 8> nakedSamples;
+        SmallVector<Value *, 8> bracketSamples;
+        nakedSamples.reserve(7);
+        bracketSamples.reserve(7);
+        for (unsigned sample = 0; sample < 7; ++sample) {
+            Value *nakedStart = emitRdtscp(B, M);
+            Value *nakedEnd = emitRdtscp(B, M);
+            Value *nakedDelta = B.CreateSub(nakedEnd, nakedStart,
+                                            "morok.timing.cpuid.naked.delta");
+            nakedSamples.push_back(nakedDelta);
+
+            Value *bracketStart = emitRdtscp(B, M);
+            Value *leaf = emitCpuid(B, M, ConstantInt::get(i32, 0),
+                                    ConstantInt::get(i32, sample & 1u));
+            Value *leafMix = cpuidReg(B, leaf, sample % 4,
+                                      "morok.timing.cpuid.leaf.mix");
+            Value *bracketEnd = emitRdtscp(B, M);
+            Value *bracketDelta =
+                B.CreateSub(bracketEnd, bracketStart,
+                            "morok.timing.cpuid.bracket.delta");
+            bracketSamples.push_back(bracketDelta);
+            mix = B.CreateXor(
+                B.CreateAdd(mix,
+                            B.CreateMul(bracketDelta,
+                                        ConstantInt::get(i64, rng.next() | 1ULL))),
+                B.CreateXor(nakedDelta, B.CreateZExt(leafMix, i64),
+                            "morok.timing.cpuid.sample.mix"),
+                "morok.timing.cpuid.mix");
+        }
+
+        auto sortSamples = [&](SmallVector<Value *, 8> samples,
+                               const Twine &prefix) {
+            for (unsigned i = 0; i < samples.size(); ++i) {
+                for (unsigned j = i + 1; j < samples.size(); ++j) {
+                    Value *swap = B.CreateICmpUGT(samples[i], samples[j],
+                                                 prefix + ".gt");
+                    Value *lo =
+                        B.CreateSelect(swap, samples[j], samples[i],
+                                       prefix + ".lo");
+                    Value *hi =
+                        B.CreateSelect(swap, samples[i], samples[j],
+                                       prefix + ".hi");
+                    samples[i] = lo;
+                    samples[j] = hi;
+                }
+            }
+            return samples;
+        };
+
+        SmallVector<Value *, 8> sortedNaked =
+            sortSamples(nakedSamples, "morok.timing.cpuid.naked.sort");
+        SmallVector<Value *, 8> sortedBracket =
+            sortSamples(bracketSamples, "morok.timing.cpuid.bracket.sort");
+        Value *nakedMin = sortedNaked[0];
+        Value *bracketMin = sortedBracket[0];
+        Value *nakedMedian = sortedNaked[3];
+        Value *bracketMedian = sortedBracket[3];
+        nakedMin->setName("morok.timing.cpuid.naked.min");
+        bracketMin->setName("morok.timing.cpuid.bracket.min");
+        nakedMedian->setName("morok.timing.cpuid.naked.median");
+        bracketMedian->setName("morok.timing.cpuid.bracket.median");
+        Value *nakedBase = B.CreateSelect(
+            B.CreateICmpEQ(nakedMedian, ConstantInt::get(i64, 0),
+                           "morok.timing.cpuid.naked.zero"),
+            ConstantInt::get(i64, 1), nakedMedian,
+            "morok.timing.cpuid.naked.baseline");
+        Value *nakedMinBase = B.CreateSelect(
+            B.CreateICmpEQ(nakedMin, ConstantInt::get(i64, 0),
+                           "morok.timing.cpuid.naked.min.zero"),
+            ConstantInt::get(i64, 1), nakedMin,
+            "morok.timing.cpuid.naked.min.baseline");
+        Value *medianRatio = B.CreateICmpUGT(
+            bracketMedian,
+            B.CreateMul(nakedBase, ConstantInt::get(i64, 16),
+                        "morok.timing.cpuid.naked.scaled"),
+            "morok.timing.cpuid.ratio");
+        Value *minRatio = B.CreateICmpUGT(
+            bracketMin,
+            B.CreateMul(nakedMinBase, ConstantInt::get(i64, 8),
+                        "morok.timing.cpuid.naked.min.scaled"),
+            "morok.timing.cpuid.min.ratio");
+        Value *exitRatio =
+            B.CreateAnd(medianRatio, minRatio,
+                        "morok.timing.cpuid.exit.ratio");
+        foldState(B, State, nakedMedian, 0x8B17E0D56C3A49F2ULL,
+                  "morok.timing.cpuid.naked.median");
+        foldState(B, State, bracketMedian, 0x51C49E7A236D80BFULL,
+                  "morok.timing.cpuid.bracket.median");
+        foldState(B, State, nakedMin, 0xC72E5A913B04D68FULL,
+                  "morok.timing.cpuid.naked.min");
+        foldState(B, State, bracketMin, 0x2A93D8C45F6071BEULL,
+                  "morok.timing.cpuid.bracket.min");
+        foldFlag(B, State, medianRatio, 0xD4B2E8175C90A36FULL,
+                 "morok.timing.cpuid.ratio");
+        foldFlag(B, State, minRatio, 0x6A51C3F08E27B94DULL,
+                 "morok.timing.cpuid.min.ratio");
+        foldFlag(B, State, exitRatio, 0xB90F2E6C41A57D38ULL,
+                 "morok.timing.cpuid.exit.ratio");
+        foldPoisonFlag(B, exitRatio, 0x4E3B71D0A6C9582FULL,
+                       "morok.timing.cpuid.exit.ratio");
+    }
+
     foldState(B, State, mix, 0x275C92B4EF31D68BULL, "morok.timing.mix");
     foldState(B, State, badSamples, 0x7A6D2E10B94F35C1ULL,
               "morok.timing.bad.samples");

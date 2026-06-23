@@ -21983,6 +21983,7 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getGlobalVariable("morok.timing.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.seal.score.anti_debug.weight", true) !=
           nullptr);
+    CHECK(M->getGlobalVariable("morok.antianalysis.poison", true) != nullptr);
     checkNoSealEnforcement(*Oracle);
     CHECK(M->getFunction("morok.timing") != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
@@ -22006,6 +22007,29 @@ define i32 @main() { ret i32 0 }
         *Oracle, "morok.timing.bad.distribution.score.enough", 8u));
     CHECK_FALSE(hasNamedIcmpWithConstant(
         *Oracle, "morok.timing.coherent.distribution.score.enough", 32u));
+    CHECK(countNamedInstructions(*Oracle, "morok.timing.cpuid.naked.delta") >=
+          5u);
+    CHECK(countNamedInstructions(*Oracle,
+                                 "morok.timing.cpuid.bracket.delta") >= 5u);
+    CHECK(countNamedInstructions(*Oracle, "morok.timing.cpuid.naked.min") >=
+          1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.timing.cpuid.bracket.min") >=
+          1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.timing.cpuid.naked.median") >=
+          1u);
+    CHECK(countNamedInstructions(*Oracle,
+                                 "morok.timing.cpuid.bracket.median") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.timing.cpuid.ratio") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.timing.cpuid.min.ratio") >=
+          1u);
+    Instruction *ExitRatio =
+        findNamedInstruction(*Oracle, "morok.timing.cpuid.exit.ratio");
+    REQUIRE(ExitRatio != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(ExitRatio,
+                                           "morok.seal.fold.anti_debug"));
+    CHECK(valueFeedsNamedInstruction(ExitRatio,
+                                     "morok.timing.cpuid.exit.ratio.poison"));
+    CHECK(countInlineAsmBodies(*Oracle, "cpuid") >= 7u);
     // The x86 timestamp read lives in a CPUID-gated helper (rdtscp + rdtsc
     // fallback); the probe calls it rather than inlining the asm.
     Function *Tsc = M->getFunction("morok.timing.tsc.read");
@@ -22071,10 +22095,13 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getGlobalVariable("morok.seal.score.anti_debug.weight", true) ==
           nullptr);
     checkNoSealEnforcement(*Oracle);
+    CHECK(M->getGlobalVariable("morok.antianalysis.poison", true) == nullptr);
     CHECK(M->getFunction("mach_absolute_time") != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
     CHECK(countNamedInstructions(*Oracle, "morok.timing.bad.distribution") >=
           1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.timing.cpuid.exit.ratio") ==
+          0u);
     CHECK_FALSE(hasInlineAsmCall(*Oracle));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
