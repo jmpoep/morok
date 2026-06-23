@@ -16984,6 +16984,10 @@ entry:
     REQUIRE(Fpu != nullptr);
     Function *Sandbox = M->getFunction("morok.antihook.sandbox");
     REQUIRE(Sandbox != nullptr);
+    Function *ClockCoherence =
+        M->getFunction("morok.antihook.sandbox.clock");
+    REQUIRE(ClockCoherence != nullptr);
+    CHECK(M->getFunction("morok.antihook.sandbox.firmware") == nullptr);
     Function *Dbi = M->getFunction("morok.antihook.dbi.linux");
     REQUIRE(Dbi != nullptr);
     Function *DbiOverhead = M->getFunction("morok.antihook.dbi.overhead");
@@ -17310,6 +17314,21 @@ entry:
                                  "morok.antihook.sandbox.tcg.tb.ratio") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.smc.flush") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.clock.changed") >= 1u);
+    CHECK(countNamedInstructions(*ClockCoherence,
+                                 "morok.antihook.sandbox.clock.tsc.delta") >=
+          1u);
+    CHECK(countNamedInstructions(*ClockCoherence,
+                                 "morok.antihook.sandbox.clock.mono.delta") >=
+          1u);
+    CHECK(countNamedInstructions(*ClockCoherence,
+                                 "morok.antihook.sandbox.clock.raw.delta") >=
+          1u);
+    CHECK(countNamedInstructions(*ClockCoherence,
+                                 "morok.antihook.sandbox.clock.uniform") >= 1u);
+    CHECK(countNamedInstructions(*ClockCoherence,
+                                 "morok.antihook.sandbox.clock.hit") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.raw.score") >= 1u);
     CHECK(countNamedInstructions(
@@ -18436,6 +18455,12 @@ entry:
     REQUIRE(Stack != nullptr);
     Function *Sandbox = M->getFunction("morok.antihook.sandbox");
     REQUIRE(Sandbox != nullptr);
+    Function *ClockCoherence =
+        M->getFunction("morok.antihook.sandbox.clock");
+    REQUIRE(ClockCoherence != nullptr);
+    Function *FirmwareCoherence =
+        M->getFunction("morok.antihook.sandbox.firmware");
+    REQUIRE(FirmwareCoherence != nullptr);
     Function *Emu = M->getFunction("morok.antihook.emu.x86");
     REQUIRE(Emu != nullptr);
     Function *Fpu = M->getFunction("morok.antihook.fpu.x86");
@@ -18446,6 +18471,8 @@ entry:
     REQUIRE(WinEnv != nullptr);
     Function *WriteWatch = M->getFunction("morok.win.writewatch.probe");
     REQUIRE(WriteWatch != nullptr);
+    Function *Direct = M->getFunction("morok.win.sys.direct");
+    REQUIRE(Direct != nullptr);
     Function *Direct6 = M->getFunction("morok.win.sys.direct6");
     REQUIRE(Direct6 != nullptr);
     Function *Direct7 = M->getFunction("morok.win.sys.direct7");
@@ -18472,11 +18499,14 @@ entry:
     CHECK(M->getFunction("GetWriteWatch") == nullptr);
     CHECK(M->getFunction("ResetWriteWatch") == nullptr);
     CHECK(M->getFunction("VirtualAlloc") == nullptr);
+    CHECK(M->getFunction("GetSystemFirmwareTable") == nullptr);
+    CHECK(M->getFunction("QueryInterruptTimePrecise") == nullptr);
     CHECK(M->getFunction("GetEnvironmentStringsA") == nullptr);
     CHECK(M->getFunction("GetEnvironmentStringsW") == nullptr);
     CHECK(hasInlineAsmCall(*Sandbox));
     CHECK(hasInlineAsmCall(*Emu));
     CHECK(hasInlineAsmCall(*Fpu));
+    CHECK(hasInlineAsmCall(*Direct));
     CHECK(hasInlineAsmCall(*Direct6));
     CHECK(hasInlineAsmCall(*Direct7));
     CHECK(Emu->hasFnAttribute(Attribute::NoRedZone));
@@ -18492,6 +18522,33 @@ entry:
                                  "morok.antihook.sandbox.tcg.tb.ratio") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.smc.flush") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.clock.changed") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.firmware.changed") >= 1u);
+    CHECK(countNamedInstructions(*ClockCoherence,
+                                 "morok.antihook.sandbox.clock.qpc.delta") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *ClockCoherence,
+              "morok.antihook.sandbox.clock.interrupt.delta") >= 1u);
+    CHECK(countNamedInstructions(*ClockCoherence,
+                                 "morok.antihook.sandbox.clock.uniform") >= 1u);
+    CHECK(countNamedInstructions(*ClockCoherence,
+                                 "morok.antihook.sandbox.clock.hit") >= 1u);
+    CHECK(countNamedInstructions(
+              *FirmwareCoherence,
+              "morok.antihook.sandbox.firmware.ntqsi.pack") >= 1u);
+    CHECK(countNamedInstructions(*FirmwareCoherence,
+                                 "morok.antihook.sandbox.firmware.api") >= 1u);
+    CHECK(countNamedInstructions(
+              *FirmwareCoherence,
+              "morok.antihook.sandbox.firmware.nt.status") >= 1u);
+    CHECK(countNamedInstructions(
+              *FirmwareCoherence,
+              "morok.antihook.sandbox.firmware.compare.ready") >= 1u);
+    CHECK(countNamedInstructions(*FirmwareCoherence,
+                                 "morok.antihook.sandbox.firmware.hit") >= 1u);
     CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.flags.mismatch") >=
           1u);
     CHECK(countNamedInstructions(*Emu,

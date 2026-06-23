@@ -1462,10 +1462,13 @@ Value *emitDarwinSysctl(IRBuilder<> &B, Module &M, const Triple &TT, Value *Mib,
 Value *emitClockGettimeNanos(IRBuilder<> &B, Module &M, std::int32_t ClockId,
                              const Twine &Name);
 Value *emitRdtscp(IRBuilder<> &B, Module &M);
+Value *emitWindowsQpc(IRBuilder<> &B, Module &M, const Twine &Name);
 Function *linuxParentAncestryProbe(Module &M, GlobalVariable *State,
                                    ir::IRRandom &rng, const Triple &TT);
 Function *linuxRrReplayProbe(Module &M, GlobalVariable *State,
                              ir::IRRandom &rng, const Triple &TT);
+Function *sandboxClockCoherenceProbe(Module &M, const Triple &TT);
+Function *windowsFirmwareCoherenceProbe(Module &M);
 
 Value *emitDarwinCsops(IRBuilder<> &B, Module &M, const Triple &TT, Value *Pid,
                        Value *Ops, Value *UserAddr, Value *UserSize) {
@@ -12622,6 +12625,25 @@ Function *sandboxHeuristicProbe(Module &M, const Triple &TT) {
         B.SetInsertPoint(afterDescriptorBB);
     }
 
+    if (Function *clockCoherence = sandboxClockCoherenceProbe(M, TT)) {
+        Value *diff = B.CreateCall(clockCoherence->getFunctionType(),
+                                   clockCoherence, {},
+                                   "morok.antihook.sandbox.clock.diff");
+        Value *changed =
+            B.CreateICmpNE(diff, ConstantInt::get(i64, 0),
+                           "morok.antihook.sandbox.clock.changed");
+        incrementDiff(B, score, changed, "morok.antihook.sandbox.clock");
+    }
+    if (Function *firmwareCoherence = windowsFirmwareCoherenceProbe(M)) {
+        Value *diff = B.CreateCall(firmwareCoherence->getFunctionType(),
+                                   firmwareCoherence, {},
+                                   "morok.antihook.sandbox.firmware.diff");
+        Value *changed =
+            B.CreateICmpNE(diff, ConstantInt::get(i64, 0),
+                           "morok.antihook.sandbox.firmware.changed");
+        incrementDiff(B, score, changed, "morok.antihook.sandbox.firmware");
+    }
+
     if (TT.isOSLinux()) {
         FunctionCallee sysconf = sysconfDecl(M);
         Value *cpus = B.CreateCall(sysconf, {ConstantInt::get(i32, 84)},
@@ -23400,6 +23422,403 @@ Function *windowsDirectSyscall7Thunk(Module &M) {
     for (Argument &A : fn->args())
         args.push_back(&A);
     B.CreateRet(B.CreateCall(asmTy, IA, args, "morok.win.sys.direct7.ret"));
+    return fn;
+}
+
+Value *resolveWindowsKernelApi(IRBuilder<> &B, Module &M, StringRef Api,
+                               const Twine &Name) {
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *ip = intPtrTy(M);
+    Function *pebReader = windowsPebReader(M);
+    Function *moduleByHash = windowsLdrModuleByHash(M);
+    Function *resolver = windowsPeExportResolver(M);
+
+    Value *peb = B.CreateCall(pebReader->getFunctionType(), pebReader, {},
+                              Name + ".peb");
+    Value *kernelbase = B.CreateCall(
+        moduleByHash->getFunctionType(), moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("kernelbase.dll"))},
+        Name + ".kernelbase");
+    Value *kernel32 = B.CreateCall(
+        moduleByHash->getFunctionType(), moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("kernel32.dll"))},
+        Name + ".kernel32");
+    Value *apiBase = B.CreateCall(
+        resolver->getFunctionType(), resolver,
+        {kernelbase, ConstantInt::get(i64, fnv1aName(Api))},
+        Name + ".kernelbase.api");
+    Value *apiFallback = B.CreateCall(
+        resolver->getFunctionType(), resolver,
+        {kernel32, ConstantInt::get(i64, fnv1aName(Api))},
+        Name + ".kernel32.api");
+    return B.CreateSelect(B.CreateICmpNE(apiBase, ConstantInt::get(ip, 0),
+                                         Name + ".kernelbase.ready"),
+                          apiBase, apiFallback, Name);
+}
+
+Value *emitWindowsInterruptTimePrecise(IRBuilder<> &B, Module &M, Value *Fn,
+                                       const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    Function *parent = B.GetInsertBlock()->getParent();
+    auto *slot = B.CreateAlloca(i64, nullptr, Name + ".slot");
+    B.CreateStore(ConstantInt::get(i64, 0), slot)->setVolatile(true);
+
+    auto *callBB = BasicBlock::Create(ctx, (Name + ".call").str(), parent);
+    auto *afterBB = BasicBlock::Create(ctx, (Name + ".after").str(), parent);
+    B.CreateCondBr(B.CreateICmpNE(Fn, ConstantInt::get(ip, 0),
+                                  Name + ".ready"),
+                   callBB, afterBB);
+
+    IRBuilder<> CB(callBB);
+    auto *qitTy =
+        FunctionType::get(Type::getVoidTy(ctx), {ptr}, false);
+    CB.CreateCall(qitTy, CB.CreateIntToPtr(Fn, ptr, Name + ".ptr"), {slot});
+    CB.CreateBr(afterBB);
+
+    IRBuilder<> AB(afterBB);
+    auto *value = AB.CreateLoad(i64, slot, Name);
+    value->setVolatile(true);
+    B.SetInsertPoint(afterBB);
+    return value;
+}
+
+Function *sandboxClockCoherenceProbe(Module &M, const Triple &TT) {
+    const bool x86 = TT.getArch() == Triple::x86 || TT.getArch() == Triple::x86_64;
+    const bool supportedOs =
+        TT.isOSLinux() || TT.isOSDarwin() || TT.isOSWindows();
+    if (!x86 || !supportedOs || intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.sandbox.clock"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.sandbox.clock", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    auto *acc =
+        B.CreateAlloca(i64, nullptr, "morok.antihook.sandbox.clock.acc");
+    B.CreateStore(ConstantInt::get(i64, 0xA0761D6478BD642FULL), acc)
+        ->setVolatile(true);
+
+    Value *thirdFn = nullptr;
+    if (TT.isOSWindows())
+        thirdFn = resolveWindowsKernelApi(
+            B, M, "QueryInterruptTimePrecise",
+            "morok.antihook.sandbox.clock.interrupt.api");
+
+    Value *cpuStart = emitRdtscp(B, M);
+    cpuStart->setName("morok.antihook.sandbox.clock.tsc.start");
+    Value *wallStart = TT.isOSWindows()
+                           ? emitWindowsQpc(
+                                 B, M, "morok.antihook.sandbox.clock.qpc.start")
+                           : emitClockGettimeNanos(
+                                 B, M, 1,
+                                 "morok.antihook.sandbox.clock.mono.start");
+    Value *thirdStart = TT.isOSWindows()
+                            ? emitWindowsInterruptTimePrecise(
+                                  B, M, thirdFn,
+                                  "morok.antihook.sandbox.clock.interrupt.start")
+                            : emitClockGettimeNanos(
+                                  B, M, 4,
+                                  "morok.antihook.sandbox.clock.raw.start");
+
+    for (unsigned i = 0; i < 32; ++i) {
+        auto *old = B.CreateLoad(i64, acc,
+                                 "morok.antihook.sandbox.clock.span.load");
+        old->setVolatile(true);
+        Value *rot =
+            B.CreateOr(B.CreateShl(old, ConstantInt::get(i64, (i % 13) + 5)),
+                       B.CreateLShr(old,
+                                    ConstantInt::get(i64, 64 - ((i % 13) + 5))),
+                       "morok.antihook.sandbox.clock.span.rot");
+        Value *mixed = B.CreateMul(
+            B.CreateXor(rot, ConstantInt::get(i64, 0xD6E8FEB86659FD93ULL +
+                                                       i * 0x9E3779B97F4A7C15ULL),
+                        "morok.antihook.sandbox.clock.span.xor"),
+            ConstantInt::get(i64, 0xC2B2AE3D27D4EB4FULL ^ (i * 0x85EBCA77ULL)),
+            "morok.antihook.sandbox.clock.span.mix");
+        B.CreateStore(mixed, acc)->setVolatile(true);
+    }
+
+    Value *cpuEnd = emitRdtscp(B, M);
+    cpuEnd->setName("morok.antihook.sandbox.clock.tsc.end");
+    Value *wallEnd = TT.isOSWindows()
+                         ? emitWindowsQpc(
+                               B, M, "morok.antihook.sandbox.clock.qpc.end")
+                         : emitClockGettimeNanos(
+                               B, M, 1,
+                               "morok.antihook.sandbox.clock.mono.end");
+    Value *thirdEnd = TT.isOSWindows()
+                          ? emitWindowsInterruptTimePrecise(
+                                B, M, thirdFn,
+                                "morok.antihook.sandbox.clock.interrupt.end")
+                          : emitClockGettimeNanos(
+                                B, M, 4,
+                                "morok.antihook.sandbox.clock.raw.end");
+
+    auto source = [&](Value *Start, Value *End, const Twine &Name) {
+        Value *available = B.CreateAnd(
+            B.CreateICmpNE(Start, ConstantInt::get(i64, 0), Name + ".start.nz"),
+            B.CreateICmpNE(End, ConstantInt::get(i64, 0), Name + ".end.nz"),
+            Name + ".available");
+        Value *ordered = B.CreateICmpUGT(End, Start, Name + ".ordered");
+        Value *delta = B.CreateSelect(
+            ordered, B.CreateSub(End, Start, Name + ".delta.raw"),
+            ConstantInt::get(i64, 0), Name + ".delta");
+        Value *advanced =
+            B.CreateAnd(available,
+                        B.CreateICmpUGT(delta, ConstantInt::get(i64, 0),
+                                        Name + ".advanced.raw"),
+                        Name + ".advanced");
+        return std::array<Value *, 3>{available, advanced, delta};
+    };
+
+    auto cpu = source(cpuStart, cpuEnd, "morok.antihook.sandbox.clock.tsc");
+    auto wall = source(wallStart, wallEnd,
+                       TT.isOSWindows()
+                           ? "morok.antihook.sandbox.clock.qpc"
+                           : "morok.antihook.sandbox.clock.mono");
+    auto third = source(thirdStart, thirdEnd,
+                        TT.isOSWindows()
+                            ? "morok.antihook.sandbox.clock.interrupt"
+                            : "morok.antihook.sandbox.clock.raw");
+
+    Value *allAvailable = B.CreateAnd(
+        cpu[0], B.CreateAnd(wall[0], third[0],
+                            "morok.antihook.sandbox.clock.available.tail"),
+        "morok.antihook.sandbox.clock.available");
+    Value *allAdvanced = B.CreateAnd(
+        cpu[1], B.CreateAnd(wall[1], third[1],
+                            "morok.antihook.sandbox.clock.advanced.tail"),
+        "morok.antihook.sandbox.clock.advanced");
+    Value *advancedCount = B.CreateAdd(
+        B.CreateAdd(B.CreateZExt(cpu[1], i32), B.CreateZExt(wall[1], i32),
+                    "morok.antihook.sandbox.clock.advance.count.01"),
+        B.CreateZExt(third[1], i32),
+        "morok.antihook.sandbox.clock.advance.count");
+    Value *oneStalled = B.CreateAnd(
+        allAvailable,
+        B.CreateICmpEQ(advancedCount, ConstantInt::get(i32, 2),
+                       "morok.antihook.sandbox.clock.one.stalled.raw"),
+        "morok.antihook.sandbox.clock.one.stalled");
+    Value *uniform = B.CreateAnd(
+        allAdvanced,
+        B.CreateAnd(B.CreateICmpEQ(cpu[2], wall[2],
+                                   "morok.antihook.sandbox.clock.uniform.01"),
+                    B.CreateICmpEQ(wall[2], third[2],
+                                   "morok.antihook.sandbox.clock.uniform.12"),
+                    "morok.antihook.sandbox.clock.uniform.raw"),
+        "morok.antihook.sandbox.clock.uniform");
+    Value *hit = B.CreateOr(uniform, oneStalled,
+                            "morok.antihook.sandbox.clock.hit");
+    B.CreateRet(B.CreateZExt(hit, i64));
+    return fn;
+}
+
+Function *windowsFirmwareCoherenceProbe(Module &M) {
+    const Triple TT(M.getTargetTriple());
+    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
+        intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.sandbox.firmware"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    constexpr std::uint32_t kSystemFirmwareTableInformation = 76;
+    constexpr std::uint32_t kFirmwareActionGet = 1;
+    constexpr std::uint32_t kFirmwareProviderRsmb = 0x52534D42u;
+    constexpr std::uint32_t kFirmwareProbeBytes = 4096;
+    constexpr std::uint32_t kFirmwareInfoBytes = 16 + kFirmwareProbeBytes;
+
+    Function *pebReader = windowsPebReader(M);
+    Function *moduleByHash = windowsLdrModuleByHash(M);
+    Function *resolver = windowsPeExportResolver(M);
+    Function *scanner = windowsSyscallStubScanner(M);
+    Function *direct = windowsDirectSyscallThunk(M);
+    if (!pebReader || !moduleByHash || !resolver || !scanner || !direct)
+        return nullptr;
+
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.sandbox.firmware", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *resolveBB = BasicBlock::Create(ctx, "resolve", fn);
+    auto *queryBB = BasicBlock::Create(ctx, "query", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    auto *apiBufTy = ArrayType::get(i8, kFirmwareProbeBytes);
+    auto *ntInfoTy = ArrayType::get(i8, kFirmwareInfoBytes);
+    AllocaInst *apiBuf =
+        B.CreateAlloca(apiBufTy, nullptr,
+                       "morok.antihook.sandbox.firmware.api.buf");
+    AllocaInst *ntInfo =
+        B.CreateAlloca(ntInfoTy, nullptr,
+                       "morok.antihook.sandbox.firmware.nt.info");
+    AllocaInst *retLen =
+        B.CreateAlloca(i32, nullptr,
+                       "morok.antihook.sandbox.firmware.retlen");
+    B.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
+    storeAt(B, M, apiBuf, 0, ConstantInt::get(i64, 0),
+            "morok.antihook.sandbox.firmware.api.init0");
+    storeAt(B, M, apiBuf, 8, ConstantInt::get(i64, 0),
+            "morok.antihook.sandbox.firmware.api.init1");
+    storeAt(B, M, ntInfo, 0, ConstantInt::get(i32, kFirmwareProviderRsmb),
+            "morok.antihook.sandbox.firmware.nt.provider");
+    storeAt(B, M, ntInfo, 4, ConstantInt::get(i32, kFirmwareActionGet),
+            "morok.antihook.sandbox.firmware.nt.action");
+    storeAt(B, M, ntInfo, 8, ConstantInt::get(i32, 0),
+            "morok.antihook.sandbox.firmware.nt.table");
+    storeAt(B, M, ntInfo, 12, ConstantInt::get(i32, kFirmwareProbeBytes),
+            "morok.antihook.sandbox.firmware.nt.capacity");
+    storeAt(B, M, ntInfo, 16, ConstantInt::get(i64, 0),
+            "morok.antihook.sandbox.firmware.nt.init0");
+    storeAt(B, M, ntInfo, 24, ConstantInt::get(i64, 0),
+            "morok.antihook.sandbox.firmware.nt.init1");
+
+    Value *peb = B.CreateCall(pebReader->getFunctionType(), pebReader, {},
+                              "morok.antihook.sandbox.firmware.peb");
+    B.CreateCondBr(B.CreateICmpNE(peb, ConstantInt::get(ip, 0),
+                                  "morok.antihook.sandbox.firmware.peb.present"),
+                   resolveBB, retBB);
+
+    IRBuilder<> RB(resolveBB);
+    Value *kernelbase = RB.CreateCall(
+        moduleByHash->getFunctionType(), moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("kernelbase.dll"))},
+        "morok.antihook.sandbox.firmware.kernelbase");
+    Value *kernel32 = RB.CreateCall(
+        moduleByHash->getFunctionType(), moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("kernel32.dll"))},
+        "morok.antihook.sandbox.firmware.kernel32");
+    Value *ntdll = RB.CreateCall(
+        moduleByHash->getFunctionType(), moduleByHash,
+        {peb, ConstantInt::get(i64, fnv1aLowerAsciiName("ntdll.dll"))},
+        "morok.antihook.sandbox.firmware.ntdll");
+    Value *apiKb = RB.CreateCall(
+        resolver->getFunctionType(), resolver,
+        {kernelbase, ConstantInt::get(i64, fnv1aName("GetSystemFirmwareTable"))},
+        "morok.antihook.sandbox.firmware.api.kb");
+    Value *apiK32 = RB.CreateCall(
+        resolver->getFunctionType(), resolver,
+        {kernel32, ConstantInt::get(i64, fnv1aName("GetSystemFirmwareTable"))},
+        "morok.antihook.sandbox.firmware.api.k32");
+    Value *api = RB.CreateSelect(
+        RB.CreateICmpNE(apiKb, ConstantInt::get(ip, 0),
+                        "morok.antihook.sandbox.firmware.api.kb.ready"),
+        apiKb, apiK32, "morok.antihook.sandbox.firmware.api");
+    Value *ntqsi = RB.CreateCall(
+        resolver->getFunctionType(), resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtQuerySystemInformation"))},
+        "morok.antihook.sandbox.firmware.ntqsi");
+    Value *ntqsiPack = RB.CreateCall(
+        scanner->getFunctionType(), scanner,
+        {RB.CreateIntToPtr(ntqsi, ptr,
+                           "morok.antihook.sandbox.firmware.ntqsi.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.antihook.sandbox.firmware.ntqsi.pack");
+    Value *ntqsiSsn =
+        RB.CreateTrunc(ntqsiPack, i32,
+                       "morok.antihook.sandbox.firmware.ntqsi.ssn");
+    Value *ready = RB.CreateAnd(
+        RB.CreateICmpNE(api, ConstantInt::get(ip, 0),
+                        "morok.antihook.sandbox.firmware.api.ready"),
+        RB.CreateAnd(RB.CreateICmpNE(ntqsi, ConstantInt::get(ip, 0),
+                                     "morok.antihook.sandbox.firmware.nt.ready"),
+                     RB.CreateICmpNE(ntqsiSsn, ConstantInt::get(i32, 0),
+                                     "morok.antihook.sandbox.firmware.ssn.ready"),
+                     "morok.antihook.sandbox.firmware.raw.ready"),
+        "morok.antihook.sandbox.firmware.ready");
+    RB.CreateCondBr(ready, queryBB, retBB);
+
+    IRBuilder<> QB(queryBB);
+    auto *apiTy = FunctionType::get(i32, {i32, i32, ptr, i32}, false);
+    Value *apiSize = QB.CreateCall(
+        apiTy,
+        QB.CreateIntToPtr(api, ptr,
+                          "morok.antihook.sandbox.firmware.api.ptr"),
+        {ConstantInt::get(i32, kFirmwareProviderRsmb),
+         ConstantInt::get(i32, 0), apiBuf,
+         ConstantInt::get(i32, kFirmwareProbeBytes)},
+        "morok.antihook.sandbox.firmware.api.size");
+    Value *ntInfoIp =
+        QB.CreatePtrToInt(ntInfo, ip,
+                          "morok.antihook.sandbox.firmware.nt.info.ip");
+    Value *retLenIp =
+        QB.CreatePtrToInt(retLen, ip,
+                          "morok.antihook.sandbox.firmware.retlen.ip");
+    Value *ntStatus = QB.CreateCall(
+        direct->getFunctionType(), direct,
+        {ntqsiSsn, ConstantInt::get(ip, kSystemFirmwareTableInformation),
+         ntInfoIp, ConstantInt::get(ip, kFirmwareInfoBytes), retLenIp},
+        "morok.antihook.sandbox.firmware.nt.status");
+    Value *ntStatus32 =
+        QB.CreateTrunc(ntStatus, i32,
+                       "morok.antihook.sandbox.firmware.nt.status.i32");
+    Value *ntSize =
+        loadAt(QB, M, i32, ntInfo, 12,
+               "morok.antihook.sandbox.firmware.nt.size");
+
+    auto boundedSize = [&](Value *Size, const Twine &Name) {
+        return QB.CreateAnd(
+            QB.CreateICmpUGE(Size, ConstantInt::get(i32, 8),
+                             Name + ".min"),
+            QB.CreateICmpULE(Size, ConstantInt::get(i32, kFirmwareProbeBytes),
+                             Name + ".max"),
+            Name);
+    };
+    Value *apiOk =
+        boundedSize(apiSize, "morok.antihook.sandbox.firmware.api.ok");
+    Value *ntOk = QB.CreateAnd(
+        QB.CreateICmpSGE(ntStatus32, ConstantInt::get(i32, 0),
+                         "morok.antihook.sandbox.firmware.nt.success"),
+        boundedSize(ntSize, "morok.antihook.sandbox.firmware.nt.ok"),
+        "morok.antihook.sandbox.firmware.nt.complete");
+    Value *sameSize =
+        QB.CreateICmpEQ(apiSize, ntSize,
+                        "morok.antihook.sandbox.firmware.size.same");
+    Value *compareReady =
+        QB.CreateAnd(apiOk, QB.CreateAnd(ntOk, sameSize,
+                                         "morok.antihook.sandbox.firmware.nt.api"),
+                     "morok.antihook.sandbox.firmware.compare.ready");
+    Value *api0 = loadAt(QB, M, i64, apiBuf, 0ULL,
+                         "morok.antihook.sandbox.firmware.api.word0");
+    Value *api1 = loadAt(QB, M, i64, apiBuf, 8,
+                         "morok.antihook.sandbox.firmware.api.word1");
+    Value *nt0 = loadAt(QB, M, i64, ntInfo, 16,
+                        "morok.antihook.sandbox.firmware.nt.word0");
+    Value *nt1 = loadAt(QB, M, i64, ntInfo, 24,
+                        "morok.antihook.sandbox.firmware.nt.word1");
+    Value *dataMismatch = QB.CreateOr(
+        QB.CreateICmpNE(api0, nt0,
+                        "morok.antihook.sandbox.firmware.word0.diff"),
+        QB.CreateICmpNE(api1, nt1,
+                        "morok.antihook.sandbox.firmware.word1.diff"),
+        "morok.antihook.sandbox.firmware.words.diff");
+    Value *hit = QB.CreateAnd(compareReady, dataMismatch,
+                              "morok.antihook.sandbox.firmware.hit");
+    QB.CreateRet(QB.CreateZExt(hit, i64));
+
+    IRBuilder<> RetB(retBB);
+    RetB.CreateRet(ConstantInt::get(i64, 0));
     return fn;
 }
 
