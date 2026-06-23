@@ -22758,6 +22758,53 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+void checkLinuxPmuSeqlockAndFaultShield(Module &M, Function &Pmu,
+                                        std::uint64_t InstructionBytes) {
+    Function *Handler = M.getFunction("morok.step.pmu.sig.handler");
+    REQUIRE(Handler != nullptr);
+    CHECK(M.getGlobalVariable("morok.step.pmu.sig.mask", true) != nullptr);
+    CHECK(M.getGlobalVariable("morok.step.pmu.sig.armed", true) != nullptr);
+    CHECK(M.getGlobalVariable("morok.step.pmu.old.ill.action", true) !=
+          nullptr);
+    CHECK(M.getGlobalVariable("morok.step.pmu.old.segv.action", true) !=
+          nullptr);
+    CHECK(M.getGlobalVariable("morok.step.pmu.old.bus.action", true) !=
+          nullptr);
+
+    CHECK(countNamedInstructions(Pmu, "morok.step.pmu.seqlock.begin") >= 1u);
+    CHECK(countNamedInstructions(Pmu, "morok.step.pmu.seqlock.end") >= 1u);
+    CHECK(countNamedInstructions(Pmu, "morok.step.pmu.seqlock.stable") >= 1u);
+    CHECK(countNamedInstructions(Pmu, "morok.step.pmu.seqlock.retry") >= 1u);
+    std::size_t fences = 0;
+    for (Instruction &I : instructions(Pmu))
+        if (isa<FenceInst>(&I))
+            ++fences;
+    CHECK(fences >= 2u);
+
+    CHECK(countNamedInstructions(Pmu, "morok.step.pmu.rt_sigaction.ill") >= 1u);
+    CHECK(countNamedInstructions(Pmu, "morok.step.pmu.rt_sigaction.segv") >=
+          1u);
+    CHECK(countNamedInstructions(Pmu, "morok.step.pmu.rt_sigaction.bus") >= 1u);
+    CHECK(countNamedInstructions(Pmu, "morok.step.pmu.before.fault.mask") >=
+          1u);
+    CHECK(countNamedInstructions(Pmu, "morok.step.pmu.after.fault.mask") >= 1u);
+    CHECK(countNamedInstructions(Pmu, "morok.step.pmu.fault.unavailable") >=
+          1u);
+    CHECK(countNamedInstructions(Pmu, "morok.step.pmu.rt_sigaction.restore") >=
+          3u);
+
+    Instruction *Advance =
+        findNamedInstruction(*Handler, "morok.step.pmu.sig.pc.next");
+    REQUIRE(Advance != nullptr);
+    CHECK(instructionHasConstantOperand(Advance, InstructionBytes));
+    CHECK(countNamedInstructions(*Handler, "morok.step.pmu.sig.advance.pc") >=
+          1u);
+    CHECK(countNamedInstructions(*Handler, "morok.step.pmu.sig.mask.next") >=
+          1u);
+    CHECK(countNamedInstructions(*Handler, "morok.step.pmu.sig.chain.restore") >=
+          1u);
+}
+
 TEST_CASE("schedulerStepOracleModule emits Linux context-switch sampling") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -22775,6 +22822,7 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Ctor != nullptr);
     REQUIRE(Oracle != nullptr);
     REQUIRE(Pmu != nullptr);
+    checkLinuxPmuSeqlockAndFaultShield(*M, *Pmu, 2);
     CHECK(M->getGlobalVariable("morok.step.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.seal.score.anti_debug.weight", true) ==
           nullptr);
@@ -22860,6 +22908,7 @@ define i32 @main() { ret i32 0 }
     Function *Pmu = M->getFunction("morok.step.pmu.oracle");
     REQUIRE(Oracle != nullptr);
     REQUIRE(Pmu != nullptr);
+    checkLinuxPmuSeqlockAndFaultShield(*M, *Pmu, 4);
     CHECK(M->getFunction("syscall") == nullptr);
     CHECK(countCallsTo(*Oracle, "morok.step.pmu.oracle") == 1u);
     CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.cap_user_rdpmc") >= 1u);
@@ -22888,6 +22937,7 @@ define i32 @main() { ret i32 0 }
     Function *Pmu = M->getFunction("morok.step.pmu.oracle");
     REQUIRE(Oracle != nullptr);
     REQUIRE(Pmu != nullptr);
+    checkLinuxPmuSeqlockAndFaultShield(*M, *Pmu, 2);
     CHECK(M->getFunction("syscall") != nullptr);
     CHECK(M->getFunction("__errno_location") != nullptr);
     CHECK(countCallsTo(*Oracle, "morok.step.pmu.oracle") == 1u);

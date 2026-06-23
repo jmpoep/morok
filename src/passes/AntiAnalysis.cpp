@@ -18891,6 +18891,217 @@ Value *emitLinuxUserPmuCounterRead(IRBuilder<> &B, Module &M, const Triple &TT,
     return ConstantInt::get(i64, 0);
 }
 
+struct LinuxPmuFaultLayout {
+    std::uint64_t pcSlotOffset = 0;
+    std::uint32_t instructionBytes = 0;
+    std::int32_t sigIll = 4;
+    std::int32_t sigSegv = 11;
+    std::int32_t sigBus = 7;
+};
+
+bool linuxPmuFaultLayout(const Triple &TT, LinuxPmuFaultLayout &L) {
+    if (!TT.isOSLinux())
+        return false;
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        L.pcSlotOffset = 168; // ucontext_t.uc_mcontext.gregs[REG_RIP]
+        L.instructionBytes = 2; // rdpmc
+        return true;
+    case Triple::x86:
+        L.pcSlotOffset = 76; // ucontext_t.uc_mcontext.gregs[REG_EIP]
+        L.instructionBytes = 2; // rdpmc
+        return true;
+    case Triple::aarch64:
+        L.pcSlotOffset = 440; // ucontext_t.uc_mcontext.pc
+        L.instructionBytes = 4; // mrs PMCCNTR_EL0
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool linuxPmuRtSigactionSyscall(const Triple &TT, std::uint32_t &RtSigaction) {
+    if (!TT.isOSLinux())
+        return false;
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        RtSigaction = 13;
+        return true;
+    case Triple::x86:
+        RtSigaction = 174;
+        return true;
+    case Triple::aarch64:
+        RtSigaction = 134;
+        return true;
+    default:
+        return false;
+    }
+}
+
+Value *emitLinuxPmuRtSigaction(IRBuilder<> &B, Module &M, const Triple &TT,
+                               std::uint32_t Number,
+                               std::initializer_list<Value *> Args,
+                               const Twine &Name) {
+    Value *rc = emitLinuxSigtrapRoutingSyscall(B, M, TT, Number, Args, Name);
+    rc->setName(Name);
+    return rc;
+}
+
+GlobalVariable *pmuFaultMaskGlobal(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.step.pmu.sig.mask",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i32, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i32, 0),
+                                  "morok.step.pmu.sig.mask");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(4));
+    return gv;
+}
+
+GlobalVariable *pmuFaultArmedGlobal(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.step.pmu.sig.armed",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i32, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i32, 0),
+                                  "morok.step.pmu.sig.armed");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(4));
+    return gv;
+}
+
+GlobalVariable *pmuOldActionGlobal(Module &M, StringRef Name,
+                                   std::uint64_t Bytes) {
+    if (auto *existing = M.getGlobalVariable(Name, /*AllowInternal=*/true))
+        return existing;
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    auto *ty = ArrayType::get(i8, Bytes);
+    auto *gv = new GlobalVariable(M, ty, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantAggregateZero::get(ty), Name);
+    gv->setAlignment(Align(8));
+    return gv;
+}
+
+GlobalVariable *pmuOldIllActionGlobal(Module &M, std::uint64_t Bytes) {
+    return pmuOldActionGlobal(M, "morok.step.pmu.old.ill.action", Bytes);
+}
+
+GlobalVariable *pmuOldSegvActionGlobal(Module &M, std::uint64_t Bytes) {
+    return pmuOldActionGlobal(M, "morok.step.pmu.old.segv.action", Bytes);
+}
+
+GlobalVariable *pmuOldBusActionGlobal(Module &M, std::uint64_t Bytes) {
+    return pmuOldActionGlobal(M, "morok.step.pmu.old.bus.action", Bytes);
+}
+
+Function *linuxPmuFaultHandler(Module &M, const Triple &TT,
+                               const LinuxRawSigactionLayout &RawLayout,
+                               const LinuxPmuFaultLayout &FaultLayout,
+                               std::uint32_t RtSigactionNr) {
+    if (Function *existing = M.getFunction("morok.step.pmu.sig.handler"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(
+        FunctionType::get(Type::getVoidTy(ctx), {i32, ptr, ptr}, false),
+        GlobalValue::PrivateLinkage, "morok.step.pmu.sig.handler", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *sig = fn->getArg(0);
+    sig->setName("sig");
+    fn->getArg(1)->setName("info");
+    Argument *uctx = fn->getArg(2);
+    uctx->setName("uctx");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *handledBB = BasicBlock::Create(ctx, "handled", fn);
+    auto *chainBB = BasicBlock::Create(ctx, "chain", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "done", fn);
+
+    IRBuilder<> B(entry);
+    auto *armed =
+        B.CreateLoad(i32, pmuFaultArmedGlobal(M), "morok.step.pmu.sig.armed.v");
+    armed->setVolatile(true);
+    armed->setAlignment(Align(4));
+    Value *isIll = B.CreateICmpEQ(
+        sig, ConstantInt::getSigned(i32, FaultLayout.sigIll),
+        "morok.step.pmu.sig.ill");
+    Value *isSegv = B.CreateICmpEQ(
+        sig, ConstantInt::getSigned(i32, FaultLayout.sigSegv),
+        "morok.step.pmu.sig.segv");
+    Value *isBus = B.CreateICmpEQ(
+        sig, ConstantInt::getSigned(i32, FaultLayout.sigBus),
+        "morok.step.pmu.sig.bus");
+    Value *bit = B.CreateSelect(
+        isIll, ConstantInt::get(i32, 1),
+        B.CreateSelect(isSegv, ConstantInt::get(i32, 2),
+                       B.CreateSelect(isBus, ConstantInt::get(i32, 4),
+                                      ConstantInt::get(i32, 0))),
+        "morok.step.pmu.sig.bit");
+    Value *ready = B.CreateAnd(
+        B.CreateICmpEQ(armed, ConstantInt::get(i32, 1),
+                       "morok.step.pmu.sig.armed"),
+        B.CreateAnd(B.CreateICmpNE(bit, ConstantInt::get(i32, 0),
+                                   "morok.step.pmu.sig.known"),
+                    B.CreateICmpNE(uctx, ConstantPointerNull::get(ptr),
+                                   "morok.step.pmu.sig.uctx"),
+                    "morok.step.pmu.sig.context"),
+        "morok.step.pmu.sig.ready");
+    B.CreateCondBr(ready, handledBB, chainBB);
+
+    IRBuilder<> HB(handledBB);
+    Value *pc = loadAt(HB, M, ip, uctx, FaultLayout.pcSlotOffset,
+                       "morok.step.pmu.sig.pc");
+    Value *nextPc =
+        HB.CreateAdd(pc, ConstantInt::get(ip, FaultLayout.instructionBytes),
+                     "morok.step.pmu.sig.pc.next");
+    storeAt(HB, M, uctx, FaultLayout.pcSlotOffset, nextPc,
+            "morok.step.pmu.sig.advance.pc");
+    auto *oldMask =
+        HB.CreateLoad(i32, pmuFaultMaskGlobal(M),
+                      "morok.step.pmu.sig.mask.old");
+    oldMask->setVolatile(true);
+    oldMask->setAlignment(Align(4));
+    auto *nextMask =
+        HB.CreateOr(oldMask, bit, "morok.step.pmu.sig.mask.next");
+    auto *maskStore = HB.CreateStore(nextMask, pmuFaultMaskGlobal(M));
+    maskStore->setVolatile(true);
+    maskStore->setAlignment(Align(4));
+    HB.CreateBr(doneBB);
+
+    IRBuilder<> CB(chainBB);
+    Value *oldAction = CB.CreateSelect(
+        isBus, static_cast<Value *>(
+                   pmuOldBusActionGlobal(M, RawLayout.actionSize)),
+        CB.CreateSelect(isSegv,
+                        static_cast<Value *>(
+                            pmuOldSegvActionGlobal(M, RawLayout.actionSize)),
+                        static_cast<Value *>(pmuOldIllActionGlobal(
+                            M, RawLayout.actionSize))),
+        "morok.step.pmu.sig.old.action");
+    emitLinuxPmuRtSigaction(
+        CB, M, TT, RtSigactionNr,
+        {sig, oldAction, ConstantPointerNull::get(ptr),
+         ConstantInt::get(ip, RawLayout.sigsetSize)},
+        "morok.step.pmu.sig.chain.restore");
+    CB.CreateBr(doneBB);
+
+    IRBuilder<> DB(doneBB);
+    DB.CreateRetVoid();
+    return fn;
+}
+
 Function *linuxPmuAccessProbe(Module &M, GlobalVariable *State,
                               ir::IRRandom &rng, const Triple &TT) {
     if (!TT.isOSLinux())
@@ -18904,13 +19115,29 @@ Function *linuxPmuAccessProbe(Module &M, GlobalVariable *State,
         return nullptr;
     if (!schedulerStepTargetSupported(M, TT))
         return nullptr;
+    LinuxRawSigactionLayout rawLayout;
+    LinuxPmuFaultLayout faultLayout;
+    std::uint32_t rtSigactionNr = 0;
+    if (!linuxRawSigactionLayout(TT, rawLayout) ||
+        !linuxPmuFaultLayout(TT, faultLayout) ||
+        !linuxPmuRtSigactionSyscall(TT, rtSigactionNr))
+        return nullptr;
+    if (runtime::directSyscallPolicy(M) == 2u && rawLayout.needsRestorer)
+        return nullptr;
 
     LLVMContext &ctx = M.getContext();
-    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i8 = Type::getInt8Ty(ctx);
     auto *i32 = Type::getInt32Ty(ctx);
     auto *i64 = Type::getInt64Ty(ctx);
     auto *ip = intPtrTy(M);
     auto *ptr = PointerType::getUnqual(ctx);
+    Function *handler =
+        linuxPmuFaultHandler(M, TT, rawLayout, faultLayout, rtSigactionNr);
+    Function *restorer =
+        rawLayout.needsRestorer ? linuxRtSigreturnRestorer(M, TT) : nullptr;
+    if (rawLayout.needsRestorer && !restorer)
+        return nullptr;
+
     auto *fn = Function::Create(FunctionType::get(i64, false),
                                 GlobalValue::PrivateLinkage,
                                 "morok.step.pmu.oracle", &M);
@@ -18919,10 +19146,22 @@ Function *linuxPmuAccessProbe(Module &M, GlobalVariable *State,
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
     auto *mmapBB = BasicBlock::Create(ctx, "mmap", fn);
-    auto *capBB = BasicBlock::Create(ctx, "cap", fn);
     auto *enableBB = BasicBlock::Create(ctx, "enable", fn);
+    auto *seqBB = BasicBlock::Create(ctx, "seqlock", fn);
+    auto *retryBB = BasicBlock::Create(ctx, "seqlock.retry", fn);
+    auto *capBB = BasicBlock::Create(ctx, "cap", fn);
     auto *unreadyBB = BasicBlock::Create(ctx, "unready", fn);
+    auto *installIllBB = BasicBlock::Create(ctx, "install.ill", fn);
+    auto *installSegvBB = BasicBlock::Create(ctx, "install.segv", fn);
+    auto *installBusBB = BasicBlock::Create(ctx, "install.bus", fn);
+    auto *restoreIllBB = BasicBlock::Create(ctx, "restore.ill", fn);
+    auto *restoreSegvIllBB =
+        BasicBlock::Create(ctx, "restore.segv.ill", fn);
     auto *sampleBB = BasicBlock::Create(ctx, "sample", fn);
+    auto *beforeOkBB = BasicBlock::Create(ctx, "sample.before.ok", fn);
+    auto *afterOkBB = BasicBlock::Create(ctx, "sample.after.ok", fn);
+    auto *faultSampleBB = BasicBlock::Create(ctx, "sample.fault", fn);
+    auto *restoreAllBB = BasicBlock::Create(ctx, "restore.all", fn);
     auto *cleanupBB = BasicBlock::Create(ctx, "cleanup", fn);
     auto *closeBB = BasicBlock::Create(ctx, "close", fn);
     auto *retBB = BasicBlock::Create(ctx, "ret", fn);
@@ -18930,12 +19169,25 @@ Function *linuxPmuAccessProbe(Module &M, GlobalVariable *State,
     IRBuilder<> B(entry);
     auto *mixSlot = B.CreateAlloca(i64, nullptr, "morok.step.pmu.mix.slot");
     auto *acc = B.CreateAlloca(i64, nullptr, "morok.step.pmu.span.acc");
+    auto *capsSlot =
+        B.CreateAlloca(i64, nullptr, "morok.step.pmu.capabilities.slot");
+    auto *widthSlot =
+        B.CreateAlloca(i32, nullptr, "morok.step.pmu.pmc_width.slot");
+    auto *indexSlot =
+        B.CreateAlloca(i32, nullptr, "morok.step.pmu.index.slot");
     B.CreateStore(ConstantInt::get(i64, rng.next()), mixSlot)->setVolatile(true);
     B.CreateStore(ConstantInt::get(i64, rng.next()), acc)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), capsSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), widthSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), indexSlot)->setVolatile(true);
 
     constexpr std::uint64_t kPerfFlagFdCloexec = 8;
     constexpr std::uint64_t kPerfAttrDisabledExcludeKernelHv =
         (1ULL << 0) | (1ULL << 5) | (1ULL << 6);
+    constexpr std::uint64_t kPerfEventIocEnable = 0x2400;
+    constexpr std::uint64_t kPerfEventIocDisable = 0x2401;
+    constexpr std::uint64_t kPerfEventIocReset = 0x2403;
+    constexpr std::uint32_t kMaxSeqRetries = 6;
     Value *hwReady = nullptr;
     Value *fd = emitLinuxPerfOpen(
         B, M, TT, /*Type=*/0, /*Config=*/0,
@@ -18956,115 +19208,293 @@ Function *linuxPmuAccessProbe(Module &M, GlobalVariable *State,
     Value *mapAddr =
         emitLinuxPerfMetadataMmap(MB, M, TT, fd, mapReady,
                                   "morok.step.pmu.mmap");
-    MB.CreateCondBr(mapReady, capBB, closeBB);
-
-    IRBuilder<> CB(capBB);
-    Value *page = CB.CreateIntToPtr(mapAddr, ptr, "morok.step.pmu.page");
-    Value *caps = loadI64AtOffset(CB, M, page, 40,
-                                  "morok.step.pmu.capabilities");
-    Value *capUserRdpmc =
-        CB.CreateICmpNE(CB.CreateAnd(CB.CreateLShr(caps,
-                                                   ConstantInt::get(i64, 2),
-                                                   "morok.step.pmu.cap.shift"),
-                                     ConstantInt::get(i64, 1),
-                                     "morok.step.pmu.cap.bit"),
-                       ConstantInt::get(i64, 0),
-                       "morok.step.pmu.cap_user_rdpmc");
-    Value *widthRaw =
-        loadI16AtOffset(CB, M, page, 48, "morok.step.pmu.pmc_width");
-    Value *width = CB.CreateZExt(widthRaw, i32, "morok.step.pmu.pmc_width.w");
-    Value *widthOk =
-        CB.CreateAnd(CB.CreateICmpNE(widthRaw, ConstantInt::get(i16, 0),
-                                     "morok.step.pmu.pmc_width.nonzero"),
-                     CB.CreateICmpULE(width, ConstantInt::get(i32, 64),
-                                      "morok.step.pmu.pmc_width.sane"),
-                     "morok.step.pmu.pmc_width.ok");
-    Value *capReady = CB.CreateAnd(capUserRdpmc, widthOk,
-                                   "morok.step.pmu.cap.ready");
-    foldState(CB, State, caps, 0x9D41E630C5A78B2FULL,
-              "morok.step.pmu.capabilities");
-    foldState(CB, State, width, 0x348F0A6C91D257BEULL,
-              "morok.step.pmu.pmc_width");
-    foldFlag(CB, State, CB.CreateNot(capUserRdpmc,
-                                     "morok.step.pmu.cap_user_rdpmc.missing"),
-             0xC6E5A9703B18D42FULL, "morok.step.pmu.cap_user_rdpmc.missing");
-    foldFlag(CB, State, CB.CreateNot(widthOk, "morok.step.pmu.pmc_width.bad"),
-             0x817C2D40E9A65F3BULL, "morok.step.pmu.pmc_width.bad");
-    CB.CreateCondBr(capReady, enableBB, cleanupBB);
+    MB.CreateCondBr(mapReady, enableBB, closeBB);
 
     IRBuilder<> EB(enableBB);
-    constexpr std::uint64_t kPerfEventIocEnable = 0x2400;
-    constexpr std::uint64_t kPerfEventIocDisable = 0x2401;
-    constexpr std::uint64_t kPerfEventIocReset = 0x2403;
     Value *resetRc =
         emitLinuxPerfIoctl(EB, M, TT, fd, kPerfEventIocReset,
                            "morok.step.pmu.reset");
     Value *enableRc =
         emitLinuxPerfIoctl(EB, M, TT, fd, kPerfEventIocEnable,
                            "morok.step.pmu.enable");
-    Value *indexRaw =
-        loadI32AtOffset(EB, M, page, 12, "morok.step.pmu.index");
-    Value *indexOk = EB.CreateICmpNE(indexRaw, ConstantInt::get(i32, 0),
-                                     "morok.step.pmu.index.nonzero");
-    Value *flowOk = EB.CreateAnd(
+    Value *enableFlowOk = EB.CreateAnd(
         EB.CreateICmpEQ(resetRc, ConstantInt::get(ip, 0),
                         "morok.step.pmu.reset.ok"),
-        EB.CreateAnd(EB.CreateICmpEQ(enableRc, ConstantInt::get(ip, 0),
-                                     "morok.step.pmu.enable.ok"),
-                     indexOk, "morok.step.pmu.enabled.index"),
-        "morok.step.pmu.flow.ok");
-    foldState(EB, State, indexRaw, 0x5AF0D36B82C41E97ULL,
+        EB.CreateICmpEQ(enableRc, ConstantInt::get(ip, 0),
+                        "morok.step.pmu.enable.ok"),
+        "morok.step.pmu.enable.flow.ok");
+    EB.CreateCondBr(enableFlowOk, seqBB, unreadyBB);
+
+    IRBuilder<> QB(seqBB);
+    PHINode *attempt =
+        QB.CreatePHI(i32, 2, "morok.step.pmu.seqlock.attempt");
+    attempt->addIncoming(ConstantInt::get(i32, 0), enableBB);
+    Value *page = QB.CreateIntToPtr(mapAddr, ptr, "morok.step.pmu.page");
+    Value *seq0 =
+        loadI32AtOffset(QB, M, page, 0, "morok.step.pmu.seqlock.begin");
+    Value *seqOdd = QB.CreateICmpNE(
+        QB.CreateAnd(seq0, ConstantInt::get(i32, 1),
+                     "morok.step.pmu.seqlock.odd.bit"),
+        ConstantInt::get(i32, 0), "morok.step.pmu.seqlock.odd");
+    QB.CreateFence(AtomicOrdering::Acquire);
+    Value *caps = loadI64AtOffset(QB, M, page, 40,
+                                  "morok.step.pmu.capabilities");
+    Value *widthRaw =
+        loadI16AtOffset(QB, M, page, 48, "morok.step.pmu.pmc_width.raw");
+    Value *indexRaw =
+        loadI32AtOffset(QB, M, page, 12, "morok.step.pmu.index.raw");
+    QB.CreateFence(AtomicOrdering::Acquire);
+    Value *seq1 =
+        loadI32AtOffset(QB, M, page, 0, "morok.step.pmu.seqlock.end");
+    QB.CreateStore(caps, capsSlot)->setVolatile(true);
+    Value *width = QB.CreateZExt(widthRaw, i32, "morok.step.pmu.pmc_width.w");
+    QB.CreateStore(width, widthSlot)->setVolatile(true);
+    QB.CreateStore(indexRaw, indexSlot)->setVolatile(true);
+    Value *seqStable = QB.CreateAnd(
+        QB.CreateICmpEQ(seq0, seq1, "morok.step.pmu.seqlock.same"),
+        QB.CreateNot(seqOdd, "morok.step.pmu.seqlock.even"),
+        "morok.step.pmu.seqlock.stable");
+    Value *nextAttempt =
+        QB.CreateAdd(attempt, ConstantInt::get(i32, 1),
+                     "morok.step.pmu.seqlock.attempt.next");
+    QB.CreateCondBr(seqStable, capBB, retryBB);
+
+    IRBuilder<> RBQ(retryBB);
+    attempt->addIncoming(nextAttempt, retryBB);
+    RBQ.CreateCondBr(
+        RBQ.CreateICmpULT(nextAttempt, ConstantInt::get(i32, kMaxSeqRetries),
+                          "morok.step.pmu.seqlock.retry"),
+        seqBB, unreadyBB);
+
+    IRBuilder<> CB(capBB);
+    auto *capsStable =
+        CB.CreateLoad(i64, capsSlot, "morok.step.pmu.capabilities.stable");
+    capsStable->setVolatile(true);
+    auto *widthStable =
+        CB.CreateLoad(i32, widthSlot, "morok.step.pmu.pmc_width");
+    widthStable->setVolatile(true);
+    auto *indexStable = CB.CreateLoad(i32, indexSlot, "morok.step.pmu.index");
+    indexStable->setVolatile(true);
+    Value *capUserRdpmc = CB.CreateICmpNE(
+        CB.CreateAnd(CB.CreateLShr(capsStable, ConstantInt::get(i64, 2),
+                                   "morok.step.pmu.cap.shift"),
+                     ConstantInt::get(i64, 1), "morok.step.pmu.cap.bit"),
+        ConstantInt::get(i64, 0), "morok.step.pmu.cap_user_rdpmc");
+    Value *widthOk = CB.CreateAnd(
+        CB.CreateICmpNE(widthStable, ConstantInt::get(i32, 0),
+                        "morok.step.pmu.pmc_width.nonzero"),
+        CB.CreateICmpULE(widthStable, ConstantInt::get(i32, 64),
+                         "morok.step.pmu.pmc_width.sane"),
+        "morok.step.pmu.pmc_width.ok");
+    Value *indexOk = CB.CreateICmpNE(indexStable, ConstantInt::get(i32, 0),
+                                     "morok.step.pmu.index.nonzero");
+    Value *capReady = CB.CreateAnd(capUserRdpmc, widthOk,
+                                   "morok.step.pmu.cap.ready");
+    Value *flowOk = CB.CreateAnd(capReady, indexOk,
+                                 "morok.step.pmu.flow.ok");
+    foldState(CB, State, capsStable, 0x9D41E630C5A78B2FULL,
+              "morok.step.pmu.capabilities");
+    foldState(CB, State, widthStable, 0x348F0A6C91D257BEULL,
+              "morok.step.pmu.pmc_width");
+    foldFlag(CB, State, CB.CreateNot(capUserRdpmc,
+                                     "morok.step.pmu.cap_user_rdpmc.missing"),
+             0xC6E5A9703B18D42FULL, "morok.step.pmu.cap_user_rdpmc.missing");
+    foldFlag(CB, State, CB.CreateNot(widthOk, "morok.step.pmu.pmc_width.bad"),
+             0x817C2D40E9A65F3BULL, "morok.step.pmu.pmc_width.bad");
+    foldState(CB, State, indexStable, 0x5AF0D36B82C41E97ULL,
               "morok.step.pmu.index");
-    foldFlag(EB, State, EB.CreateNot(indexOk, "morok.step.pmu.index.missing"),
+    foldFlag(CB, State, CB.CreateNot(indexOk, "morok.step.pmu.index.missing"),
              0x24E8B3F06195CD7AULL, "morok.step.pmu.index.missing");
-    EB.CreateCondBr(flowOk, sampleBB, unreadyBB);
+    CB.CreateCondBr(flowOk, installIllBB, unreadyBB);
 
     IRBuilder<> UB(unreadyBB);
     emitLinuxPerfIoctl(UB, M, TT, fd, kPerfEventIocDisable,
                        "morok.step.pmu.disable.unready");
     UB.CreateBr(cleanupBB);
 
+    IRBuilder<> IB(installIllBB);
+    auto *actionTy = ArrayType::get(i8, rawLayout.actionSize);
+    AllocaInst *action =
+        IB.CreateAlloca(actionTy, nullptr, "morok.step.pmu.sa");
+    action->setAlignment(Align(8));
+    GlobalVariable *oldIll =
+        pmuOldIllActionGlobal(M, rawLayout.actionSize);
+    GlobalVariable *oldSegv =
+        pmuOldSegvActionGlobal(M, rawLayout.actionSize);
+    GlobalVariable *oldBus =
+        pmuOldBusActionGlobal(M, rawLayout.actionSize);
+    storeRawSiginfoAction(IB, M, action, handler, rawLayout, 0,
+                          "morok.step.pmu.sa");
+    if (rawLayout.needsRestorer)
+        IB.CreateStore(restorer,
+                       gepI8(IB, M, action,
+                             constIp(M, rawLayout.restorerOffset),
+                             "morok.step.pmu.sa.restorer"));
+    auto restoreSignal = [&](IRBuilder<> &Builder, std::int32_t Sig,
+                             GlobalVariable *Old, const Twine &Name) {
+        Value *rc = emitLinuxPmuRtSigaction(
+            Builder, M, TT, rtSigactionNr,
+            {ConstantInt::getSigned(ip, Sig), Old,
+             ConstantPointerNull::get(ptr),
+             ConstantInt::get(ip, rawLayout.sigsetSize)},
+            Name);
+        rc->setName(Name);
+    };
+    Value *illRc = emitLinuxPmuRtSigaction(
+        IB, M, TT, rtSigactionNr,
+        {ConstantInt::getSigned(ip, faultLayout.sigIll), action, oldIll,
+         ConstantInt::get(ip, rawLayout.sigsetSize)},
+        "morok.step.pmu.rt_sigaction.ill");
+    illRc->setName("morok.step.pmu.rt_sigaction.ill");
+    IB.CreateCondBr(
+        IB.CreateICmpEQ(illRc, ConstantInt::get(ip, 0),
+                        "morok.step.pmu.rt_sigaction.ill.ok"),
+        installSegvBB, unreadyBB);
+
+    IRBuilder<> ISB(installSegvBB);
+    Value *segvRc = emitLinuxPmuRtSigaction(
+        ISB, M, TT, rtSigactionNr,
+        {ConstantInt::getSigned(ip, faultLayout.sigSegv), action, oldSegv,
+         ConstantInt::get(ip, rawLayout.sigsetSize)},
+        "morok.step.pmu.rt_sigaction.segv");
+    segvRc->setName("morok.step.pmu.rt_sigaction.segv");
+    ISB.CreateCondBr(
+        ISB.CreateICmpEQ(segvRc, ConstantInt::get(ip, 0),
+                         "morok.step.pmu.rt_sigaction.segv.ok"),
+        installBusBB, restoreIllBB);
+
+    IRBuilder<> IBB(installBusBB);
+    Value *busRc = emitLinuxPmuRtSigaction(
+        IBB, M, TT, rtSigactionNr,
+        {ConstantInt::getSigned(ip, faultLayout.sigBus), action, oldBus,
+         ConstantInt::get(ip, rawLayout.sigsetSize)},
+        "morok.step.pmu.rt_sigaction.bus");
+    busRc->setName("morok.step.pmu.rt_sigaction.bus");
+    IBB.CreateCondBr(
+        IBB.CreateICmpEQ(busRc, ConstantInt::get(ip, 0),
+                         "morok.step.pmu.rt_sigaction.bus.ok"),
+        sampleBB, restoreSegvIllBB);
+
+    IRBuilder<> RIB(restoreIllBB);
+    restoreSignal(RIB, faultLayout.sigIll, oldIll,
+                  "morok.step.pmu.rt_sigaction.restore.ill");
+    RIB.CreateBr(unreadyBB);
+
+    IRBuilder<> RSIB(restoreSegvIllBB);
+    restoreSignal(RSIB, faultLayout.sigSegv, oldSegv,
+                  "morok.step.pmu.rt_sigaction.restore.segv.partial");
+    restoreSignal(RSIB, faultLayout.sigIll, oldIll,
+                  "morok.step.pmu.rt_sigaction.restore.ill.partial");
+    RSIB.CreateBr(unreadyBB);
+
     IRBuilder<> SB(sampleBB);
+    auto *maskClear =
+        SB.CreateStore(ConstantInt::get(i32, 0), pmuFaultMaskGlobal(M));
+    maskClear->setVolatile(true);
+    maskClear->setAlignment(Align(4));
+    auto *armedStore =
+        SB.CreateStore(ConstantInt::get(i32, 1), pmuFaultArmedGlobal(M));
+    armedStore->setVolatile(true);
+    armedStore->setAlignment(Align(4));
+    auto *indexForSample =
+        SB.CreateLoad(i32, indexSlot, "morok.step.pmu.index.sample");
+    indexForSample->setVolatile(true);
     Value *counterIndex =
-        SB.CreateSub(indexRaw, ConstantInt::get(i32, 1),
+        SB.CreateSub(indexForSample, ConstantInt::get(i32, 1),
                      "morok.step.pmu.counter.index");
     Value *before =
         emitLinuxUserPmuCounterRead(SB, M, TT, counterIndex,
                                     "morok.step.pmu.before");
-    emitSchedulerStepSpan(SB, acc, rng);
+    auto *beforeMask =
+        SB.CreateLoad(i32, pmuFaultMaskGlobal(M),
+                      "morok.step.pmu.before.fault.mask");
+    beforeMask->setVolatile(true);
+    beforeMask->setAlignment(Align(4));
+    SB.CreateCondBr(SB.CreateICmpNE(beforeMask, ConstantInt::get(i32, 0),
+                                    "morok.step.pmu.before.faulted"),
+                    faultSampleBB, beforeOkBB);
+
+    IRBuilder<> BOK(beforeOkBB);
+    emitSchedulerStepSpan(BOK, acc, rng);
     Value *after =
-        emitLinuxUserPmuCounterRead(SB, M, TT, counterIndex,
+        emitLinuxUserPmuCounterRead(BOK, M, TT, counterIndex,
                                     "morok.step.pmu.after");
+    auto *afterMask =
+        BOK.CreateLoad(i32, pmuFaultMaskGlobal(M),
+                       "morok.step.pmu.after.fault.mask");
+    afterMask->setVolatile(true);
+    afterMask->setAlignment(Align(4));
+    BOK.CreateCondBr(BOK.CreateICmpNE(afterMask, ConstantInt::get(i32, 0),
+                                      "morok.step.pmu.after.faulted"),
+                     faultSampleBB, afterOkBB);
+
+    IRBuilder<> AOK(afterOkBB);
+    auto *armedClear =
+        AOK.CreateStore(ConstantInt::get(i32, 0), pmuFaultArmedGlobal(M));
+    armedClear->setVolatile(true);
+    armedClear->setAlignment(Align(4));
     Value *disableRc =
-        emitLinuxPerfIoctl(SB, M, TT, fd, kPerfEventIocDisable,
+        emitLinuxPerfIoctl(AOK, M, TT, fd, kPerfEventIocDisable,
                            "morok.step.pmu.disable");
-    Value *delta = SB.CreateSub(after, before, "morok.step.pmu.delta");
+    Value *delta = AOK.CreateSub(after, before, "morok.step.pmu.delta");
     Value *disableBad =
-        SB.CreateICmpNE(disableRc, ConstantInt::get(ip, 0),
-                        "morok.step.pmu.disable.bad");
+        AOK.CreateICmpNE(disableRc, ConstantInt::get(ip, 0),
+                         "morok.step.pmu.disable.bad");
     Value *deltaStalled =
-        SB.CreateICmpEQ(delta, ConstantInt::get(i64, 0),
-                        "morok.step.pmu.delta.stalled");
-    auto *oldMix = SB.CreateLoad(i64, mixSlot, "morok.step.pmu.mix.old");
+        AOK.CreateICmpEQ(delta, ConstantInt::get(i64, 0),
+                         "morok.step.pmu.delta.stalled");
+    auto *oldMix = AOK.CreateLoad(i64, mixSlot, "morok.step.pmu.mix.old");
     oldMix->setVolatile(true);
-    Value *nextMix = SB.CreateXor(
-        SB.CreateMul(oldMix, ConstantInt::get(i64, rng.next() | 1ULL),
-                     "morok.step.pmu.mix.mul"),
-        SB.CreateAdd(delta, SB.CreateZExt(width, i64),
-                     "morok.step.pmu.mix.delta"),
+    auto *widthForSample =
+        AOK.CreateLoad(i32, widthSlot, "morok.step.pmu.pmc_width.sample");
+    widthForSample->setVolatile(true);
+    Value *nextMix = AOK.CreateXor(
+        AOK.CreateMul(oldMix, ConstantInt::get(i64, rng.next() | 1ULL),
+                      "morok.step.pmu.mix.mul"),
+        AOK.CreateAdd(delta, AOK.CreateZExt(widthForSample, i64),
+                      "morok.step.pmu.mix.delta"),
         "morok.step.pmu.mix");
-    SB.CreateStore(nextMix, mixSlot)->setVolatile(true);
-    foldState(SB, State, before, 0xE5A134C7906B2D8FULL,
+    AOK.CreateStore(nextMix, mixSlot)->setVolatile(true);
+    foldState(AOK, State, before, 0xE5A134C7906B2D8FULL,
               "morok.step.pmu.before");
-    foldState(SB, State, after, 0x7B6D20E94A31C85FULL,
+    foldState(AOK, State, after, 0x7B6D20E94A31C85FULL,
               "morok.step.pmu.after");
-    foldState(SB, State, delta, 0xD0C7A4815E9B632FULL,
+    foldState(AOK, State, delta, 0xD0C7A4815E9B632FULL,
               "morok.step.pmu.delta");
-    foldFlag(SB, State, disableBad, 0x96C418A7E35D02BFULL,
+    foldFlag(AOK, State, disableBad, 0x96C418A7E35D02BFULL,
              "morok.step.pmu.disable.bad");
-    foldEnforcedFlag(SB, State, deltaStalled, 0x43E8B0D61A9C752FULL,
+    foldEnforcedFlag(AOK, State, deltaStalled, 0x43E8B0D61A9C752FULL,
                      "morok.step.pmu.delta.stalled");
-    SB.CreateBr(cleanupBB);
+    AOK.CreateBr(restoreAllBB);
+
+    IRBuilder<> FSB(faultSampleBB);
+    auto *faultMask =
+        FSB.CreateLoad(i32, pmuFaultMaskGlobal(M),
+                       "morok.step.pmu.fault.mask");
+    faultMask->setVolatile(true);
+    faultMask->setAlignment(Align(4));
+    auto *faultArmedClear =
+        FSB.CreateStore(ConstantInt::get(i32, 0), pmuFaultArmedGlobal(M));
+    faultArmedClear->setVolatile(true);
+    faultArmedClear->setAlignment(Align(4));
+    emitLinuxPerfIoctl(FSB, M, TT, fd, kPerfEventIocDisable,
+                       "morok.step.pmu.disable.fault");
+    foldState(FSB, State, faultMask, 0x31F60C8B5E27A49DULL,
+              "morok.step.pmu.fault.mask");
+    foldFlag(FSB, State,
+             FSB.CreateICmpNE(faultMask, ConstantInt::get(i32, 0),
+                              "morok.step.pmu.fault.unavailable"),
+             0xB9D0426F13A5C87EULL, "morok.step.pmu.fault.unavailable");
+    FSB.CreateBr(restoreAllBB);
+
+    IRBuilder<> RAB(restoreAllBB);
+    restoreSignal(RAB, faultLayout.sigBus, oldBus,
+                  "morok.step.pmu.rt_sigaction.restore.bus");
+    restoreSignal(RAB, faultLayout.sigSegv, oldSegv,
+                  "morok.step.pmu.rt_sigaction.restore.segv");
+    restoreSignal(RAB, faultLayout.sigIll, oldIll,
+                  "morok.step.pmu.rt_sigaction.restore.ill");
+    RAB.CreateBr(cleanupBB);
 
     IRBuilder<> XB(cleanupBB);
     emitLinuxPerfMetadataMunmap(XB, M, TT, mapAddr);
