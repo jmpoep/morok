@@ -16225,7 +16225,7 @@ void emitSmcLockCmpxchgProbe(IRBuilder<> &B, Module &M, AllocaInst *Diff,
 void emitSmcLockThreadRaceProbe(IRBuilder<> &B, Module &M, Function *Fn,
                                 AllocaInst *Diff, const Triple &TT) {
     if (TT.getArch() != Triple::x86_64 ||
-        (!TT.isOSLinux() && !TT.isOSDarwin() && !TT.isOSWindows()))
+        (!TT.isOSLinux() && !TT.isOSDarwin()))
         return;
 
     LLVMContext &ctx = M.getContext();
@@ -16259,51 +16259,25 @@ void emitSmcLockThreadRaceProbe(IRBuilder<> &B, Module &M, Function *Fn,
     smcAtomicStore(B, ConstantInt::get(i32, 0), goPtr, Align(4));
     smcAtomicStore(B, ConstantInt::get(i32, 0), donePtr, Align(4));
 
-    const bool posixThread = TT.isOSLinux() || TT.isOSDarwin();
     Type *threadTokenTy = ip;
-    if (TT.isOSDarwin() || TT.isOSWindows())
+    if (TT.isOSDarwin())
         threadTokenTy = ptr;
-    Value *threadToken = nullptr;
     AllocaInst *thread = nullptr;
     Value *created = nullptr;
     FunctionCallee pthreadJoin;
-    FunctionCallee waitForSingleObject;
-    FunctionCallee closeHandle;
-    if (posixThread) {
-        thread = B.CreateAlloca(threadTokenTy, nullptr,
-                                "morok.antihook.dbi.smc.lock.thread");
-        thread->setAlignment(Align(8));
-        FunctionCallee pthreadCreate = M.getOrInsertFunction(
-            "pthread_create",
-            FunctionType::get(i32, {ptr, ptr, ptr, ptr}, false));
-        pthreadJoin = M.getOrInsertFunction(
-            "pthread_join",
-            FunctionType::get(i32, {threadTokenTy, ptr}, false));
-        Value *rc = B.CreateCall(
-            pthreadCreate,
-            {thread, ConstantPointerNull::get(ptr), worker, statePtr},
-            "morok.antihook.dbi.smc.lock.pthread");
-        created = B.CreateICmpEQ(
-            rc, ConstantInt::get(i32, 0),
-            "morok.antihook.dbi.smc.lock.thread.created");
-    } else {
-        FunctionCallee createThread = M.getOrInsertFunction(
-            "CreateThread",
-            FunctionType::get(ptr, {ptr, ip, ptr, ptr, i32, ptr}, false));
-        waitForSingleObject = M.getOrInsertFunction(
-            "WaitForSingleObject", FunctionType::get(i32, {ptr, i32}, false));
-        closeHandle = M.getOrInsertFunction(
-            "CloseHandle", FunctionType::get(i32, {ptr}, false));
-        threadToken = B.CreateCall(
-            createThread,
-            {ConstantPointerNull::get(ptr), ConstantInt::get(ip, 0), worker,
-             statePtr, ConstantInt::get(i32, 0),
-             ConstantPointerNull::get(ptr)},
-            "morok.antihook.dbi.smc.lock.createthread");
-        created = B.CreateICmpNE(
-            threadToken, ConstantPointerNull::get(ptr),
-            "morok.antihook.dbi.smc.lock.thread.created");
-    }
+    thread = B.CreateAlloca(threadTokenTy, nullptr,
+                            "morok.antihook.dbi.smc.lock.thread");
+    thread->setAlignment(Align(8));
+    FunctionCallee pthreadCreate = M.getOrInsertFunction(
+        "pthread_create", FunctionType::get(i32, {ptr, ptr, ptr, ptr}, false));
+    pthreadJoin = M.getOrInsertFunction(
+        "pthread_join", FunctionType::get(i32, {threadTokenTy, ptr}, false));
+    Value *rc = B.CreateCall(
+        pthreadCreate, {thread, ConstantPointerNull::get(ptr), worker, statePtr},
+        "morok.antihook.dbi.smc.lock.pthread");
+    created = B.CreateICmpEQ(
+        rc, ConstantInt::get(i32, 0),
+        "morok.antihook.dbi.smc.lock.thread.created");
 
     auto *waitBB =
         BasicBlock::Create(ctx, "morok.antihook.dbi.smc.lock.wait", Fn);
@@ -16396,18 +16370,10 @@ void emitSmcLockThreadRaceProbe(IRBuilder<> &B, Module &M, Function *Fn,
     TB.CreateBr(joinBB);
 
     IRBuilder<> JB(joinBB);
-    if (posixThread) {
-        auto *tid = JB.CreateLoad(threadTokenTy, thread,
-                                  "morok.antihook.dbi.smc.lock.thread.id");
-        JB.CreateCall(pthreadJoin, {tid, ConstantPointerNull::get(ptr)},
-                      "morok.antihook.dbi.smc.lock.join.rc");
-    } else {
-        JB.CreateCall(waitForSingleObject,
-                      {threadToken, ConstantInt::get(i32, 0xFFFFFFFFu)},
-                      "morok.antihook.dbi.smc.lock.wait.rc");
-        JB.CreateCall(closeHandle, {threadToken},
-                      "morok.antihook.dbi.smc.lock.close.rc");
-    }
+    auto *tid = JB.CreateLoad(threadTokenTy, thread,
+                              "morok.antihook.dbi.smc.lock.thread.id");
+    JB.CreateCall(pthreadJoin, {tid, ConstantPointerNull::get(ptr)},
+                  "morok.antihook.dbi.smc.lock.join.rc");
     auto *badFinal =
         smcAtomicLoad(JB, i64, badPtr, Align(8),
                       "morok.antihook.dbi.smc.lock.race.bad.final");

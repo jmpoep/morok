@@ -1332,17 +1332,23 @@ void checkPosixSmcThreadRaceProbe(Module &M, Function &Smc) {
                                  "morok.antihook.dbi.smc.lock.join.rc") >= 1u);
 }
 
-void checkWindowsSmcThreadRaceProbe(Module &M, Function &Smc) {
-    checkSmcThreadRaceCore(M, Smc);
-    CHECK(M.getFunction("CreateThread") != nullptr);
-    CHECK(M.getFunction("WaitForSingleObject") != nullptr);
-    CHECK(M.getFunction("CloseHandle") != nullptr);
+void checkWindowsSmcThreadRaceProbeSkipped(Module &M, Function &Smc) {
+    CHECK(M.getFunction("morok.antihook.dbi.smc.lock.worker") == nullptr);
+    CHECK(M.getFunction("CreateThread") == nullptr);
+    CHECK(M.getFunction("WaitForSingleObject") == nullptr);
+    CHECK(M.getFunction("CloseHandle") == nullptr);
     CHECK(countNamedInstructions(
-              Smc, "morok.antihook.dbi.smc.lock.createthread") >= 1u);
+              Smc, "morok.antihook.dbi.smc.lock.thread.created") == 0u);
     CHECK(countNamedInstructions(Smc,
-                                 "morok.antihook.dbi.smc.lock.wait.rc") >= 1u);
+                                 "morok.antihook.dbi.smc.lock.ready") == 0u);
+    CHECK(countNamedInstructions(
+              Smc, "morok.antihook.dbi.smc.lock.race.cmpxchg") == 0u);
+    CHECK(countNamedInstructions(
+              Smc, "morok.antihook.dbi.smc.lock.createthread") == 0u);
     CHECK(countNamedInstructions(Smc,
-                                 "morok.antihook.dbi.smc.lock.close.rc") >= 1u);
+                                 "morok.antihook.dbi.smc.lock.wait.rc") == 0u);
+    CHECK(countNamedInstructions(Smc,
+                                 "morok.antihook.dbi.smc.lock.close.rc") == 0u);
 }
 
 TEST_CASE("RuntimeSeal gates weighted detector score with corroboration") {
@@ -19049,7 +19055,7 @@ entry:
               *Smc, "morok.antihook.dbi.smc.virtualprotect.rwx") >= 1u);
     CHECK(countNamedInstructions(*Smc, "morok.antihook.dbi.smc.trip") >= 1u);
     checkSmcCoherencyProbe(*Smc);
-    checkWindowsSmcThreadRaceProbe(*M, *Smc);
+    checkWindowsSmcThreadRaceProbeSkipped(*M, *Smc);
     CHECK(countNamedInstructions(*WinEnv, "morok.win.env.dbi.frida.log.hit") >=
           1u);
     CHECK(countNamedInstructions(
