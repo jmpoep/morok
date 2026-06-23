@@ -19219,6 +19219,12 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.tracer.state") >=
           1u);
+    // #268: the decimal TracerPid: parser shares the unanchored bug; its field
+    // match must be line-anchored too (a "TracerPid:0" comm must not spoof it).
+    CHECK(countNamedInstructions(*Stat,
+                                 "morok.antidbg.stat.tracer.anchored") >= 1u);
+    CHECK(countNamedInstructions(*Stat,
+                                 "morok.antidbg.stat.tracer.after.nl") >= 1u);
     CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.coherence.anomaly") >=
           1u);
     CHECK(countNamedInstructions(*Stat, "morok.seal.fold.anti_debug") == 0u);
@@ -19288,6 +19294,15 @@ entry:
     CHECK(countNamedInstructions(*Sigmask,
                                  "morok.antidbg.sigmask.thread.blk.found") >=
           1u);
+    // #268: each SigBlk:/SigCgt: field-name match must be anchored to a line
+    // boundary so a spoofed prefix inside the attacker-controlled Name:<comm>
+    // line cannot be consumed before the real field (bypass + seal poison).
+    CHECK(countNamedInstructions(
+              *Sigmask, "morok.antidbg.sigmask.proc.blk.anchored") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sigmask, "morok.antidbg.sigmask.proc.blk.after.nl") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sigmask, "morok.antidbg.sigmask.proc.cgt.anchored") >= 1u);
     CHECK(countNamedInstructions(*Sigmask,
                                  "morok.antidbg.sigmask.cgt.diverged") >= 1u);
     CHECK(countNamedInstructions(

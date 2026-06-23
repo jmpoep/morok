@@ -2672,6 +2672,25 @@ StatusDecimalFieldIR parseProcStatusDecimalField(
             match, MB.CreateICmpEQ(ch, ConstantInt::get(i8, prefix[j])),
             Name + ".prefix.match");
     }
+    // #268: anchor the field-name match to a line boundary (buffer start or
+    // immediately after a newline). Otherwise an attacker-controlled comm /
+    // basename in the first "Name:\t<comm>" line (e.g. a binary renamed to
+    // "SigBlk:0" / "TracerPid:0") makes the field prefix appear at a low offset
+    // and be consumed before the genuine line — a detection bypass AND a
+    // seal-poison vector, since the parsed value reaches sealFold. prevIdx is
+    // saturated to idx when atStart so idx==0 never reads Buf[-1].
+    Value *atStart = MB.CreateICmpEQ(idx, ConstantInt::get(ip, 0),
+                                     Name + ".at.start");
+    Value *prevIdx = MB.CreateSelect(
+        atStart, idx,
+        MB.CreateSub(idx, ConstantInt::get(ip, 1), Name + ".prev.idx"),
+        Name + ".prev.idx.safe");
+    Value *prevCh = loadAt(MB, M, i8, Buf, prevIdx, Name + ".prev");
+    Value *afterNl = MB.CreateICmpEQ(prevCh, ConstantInt::get(i8, '\n'),
+                                     Name + ".after.nl");
+    match = MB.CreateAnd(match,
+                         MB.CreateOr(atStart, afterNl, Name + ".line.start"),
+                         Name + ".anchored");
     MB.CreateCondBr(match, parseBB, nextBB);
 
     IRBuilder<> PB(parseBB);
@@ -2804,6 +2823,25 @@ StatusHexFieldIR parseProcStatusHexField(IRBuilder<> &B, Module &M,
             match, MB.CreateICmpEQ(ch, ConstantInt::get(i8, prefix[j])),
             Name + ".prefix.match");
     }
+    // #268: anchor the field-name match to a line boundary (buffer start or
+    // immediately after a newline). Otherwise an attacker-controlled comm /
+    // basename in the first "Name:\t<comm>" line (e.g. a binary renamed to
+    // "SigBlk:0" / "TracerPid:0") makes the field prefix appear at a low offset
+    // and be consumed before the genuine line — a detection bypass AND a
+    // seal-poison vector, since the parsed value reaches sealFold. prevIdx is
+    // saturated to idx when atStart so idx==0 never reads Buf[-1].
+    Value *atStart = MB.CreateICmpEQ(idx, ConstantInt::get(ip, 0),
+                                     Name + ".at.start");
+    Value *prevIdx = MB.CreateSelect(
+        atStart, idx,
+        MB.CreateSub(idx, ConstantInt::get(ip, 1), Name + ".prev.idx"),
+        Name + ".prev.idx.safe");
+    Value *prevCh = loadAt(MB, M, i8, Buf, prevIdx, Name + ".prev");
+    Value *afterNl = MB.CreateICmpEQ(prevCh, ConstantInt::get(i8, '\n'),
+                                     Name + ".after.nl");
+    match = MB.CreateAnd(match,
+                         MB.CreateOr(atStart, afterNl, Name + ".line.start"),
+                         Name + ".anchored");
     MB.CreateCondBr(match, parseBB, nextBB);
 
     IRBuilder<> PB(parseBB);
