@@ -4114,9 +4114,15 @@ bool emitLinuxDrSentinelStart(IRBuilder<> &B, Module &M, GlobalVariable *State,
             ParentB.CreateAnd(
                 ParentB.CreateICmpSGT(pid, ConstantInt::get(ip, 0),
                                       "morok.antidbg.dr.pid.valid"),
-                ParentB.CreateOr(yama.mode0, yama.unreadable,
-                                 "morok.antidbg.dr.ptracer.scope.open"),
-                "morok.antidbg.dr.ptracer.open.active"),
+                // #270: only a permissive Yama scope (mode 0) lets the forked DR
+                // sentinel attach to the parent without an installed
+                // PR_SET_PTRACER exception. An UNREADABLE scope must NOT mark the
+                // sentinel active: it installs no exception yet would suppress
+                // the self-trace fallback (which keys off SentinelActive),
+                // arming neither defense. Fail closed to self-trace instead
+                // (mode1 is authorized by the PR_SET_PTRACER call below;
+                // mode2/mode3 cannot attach, so they also fall back).
+                yama.mode0, "morok.antidbg.dr.ptracer.open.active"),
             SentinelActive);
     inactive->setVolatile(true);
     inactive->setAlignment(Align(1));

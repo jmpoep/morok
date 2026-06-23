@@ -19413,11 +19413,28 @@ entry:
           1u);
     CHECK(countNamedInstructions(*AntiDbg,
                                  "morok.antidbg.yama.dr.unreadable") >= 1u);
+    // #270: an unreadable Yama scope must fail CLOSED — it must not mark the DR
+    // sentinel active (which would suppress the self-trace fallback while
+    // installing no PR_SET_PTRACER exception). The scope.open OR(mode0,
+    // unreadable) is gone; only mode0 gates SentinelActive, and the unreadable
+    // verdict no longer feeds it.
     CHECK(countNamedInstructions(*AntiDbg,
-                                 "morok.antidbg.dr.ptracer.scope.open") >= 1u);
+                                 "morok.antidbg.dr.ptracer.scope.open") == 0u);
     CHECK(countNamedInstructions(*AntiDbg,
                                  "morok.antidbg.dr.ptracer.open.active") >=
           1u);
+    {
+        Instruction *YamaUnreadable =
+            findNamedInstruction(*AntiDbg, "morok.antidbg.yama.dr.unreadable");
+        REQUIRE(YamaUnreadable != nullptr);
+        CHECK_FALSE(valueFeedsNamedInstruction(
+            YamaUnreadable, "morok.antidbg.dr.ptracer.open.active"));
+        Instruction *YamaMode0 =
+            findNamedInstruction(*AntiDbg, "morok.antidbg.yama.dr.mode0");
+        REQUIRE(YamaMode0 != nullptr);
+        CHECK(valueFeedsNamedInstruction(
+            YamaMode0, "morok.antidbg.dr.ptracer.open.active"));
+    }
     CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.dr.ptracer.scope1") >=
           1u);
     CHECK(countCallsTo(*AntiDbg, "morok.antidbg.parent") == 1u);
