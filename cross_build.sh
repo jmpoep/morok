@@ -11,12 +11,23 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
+HOST_OS="$(uname -s)"
+case "$HOST_OS" in
+  Darwin)
+    DEFAULT_BUILD_MACOS=1
+    DEFAULT_PLUGIN_EXT="dylib"
+    ;;
+  *)
+    DEFAULT_BUILD_MACOS=0
+    DEFAULT_PLUGIN_EXT="so"
+    ;;
+esac
 
 SRC="programs/cf_license_crackme.c"
 OUT_DIR="${OUT_DIR:-$BUILD_DIR/cross}"
 CLANG="${CLANG:-clang-23}"
 CLANGXX="${CLANGXX:-clang++}"
-PLUGIN="${PLUGIN:-$BUILD_DIR/src/pipeline/libMorok.dylib}"
+PLUGIN="${PLUGIN:-$BUILD_DIR/src/pipeline/libMorok.$DEFAULT_PLUGIN_EXT}"
 PRESET="${PRESET:-max}"
 CONFIG=""
 # Default to Morok's entropy-seeded mode (seed 0): each build draws a fresh PRNG
@@ -52,10 +63,11 @@ AUDIT_ALLOWLIST="${AUDIT_ALLOWLIST:-}"
 PYTHON="${PYTHON:-python3}"
 
 BUILD_LINUX=1
-BUILD_MACOS=1
+BUILD_MACOS="$DEFAULT_BUILD_MACOS"
 STRIP_BINARIES=1
 CLEAN_OUT=0
 CHECK_CLEAN_DIR=0
+EMIT_PLATFORM_DEFAULTS=0
 
 LINUX_TARGET="${LINUX_TARGET:-x86_64-linux-musl}"
 LINUX_CC="${LINUX_CC:-}"
@@ -78,14 +90,15 @@ Options:
   --seed N               Morok seed; 0 = per-build entropy (default: 0)
   --clang PATH           C compiler with the Morok pass ABI (default: clang-23)
   --clangxx PATH         C++ compiler with the Morok pass ABI (default: clang++)
-  --plugin PATH          Morok pass plugin (default: build/src/pipeline/libMorok.dylib)
+  --plugin PATH          Morok pass plugin (default: host suffix, .dylib on macOS,
+                         .so elsewhere)
   --linux-target TRIPLE  Linux target triple (default: x86_64-linux-musl)
   --linux-cc PATH        GCC-compatible cross toolchain driver for crt/libgcc lookup
   --macos-arches LIST    Space-separated macOS arches: native, arm64, x86_64
                          (default: current host arch)
   --macos-min VERSION    macOS deployment target (default: 13.0)
   --linux-only           Build only the Linux artifact
-  --macos-only           Build only the macOS artifact(s)
+  --macos-only           Build only the macOS artifact(s); requires a Darwin host
   --no-linux             Skip Linux
   --no-macos             Skip macOS
   --no-strip             Do not strip produced binaries
@@ -261,6 +274,9 @@ while [ "$#" -gt 0 ]; do
     # Test hook: print the resolved Morok seed and exit (see
     # tests/e2e/cross_build_seed.sh).
     --emit-seed) printf '%s\n' "$SEED"; exit 0 ;;
+    # Test hook: print host-aware platform defaults and exit (see
+    # tests/e2e/cross_build_platform_defaults.sh).
+    --emit-platform-defaults) EMIT_PLATFORM_DEFAULTS=1; shift ;;
     # Test hook: validate and print the canonical --clean target without
     # deleting it (see tests/e2e/cross_build_clean.sh).
     --check-clean-dir) CHECK_CLEAN_DIR=1; shift ;;
@@ -275,7 +291,19 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ "$EMIT_PLATFORM_DEFAULTS" -eq 1 ]; then
+  printf 'host=%s\n' "$HOST_OS"
+  printf 'linux=%s\n' "$BUILD_LINUX"
+  printf 'macos=%s\n' "$BUILD_MACOS"
+  printf 'plugin=%s\n' "$PLUGIN"
+  exit 0
+fi
+
 [ "$BUILD_LINUX" -eq 1 ] || [ "$BUILD_MACOS" -eq 1 ] || die "nothing to build"
+
+if [ "$BUILD_MACOS" -eq 1 ] && [ "$HOST_OS" != "Darwin" ]; then
+  die "macOS builds require a Darwin host; run with --linux-only or --no-macos on $HOST_OS"
+fi
 
 BUILD_DIR="$(root_path "$BUILD_DIR")"
 SRC="$(root_path "$SRC")"
@@ -462,9 +490,12 @@ build_linux() {
   local sysroot="${LINUX_SYSROOT:-$("$cc" -print-sysroot)}"
   local crt1="$("$cc" -print-file-name=crt1.o)"
   local libgcc="$("$cc" -print-libgcc-file-name)"
-  [ -n "$sysroot" ] || die "$cc did not report a sysroot"
   [ "$crt1" != "crt1.o" ] || die "$cc did not report crt1.o; install the $LINUX_TARGET runtime"
   [ -f "$libgcc" ] || die "$cc did not report libgcc.a"
+  local sysroot_arg=()
+  if [ -n "$sysroot" ]; then
+    sysroot_arg=("--sysroot=$sysroot")
+  fi
 
   local tool_bin
   local crt_dir
@@ -495,7 +526,7 @@ build_linux() {
 
   local out="$OUT_DIR/$STEM-linux-$arch$static_suffix"
   echo ">> linux $LINUX_TARGET -> $out"
-  "$COMPILER" "--target=$LINUX_TARGET" "--sysroot=$sysroot" \
+  "$COMPILER" "--target=$LINUX_TARGET" "${sysroot_arg[@]}" \
     "-B$tool_bin" "-B$gcc_lib_dir" "-B$crt_dir" "-L$gcc_lib_dir" \
     -D_GNU_SOURCE "${static_flag[@]}" "${morok_cfg[@]}" "${COMMON[@]}" -o "$out"
   strip_linux "$out"

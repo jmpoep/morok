@@ -7,6 +7,7 @@
 #include "morok/core/Galois8.hpp"
 
 #include <cstdint>
+#include <initializer_list>
 
 namespace gf8 = morok::core::gf8;
 

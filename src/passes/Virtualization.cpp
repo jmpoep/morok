@@ -2559,6 +2559,12 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
 }
 
 void rewriteAsWrapper(Function &F, Function *Helper) {
+    const GlobalValue::LinkageTypes OriginalLinkage = F.getLinkage();
+    const GlobalValue::VisibilityTypes OriginalVisibility = F.getVisibility();
+    const GlobalValue::DLLStorageClassTypes OriginalDllStorage =
+        F.getDLLStorageClass();
+    const bool OriginalDsoLocal = F.isDSOLocal();
+
     relaxMemoryAttrs(F);
     F.deleteBody();
     LLVMContext &Ctx = F.getContext();
@@ -2576,6 +2582,14 @@ void rewriteAsWrapper(Function &F, Function *Helper) {
         B.CreateRetVoid();
     else
         B.CreateRet(Call);
+
+    // deleteBody() temporarily turns local definitions into declarations, which
+    // normalizes them to external linkage.  Restore the original visibility so
+    // virtualized private generated helpers do not collide across TUs.
+    F.setLinkage(OriginalLinkage);
+    F.setVisibility(OriginalVisibility);
+    F.setDLLStorageClass(OriginalDllStorage);
+    F.setDSOLocal(OriginalDsoLocal);
 }
 
 bool materializeProgram(Module &M, Program &P, ir::IRRandom &Rng) {

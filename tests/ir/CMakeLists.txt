@@ -8,7 +8,7 @@ morok_llvm_map_components(_llvm_libs core support irreader asmparser transformut
 
 morok_add_unit_test(morok_ir_tests
   SOURCES test_passes.cpp
-  LINK morok::passes morok::config ${_llvm_libs}
+  LINK morok::passes morok::config morok::ir morok::runtime morok::core ${_llvm_libs}
   LABELS ir)
 
 target_sources(morok_ir_tests

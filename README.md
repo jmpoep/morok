@@ -286,7 +286,9 @@ For `clang -fpass-plugin`, Morok also registers extension-point callbacks:
 ## Cross Builds and Post-Link Sealing
 
 The helper in [`cross_build.sh`](cross_build.sh) builds a source file through
-Morok for Linux and/or macOS:
+Morok for Linux and/or macOS. On Linux hosts, macOS builds are disabled by
+default and the helper uses the ELF plugin (`libMorok.so`); on macOS hosts, the
+default remains Linux plus macOS with the Mach-O plugin (`libMorok.dylib`):
 
 ```sh
 ./cross_build.sh --source programs/cf_license_crackme.c --out-dir build/cross
@@ -308,7 +310,7 @@ Common options:
 | `--plugin PATH` | Morok plugin path. |
 | `--linux-target TRIPLE` | Linux target triple. |
 | `--linux-cc PATH` | GCC-compatible Linux cross toolchain driver for crt/libgcc lookup. |
-| `--macos-arches LIST` | Space-separated macOS arches or target triples. |
+| `--macos-arches LIST` | Space-separated macOS arches or target triples; requires a Darwin host. |
 | `--macos-min VERSION` | macOS deployment target. |
 | `--linux-only`, `--macos-only` | Build only one platform family. |
 | `--no-linux`, `--no-macos` | Skip one platform family. |
@@ -338,9 +340,9 @@ preset:       max, unless --config is provided
 seed:         0, which means per-build entropy
 optimization: -O3
 clang:        clang-23
-plugin:       build/src/pipeline/libMorok.dylib
+plugin:       build/src/pipeline/libMorok.so on Linux, libMorok.dylib on macOS
 Linux target: x86_64-linux-musl
-macOS min:    13.0
+macOS min:    13.0, used only when macOS builds are enabled
 strip:        enabled
 sealing:      enabled
 ```
@@ -353,6 +355,10 @@ can crash if left enabled. The static-link flag also enables the Linux `AT_BASE`
 tripwire, which folds a dynamic-loader mapping into the runtime seal only for
 builds that are expected to be `-static`; ordinary dynamic outputs must leave it
 off.
+
+Some Linux GCC-compatible drivers report an empty sysroot while still returning
+usable `crt1.o` and `libgcc.a` paths. In that case the helper omits `--sysroot`
+and still uses the driver-provided CRT/library search directories.
 
 Post-link sealing is mandatory for shippable binaries that rely on
 `self_checksum_constants`, `mutual_guard_graph`, or `caller_keyed_dispatch`

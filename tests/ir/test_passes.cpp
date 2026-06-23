@@ -9010,6 +9010,7 @@ entry:
 
     Function *Tracer = M->getFunction("morok.tracer.mix");
     REQUIRE(Tracer != nullptr);
+    CHECK(Tracer->hasLocalLinkage());
     CHECK(M->getFunction("morok.vm.morok.tracer.mix.exec") != nullptr);
     CHECK(countCallsTo(*Tracer, "morok.vm.morok.tracer.mix.exec") == 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));

@@ -129,6 +129,22 @@ add_test(NAME "e2e/cross_build_seed"
           "${CMAKE_SOURCE_DIR}/cross_build.sh")
 set_tests_properties("e2e/cross_build_seed" PROPERTIES LABELS "e2e")
 
+# Build-tooling regression: Linux hosts must default to Linux-only builds and the
+# ELF plugin suffix; Darwin hosts keep the existing Linux+macOS default.
+add_test(NAME "e2e/cross_build_platform_defaults"
+  COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/cross_build_platform_defaults.sh"
+          "${CMAKE_SOURCE_DIR}/cross_build.sh")
+set_tests_properties("e2e/cross_build_platform_defaults" PROPERTIES
+  LABELS "e2e")
+
+# Build-tooling regression: an empty Linux -print-sysroot is valid for some
+# GCC-compatible drivers and must not block the compile step.
+add_test(NAME "e2e/cross_build_empty_sysroot"
+  COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/cross_build_empty_sysroot.sh"
+          "${CMAKE_SOURCE_DIR}/cross_build.sh")
+set_tests_properties("e2e/cross_build_empty_sysroot" PROPERTIES
+  LABELS "e2e")
+
 # Build-tooling regression (issue #116): --clean must be constrained to a
 # canonical build-dir descendant and refuse destructive OUT_DIR values.
 add_test(NAME "e2e/cross_build_clean"

@@ -29,7 +29,9 @@
  *  Target: x86-64 Linux, gcc, -no-pie (stable .text for the self-checksum).
  *  Crypto: TweetNaCl (public domain) - SHA-512, Ed25519, XSalsa20.
  * ==========================================================================*/
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

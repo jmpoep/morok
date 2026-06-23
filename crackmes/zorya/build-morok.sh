@@ -21,13 +21,21 @@ SEED=${MOROK_SEED:-1234}
 LINK=${LINK:-dynamic}
 MOROK_ROOT=${MOROK_ROOT:-../..}
 PLUGIN=${MOROK_PLUGIN:-$MOROK_ROOT/build/src/pipeline/libMorok.dylib}
-CONFIG=${MOROK_CONFIG:-morok-linux-static.toml}
 
 case "$LINK" in
-    static)  LINKFLAG="-static"; OUT=${OUT:-zorya-linux-x86_64-static} ;;
-    dynamic) LINKFLAG="";        OUT=${OUT:-zorya-linux-x86_64}; ;;
+    static)
+        LINKFLAG="-static"
+        OUT=${OUT:-zorya-linux-x86_64-static}
+        DEFAULT_CONFIG=morok-linux-static.toml
+        ;;
+    dynamic)
+        LINKFLAG=""
+        OUT=${OUT:-zorya-linux-x86_64}
+        DEFAULT_CONFIG=morok-linux-dynamic.toml
+        ;;
     *) echo "LINK must be 'static' or 'dynamic'" >&2; exit 2 ;;
 esac
+CONFIG=${MOROK_CONFIG:-$DEFAULT_CONFIG}
 
 SYSROOT="$(${CROSS}-gcc -print-sysroot)"
 CRT1="$(${CROSS}-gcc -print-file-name=crt1.o)"
