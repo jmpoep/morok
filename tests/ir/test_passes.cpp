@@ -228,6 +228,20 @@ bool namedInstructionPrecedes(Function &F, StringRef firstPrefix,
     return false;
 }
 
+bool namedConditionBranchesTo(Function &F, StringRef conditionPrefix,
+                              StringRef trueSuccessorPrefix) {
+    for (BasicBlock &BB : F) {
+        auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
+        if (!BI || !BI->isConditional())
+            continue;
+        Value *Cond = BI->getCondition();
+        if (Cond->hasName() && Cond->getName().starts_with(conditionPrefix) &&
+            BI->getSuccessor(0)->getName().starts_with(trueSuccessorPrefix))
+            return true;
+    }
+    return false;
+}
+
 bool hasNamedInstructionContaining(Function &F, StringRef needle) {
     for (Instruction &I : instructions(F))
         if (I.getName().contains(needle))
@@ -17315,6 +17329,13 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.module.seg.hit") >=
           1u);
+    Instruction *ModuleSegHit =
+        findNamedInstruction(*Stack, "morok.antihook.stack.module.seg.hit");
+    REQUIRE(ModuleSegHit != nullptr);
+    CHECK(valueFeedsNamedInstruction(
+        ModuleSegHit, "morok.antihook.stack.module.seg.reject"));
+    CHECK(namedConditionBranchesTo(
+        *Stack, "morok.antihook.stack.module.seg.reject", "ret0"));
     CHECK(hasInlineAsmCall(*Diverge));
     CHECK(hasInlineAsmCall(*Emu));
     CHECK(hasInlineAsmCall(*Fpu));

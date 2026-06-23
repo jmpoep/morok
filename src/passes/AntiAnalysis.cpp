@@ -12196,7 +12196,10 @@ Function *linuxStackOriginCheck(Module &M) {
     Value *moduleHit =
         emitElfExecSegmentHit(MPB, M, target, moduleBase, modulePhPtr,
                               "morok.antihook.stack.module.seg");
-    MPB.CreateCondBr(moduleHit, ret1BB, modulePhNextBB);
+    Value *moduleReject =
+        MPB.CreateOr(moduleHit, ConstantInt::getFalse(ctx),
+                     "morok.antihook.stack.module.seg.reject");
+    MPB.CreateCondBr(moduleReject, ret0BB, modulePhNextBB);
 
     IRBuilder<> MPN(modulePhNextBB);
     Value *phNext =
