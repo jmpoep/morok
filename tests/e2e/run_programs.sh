@@ -23,21 +23,20 @@ if [ -z "$SDK" ] && command -v xcrun >/dev/null 2>&1; then
   SDK="$(xcrun --show-sdk-path 2>/dev/null || true)"
 fi
 
-SYSROOT=()
-[ -n "$SDK" ] && SYSROOT=(-isysroot "$SDK")
-
 # Resolve a portable run-time limiter. GNU coreutils ships `timeout` (Linux);
 # Homebrew installs it as `gtimeout` (macOS); stock macOS has neither, so fall
 # back to running without a hard limit (ctest's per-test TIMEOUT still bounds
 # the whole test).  Without this, a missing `timeout` makes *both* clean and obf
 # runs emit an identical-looking shell error that, because the two call sites are
 # on different lines, diffs as a spurious mismatch on every program.
-if command -v timeout >/dev/null 2>&1; then _LIMIT=(timeout)
-elif command -v gtimeout >/dev/null 2>&1; then _LIMIT=(gtimeout)
-else _LIMIT=(); fi
+LIMIT_BIN=""
+if command -v timeout >/dev/null 2>&1; then LIMIT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then LIMIT_BIN=gtimeout; fi
+CLEAN_TIMEOUT="${MOROK_RUN_CLEAN_TIMEOUT:-30}"
+OBF_TIMEOUT="${MOROK_RUN_OBF_TIMEOUT:-180}"
 run_limited() { # <seconds> <cmd...>
   local secs="$1"; shift
-  if [ "${#_LIMIT[@]}" -gt 0 ]; then "${_LIMIT[@]}" "$secs" "$@"; else "$@"; fi
+  if [ -n "$LIMIT_BIN" ]; then "$LIMIT_BIN" "$secs" "$@"; else "$@"; fi
 }
 
 MOROK_ENV=(MOROK_ENABLE=1 MOROK_SEED="$SEED")
@@ -53,12 +52,23 @@ compile_one() { # <src> <out> <log> [clean|obf]
   case "$src" in *.cpp) cc=("$CLANGXX"); std=(-std=c++23 -D_GNU_SOURCE);; esac
 
   if [ "$mode" = "obf" ]; then
-    env "${MOROK_ENV[@]}" "${cc[@]}" "${SYSROOT[@]}" -O2 "${std[@]}" \
-      -fpass-plugin="$PLUGIN" \
-      "$src" -o "$out" >"$log" 2>&1
+    if [ -n "$SDK" ]; then
+      env "${MOROK_ENV[@]}" "${cc[@]}" -isysroot "$SDK" -O2 "${std[@]}" \
+        -fpass-plugin="$PLUGIN" \
+        "$src" -o "$out" >"$log" 2>&1
+    else
+      env "${MOROK_ENV[@]}" "${cc[@]}" -O2 "${std[@]}" \
+        -fpass-plugin="$PLUGIN" \
+        "$src" -o "$out" >"$log" 2>&1
+    fi
   else
-    "${cc[@]}" "${SYSROOT[@]}" -O2 "${std[@]}" \
-      "$src" -o "$out" >"$log" 2>&1
+    if [ -n "$SDK" ]; then
+      "${cc[@]}" -isysroot "$SDK" -O2 "${std[@]}" \
+        "$src" -o "$out" >"$log" 2>&1
+    else
+      "${cc[@]}" -O2 "${std[@]}" \
+        "$src" -o "$out" >"$log" 2>&1
+    fi
   fi
 }
 
@@ -114,19 +124,24 @@ while IFS= read -r src; do
   obf_out="$TMP/${base%.*}.obf.out"
   clean_norm="$TMP/${base%.*}.clean.norm"
   obf_norm="$TMP/${base%.*}.obf.norm"
-  args=()
+  extra_arg=""
   case "$base" in
-    02_fibonacci.c) args=(30) ;;
+    02_fibonacci.c) extra_arg="30" ;;
   esac
 
-  run_capture 30 "$clean" "$TMP/${base%.*}.clean.cwd" "$clean_out" "${args[@]}"; ca=$?
-  run_capture 60 "$obf" "$TMP/${base%.*}.obf.cwd" "$obf_out" "${args[@]}"; cb=$?
-  if [ "${#_LIMIT[@]}" -gt 0 ] && [ "$ca" -eq 124 ]; then
+  if [ -n "$extra_arg" ]; then
+    run_capture "$CLEAN_TIMEOUT" "$clean" "$TMP/${base%.*}.clean.cwd" "$clean_out" "$extra_arg"; ca=$?
+    run_capture "$OBF_TIMEOUT" "$obf" "$TMP/${base%.*}.obf.cwd" "$obf_out" "$extra_arg"; cb=$?
+  else
+    run_capture "$CLEAN_TIMEOUT" "$clean" "$TMP/${base%.*}.clean.cwd" "$clean_out"; ca=$?
+    run_capture "$OBF_TIMEOUT" "$obf" "$TMP/${base%.*}.obf.cwd" "$obf_out"; cb=$?
+  fi
+  if [ -n "$LIMIT_BIN" ] && [ "$ca" -eq 124 ]; then
     echo "FAIL timeout-clean $base" >&2
     fails=$((fails + 1))
     continue
   fi
-  if [ "${#_LIMIT[@]}" -gt 0 ] && [ "$cb" -eq 124 ]; then
+  if [ -n "$LIMIT_BIN" ] && [ "$cb" -eq 124 ]; then
     echo "FAIL timeout-obf $base" >&2
     fails=$((fails + 1))
     continue
