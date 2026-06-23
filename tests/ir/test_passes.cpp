@@ -17581,10 +17581,13 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.fd.tcp.cross") >=
           1u);
-    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.frida.port") >=
-          1u);
-    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.frida.fd.tcp") >=
-          1u);
+    // #255: the correlated port-substring and fd/inode-cross-ref signals must
+    // share a SINGLE corroboration increment (frida.ipc), not two — counting
+    // both let one socket alone reach the >=2 Frida gate and poison the seal.
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.frida.ipc") >= 1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.frida.port") == 0u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.frida.fd.tcp") ==
+          0u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.frida.confirmed") >=
           1u);
     Instruction *FridaConfirmed =

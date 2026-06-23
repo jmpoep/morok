@@ -16495,10 +16495,17 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
         "morok.antihook.dbi.port.sig");
     Value *fdTcp =
         emitLinuxDbiFdTcpCrossRef(PB, M, fn, tcp.buf, tcp.n, rng, TT);
-    incrementDiff(PB, fridaDiff, portSig,
-                  "morok.antihook.dbi.frida.port");
-    incrementDiff(PB, fridaDiff, fdTcp,
-                  "morok.antihook.dbi.frida.fd.tcp");
+    // #255: portSig (a 69A2/69A3 substring anywhere in /proc/net/tcp) and fdTcp
+    // (a process-owned socket whose inode is on a line where that same port
+    // sequence appears) are NOT independent — one socket trips both. Counting
+    // them separately defeats the >=2 Frida corroboration gate, so a legit
+    // program owning a socket on/near port 27042/27043 (or with the hex
+    // elsewhere in its TCP line) alone reaches frida>=2 and poisons the enforced
+    // DBI seal. OR them into a single corroboration point; the second point must
+    // come from a distinct signal (frida/hluda maps, gum-js-loop thread name).
+    incrementDiff(PB, fridaDiff, PB.CreateOr(portSig, fdTcp,
+                                             "morok.antihook.dbi.frida.ipc"),
+                  "morok.antihook.dbi.frida.ipc");
     PB.CreateBr(retBB);
 
     IRBuilder<> RB(retBB);
