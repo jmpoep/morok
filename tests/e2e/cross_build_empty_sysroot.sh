@@ -64,6 +64,7 @@ BUILD_DIR="$build" LINUX_CC="$cc" SEAL_BINARIES=0 "$script" \
   --linux-target x86_64-linux-musl \
   --linux-only \
   --plugin "$plugin" \
+  --linux-only \
   --dynamic \
   --no-strip \
   --no-audit \

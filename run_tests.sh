@@ -13,7 +13,8 @@
 #            clean vs obfuscated, require identical output) across low/mid/high
 #            and the `max` config
 #   * e2e    programs sweep                 (compile EVERY program in programs/
-#            clean and through the plugin at `high` and at `max` settings)
+#            clean and through the plugin at `high` and at `max` settings, then
+#            run every target-supported program clean vs obfuscated at `max`)
 #
 # Any failure in any category fails the whole run.  This is the gate the project
 # treats as authoritative: all passes must keep every sample program compiling

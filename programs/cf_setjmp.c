@@ -135,8 +135,8 @@ int multi_setjmp(int selector) {
 __attribute__((noinline))
 int64_t setjmp_loop(int iterations) {
     jmp_buf loop_env;
-    int64_t sum = 0;
-    int i = 0;
+    volatile int64_t sum = 0;
+    volatile int i = 0;
 
     int jumped = setjmp(loop_env);
     if (jumped) {
@@ -158,7 +158,7 @@ int64_t setjmp_loop(int iterations) {
     return sum;
 }
 
-/* Coroutine-like switching */
+/* Coroutine-like switching without jumping back into a dead stack frame. */
 typedef struct {
     jmp_buf env;
     int state;
@@ -169,39 +169,24 @@ static Coroutine coro_main, coro_worker;
 static int64_t shared_value;
 
 __attribute__((noinline))
-void worker_entry(void) {
-    int64_t local = 0;
-
-    if (setjmp(coro_worker.env) == 0) {
-        /* Initial entry - return to main */
-        longjmp(coro_main.env, 1);
-    }
-
-    /* Resumed */
-    while (1) {
-        local += shared_value;
-        shared_value = local;
-        coro_worker.value = local;
-
-        if (setjmp(coro_worker.env) == 0) {
-            longjmp(coro_main.env, 1);
-        }
-    }
-}
-
-__attribute__((noinline))
 int64_t coroutine_test(int switches) {
+    volatile int i = 0;
+    volatile int64_t local = 0;
     shared_value = 1;
 
-    if (setjmp(coro_main.env) == 0) {
-        worker_entry();
-    }
+    for (i = 0; i < switches; i++) {
+        int main_jump = setjmp(coro_main.env);
+        if (main_jump == 0) {
+            int worker_jump = setjmp(coro_worker.env);
+            if (worker_jump == 0) {
+                shared_value = i;
+                longjmp(coro_worker.env, 1);
+            }
 
-    /* Worker is initialized, now switch back and forth */
-    for (int i = 0; i < switches; i++) {
-        shared_value = i;
-        if (setjmp(coro_main.env) == 0) {
-            longjmp(coro_worker.env, 1);
+            local += shared_value;
+            shared_value = local;
+            coro_worker.value = local;
+            longjmp(coro_main.env, 1);
         }
     }
 
@@ -270,8 +255,9 @@ int use_resources(int n) {
 __attribute__((noinline))
 int state_machine_setjmp(int input) {
     jmp_buf states[4];
-    int current = 0;
-    int result = 0;
+    volatile int current = 0;
+    volatile int state_input = input;
+    volatile int result = 0;
 
     #define DEFINE_STATE(n) \
         if (setjmp(states[n]) != 0) goto state_##n;
@@ -285,26 +271,30 @@ int state_machine_setjmp(int input) {
     longjmp(states[0], 1);
 
 state_0:
+    current = 0;
     result += 1;
-    if (input > 0) longjmp(states[1], 1);
+    if (state_input > 0) longjmp(states[1], 1);
     return result;
 
 state_1:
+    current = 1;
     result += 10;
-    input--;
-    if (input > 5) longjmp(states[2], 1);
-    if (input > 0) longjmp(states[1], 1);
+    state_input--;
+    if (state_input > 5) longjmp(states[2], 1);
+    if (state_input > 0) longjmp(states[1], 1);
     longjmp(states[0], 1);
 
 state_2:
+    current = 2;
     result += 100;
-    input -= 2;
-    if (input > 10) longjmp(states[3], 1);
+    state_input -= 2;
+    if (state_input > 10) longjmp(states[3], 1);
     longjmp(states[1], 1);
 
 state_3:
+    current = 3;
     result += 1000;
-    return result;
+    return result + current;
 
     #undef DEFINE_STATE
 }

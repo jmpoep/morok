@@ -166,11 +166,46 @@ static void bigint_shr(BigInt *a, int bits) {
     }
 }
 
-/* Modular reduction: a = a mod m (simple subtraction method) */
-static void bigint_mod(BigInt *a, const BigInt *m) {
-    while (bigint_cmp(a, m) >= 0) {
-        bigint_sub(a, a, m);
+static int bigint_is_zero(const BigInt *a) {
+    for (int i = 0; i < BIGINT_WORDS; i++) {
+        if (a->words[i] != 0) {
+            return 0;
+        }
     }
+    return 1;
+}
+
+static uint32_t bigint_get_bit(const BigInt *a, int bit) {
+    return (a->words[bit / 32] >> (bit % 32)) & 1u;
+}
+
+static void bigint_shl1(BigInt *a) {
+    uint32_t carry = 0;
+    for (int i = 0; i < BIGINT_WORDS; i++) {
+        uint32_t next_carry = a->words[i] >> 31;
+        a->words[i] = (a->words[i] << 1) | carry;
+        carry = next_carry;
+    }
+}
+
+/* Modular reduction: a = a mod m, bounded by the operand bit width. */
+static void bigint_mod(BigInt *a, const BigInt *m) {
+    if (bigint_is_zero(m)) {
+        return;
+    }
+
+    BigInt remainder;
+    memset(remainder.words, 0, sizeof(remainder.words));
+
+    for (int bit = BIGINT_WORDS * 32 - 1; bit >= 0; bit--) {
+        bigint_shl1(&remainder);
+        remainder.words[0] |= bigint_get_bit(a, bit);
+        if (bigint_cmp(&remainder, m) >= 0) {
+            bigint_sub(&remainder, &remainder, m);
+        }
+    }
+
+    bigint_copy(a, &remainder);
 }
 
 /* Modular multiplication: c = (a * b) mod m */

@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# Runtime differential over a curated set of self-contained sample programs:
-# compile each one clean and through the Morok plugin, run BOTH (no stdin), and
-# require identical output.  This is the gate the plain compile sweep cannot
-# provide — it catches *miscompilations* that still produce valid, compilable IR
-# but wrong runtime behaviour (e.g. a string that decrypts to garbage).
-#
-# Only deterministic, self-contained programs are listed: nothing that prints
-# timings, raw pointers, random data, depends on stdin/args/network/files, or is
-# a long-running benchmark.  Output is normalized to drop the few inherently
-# non-deterministic lines (elapsed time, hex addresses) before diffing.
+# Runtime differential over the full sample-program corpus: compile each
+# program clean and through the Morok plugin, run BOTH (no stdin), and require
+# identical exit status and normalized output.  This is the gate the plain
+# compile sweep cannot provide — it catches *miscompilations* that still produce
+# valid, compilable IR but wrong runtime behaviour (e.g. a string that decrypts
+# to garbage).
 #
 # Usage:
 #   run_programs.sh <clang> <clang++> <plugin> <sdk> <program-dir> <preset|config> [seed]
+#
+# MOROK_SKIP excludes target-unsupported programs from both compile and runtime
+# corpus tests. MOROK_RUN_SKIP excludes runtime-only stress cases while leaving
+# the compile sweeps strict.
 set -uo pipefail
 
 CLANG="$1"; CLANGXX="$2"; PLUGIN="$3"; SDK="$4"; DIR="$5"; CFG="$6"; SEED="${7:-1234}"
@@ -43,58 +43,118 @@ run_limited() { # <seconds> <cmd...>
 MOROK_ENV=(MOROK_ENABLE=1 MOROK_SEED="$SEED")
 if [ -f "$CFG" ]; then MOROK_ENV+=(MOROK_CONFIG="$CFG"); else MOROK_ENV+=(MOROK_PRESET="$CFG"); fi
 
-# Curated deterministic programs (pure-result output, quick, no external input).
-PROGRAMS=(
-  01_hello_world.c 09_bytecode_vm.c
-  int_sha256.c int_crc32.c int_popcount.c int_galois.c int_bitfields.c
-  int_int128_ops.c int_carryless_crc_mesh.c int_divrem_wide_lattice.c
-  simd_dot_product.c simd_matrix_mul.c simd_portable_bitplane.c
-  call_many_int_args.c call_many_float_args.c call_variadic.c call_nested.c
-  call_tail_recursive.c call_struct_return.c
-  cf_switch_dense.c cf_switch_sparse.c cf_computed_goto.c cf_duff_device_parser.c
-  mem_strided.c mem_sequential.c mem_unaligned_packed.c
-  min_add_chain.c min_mul_chain.c min_shift_chain.c min_bitwise.c
-  07_regex.c 08_json_parser.cpp 04_bst.cpp
-  cpp_rtti.cpp cpp_virtual.cpp cpp_constexpr_variant_graph.cpp
-  cf_license_crackme.c
-)
-
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # Strip inherently non-deterministic lines so they do not cause false failures.
-NOISE='Time|elapsed|seconds|nanosecond|µs| ns | ms |cycles|faster|throughput|MB/s|0x[0-9a-fA-F]{6,}'
+NOISE='Time|elapsed|seconds|nanosecond|µs| ns | ms | ms\)|cycles|faster|throughput|tasks pending|MB/s|0x[0-9a-fA-F]{6,}'
 
-fails=0; total=0
-for base in "${PROGRAMS[@]}"; do
-  src="$DIR/$base"
-  [ -f "$src" ] || { echo "skip (absent) $base"; continue; }
-  # See compile_programs.sh: exclude programs not yet supported on this target.
-  case " ${MOROK_SKIP:-} " in *" $base "*) echo "skip (excluded on this target) $base"; continue;; esac
-  total=$((total + 1))
-  cc=("$CLANG"); std=(-std=c11 -D_GNU_SOURCE)
+compile_one() { # <src> <out> <log> [clean|obf]
+  local src="$1"; local out="$2"; local log="$3"; local mode="$4"
+  local cc=("$CLANG"); local std=(-std=c11 -D_GNU_SOURCE)
   case "$src" in *.cpp) cc=("$CLANGXX"); std=(-std=c++23 -D_GNU_SOURCE);; esac
 
-  if ! "${cc[@]}" "${SYSROOT[@]}" -O2 "${std[@]}" "$src" -o "$TMP/clean" >/dev/null 2>&1; then
-    echo "FAIL clean-compile $base" >&2; fails=$((fails + 1)); continue; fi
-  if ! env "${MOROK_ENV[@]}" "${cc[@]}" "${SYSROOT[@]}" -O2 "${std[@]}" \
-        -fpass-plugin="$PLUGIN" \
-        "$src" -o "$TMP/obf" >/dev/null 2>&1; then
-    echo "FAIL obf-compile $base" >&2; fails=$((fails + 1)); continue; fi
+  if [ "$mode" = "obf" ]; then
+    env "${MOROK_ENV[@]}" "${cc[@]}" "${SYSROOT[@]}" -O2 "${std[@]}" \
+      -fpass-plugin="$PLUGIN" \
+      "$src" -o "$out" >"$log" 2>&1
+  else
+    "${cc[@]}" "${SYSROOT[@]}" -O2 "${std[@]}" \
+      "$src" -o "$out" >"$log" 2>&1
+  fi
+}
 
-  a="$(run_limited 30 "$TMP/clean" </dev/null 2>&1)"; ca=$?
-  b="$(run_limited 60 "$TMP/obf"   </dev/null 2>&1)"; cb=$?
+run_capture() { # <seconds> <exe> <cwd> <out>
+  local seconds="$1"; local exe="$2"; local cwd="$3"; local out="$4"
+  shift 4
+  mkdir -p "$cwd"
+  (cd "$cwd" && run_limited "$seconds" "$exe" "$@" </dev/null >"$out" 2>&1)
+}
+
+normalize_output() { # <in> <out>
+  grep -viE "$NOISE" "$1" >"$2" || true
+}
+
+is_listed() { # <basename> <space-separated-list>
+  case " $2 " in *" $1 "*) return 0;; *) return 1;; esac
+}
+
+fails=0; total=0; skipped=0; discovered=0
+while IFS= read -r src; do
+  base="$(basename "$src")"
+  discovered=$((discovered + 1))
+  # See compile_programs.sh: exclude programs not yet supported on this target.
+  # MOROK_RUN_SKIP is runtime-only and must not weaken the compile sweeps.
+  if is_listed "$base" "${MOROK_SKIP:-}" || is_listed "$base" "${MOROK_RUN_SKIP:-}"; then
+    echo "skip (excluded on this target) $base"
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  src="$DIR/$base"
+  total=$((total + 1))
+
+  clean="$TMP/${base%.*}.clean"
+  obf="$TMP/${base%.*}.obf"
+  clean_log="$TMP/${base%.*}.clean.compile.log"
+  obf_log="$TMP/${base%.*}.obf.compile.log"
+
+  if ! compile_one "$src" "$clean" "$clean_log" clean; then
+    echo "FAIL clean-compile $base" >&2
+    tail -80 "$clean_log" >&2
+    fails=$((fails + 1))
+    continue
+  fi
+  if ! compile_one "$src" "$obf" "$obf_log" obf; then
+    echo "FAIL obf-compile $base" >&2
+    tail -120 "$obf_log" >&2
+    fails=$((fails + 1))
+    continue
+  fi
+
+  clean_out="$TMP/${base%.*}.clean.out"
+  obf_out="$TMP/${base%.*}.obf.out"
+  clean_norm="$TMP/${base%.*}.clean.norm"
+  obf_norm="$TMP/${base%.*}.obf.norm"
+  args=()
+  case "$base" in
+    02_fibonacci.c) args=(30) ;;
+  esac
+
+  run_capture 30 "$clean" "$TMP/${base%.*}.clean.cwd" "$clean_out" "${args[@]}"; ca=$?
+  run_capture 60 "$obf" "$TMP/${base%.*}.obf.cwd" "$obf_out" "${args[@]}"; cb=$?
+  if [ "${#_LIMIT[@]}" -gt 0 ] && [ "$ca" -eq 124 ]; then
+    echo "FAIL timeout-clean $base" >&2
+    fails=$((fails + 1))
+    continue
+  fi
+  if [ "${#_LIMIT[@]}" -gt 0 ] && [ "$cb" -eq 124 ]; then
+    echo "FAIL timeout-obf $base" >&2
+    fails=$((fails + 1))
+    continue
+  fi
   if [ "$ca" -ne "$cb" ]; then
     echo "FAIL exit-code $base (clean=$ca obf=$cb)" >&2; fails=$((fails + 1)); continue; fi
-  if [ "$(printf '%s' "$a" | grep -vE "$NOISE")" != \
-       "$(printf '%s' "$b" | grep -vE "$NOISE")" ]; then
-    echo "FAIL output-mismatch $base" >&2
-    diff <(printf '%s' "$a" | grep -vE "$NOISE") \
-         <(printf '%s' "$b" | grep -vE "$NOISE") | head -8 >&2
-    fails=$((fails + 1)); continue; fi
-  echo "OK $base"
-done
 
-if [ "$fails" -ne 0 ]; then
-  echo "FAIL runtime-differential programs=$total failures=$fails config=$CFG" >&2
+  normalize_output "$clean_out" "$clean_norm"
+  normalize_output "$obf_out" "$obf_norm"
+  if ! cmp -s "$clean_norm" "$obf_norm"; then
+    echo "FAIL output-mismatch $base" >&2
+    diff "$clean_norm" "$obf_norm" | head -8 >&2
+    fails=$((fails + 1)); continue; fi
+  echo "OK $base exit=$ca"
+done < <(find "$DIR" -maxdepth 1 -type f \( -name '*.c' -o -name '*.cpp' \) | sort)
+
+if [ "$discovered" -eq 0 ]; then
+  echo "FAIL no programs found in $DIR" >&2
   exit 1
 fi
-echo "OK runtime-differential programs=$total config=$CFG seed=$SEED"
+
+if [ "$total" -eq 0 ]; then
+  echo "FAIL no runnable programs selected in $DIR" >&2
+  exit 1
+fi
+
+if [ "$fails" -ne 0 ]; then
+  echo "FAIL runtime-differential programs=$total skipped=$skipped failures=$fails config=$CFG" >&2
+  exit 1
+fi
+echo "OK runtime-differential programs=$total skipped=$skipped config=$CFG seed=$SEED"

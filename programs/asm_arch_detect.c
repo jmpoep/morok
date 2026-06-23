@@ -117,65 +117,55 @@ int64_t arch_specific_test(void) {
 
 #elif defined(__aarch64__)
 
-/* AArch64 system register reads */
-__attribute__((noinline))
-uint64_t read_midr(void) {
-    uint64_t midr;
-    __asm__ volatile("mrs %0, MIDR_EL1" : "=r"(midr));
-    return midr;
-}
-
-__attribute__((noinline))
-uint64_t read_id_aa64isar0(void) {
-    uint64_t isar0;
-    __asm__ volatile("mrs %0, ID_AA64ISAR0_EL1" : "=r"(isar0));
-    return isar0;
-}
-
-__attribute__((noinline))
-uint64_t read_id_aa64pfr0(void) {
-    uint64_t pfr0;
-    __asm__ volatile("mrs %0, ID_AA64PFR0_EL1" : "=r"(pfr0));
-    return pfr0;
-}
-
+/* AArch64 user-readable architecture probes.  Some EL1 ID registers trap in
+ * user space on macOS and hardened Linux setups, so keep the runtime corpus on
+ * registers/features that are safe from EL0. */
 __attribute__((noinline))
 uint64_t read_cntpct(void) {
     uint64_t cnt;
-    __asm__ volatile("mrs %0, CNTPCT_EL0" : "=r"(cnt));
+    __asm__ volatile("mrs %0, CNTVCT_EL0" : "=r"(cnt));
     return cnt;
 }
 
 __attribute__((noinline))
 int has_aes(void) {
-    uint64_t isar0 = read_id_aa64isar0();
-    return ((isar0 >> 4) & 0xF) >= 1;
+#if defined(__ARM_FEATURE_AES)
+    return 1;
+#else
+    return 0;
+#endif
 }
 
 __attribute__((noinline))
 int has_sha1(void) {
-    uint64_t isar0 = read_id_aa64isar0();
-    return ((isar0 >> 8) & 0xF) >= 1;
+#if defined(__ARM_FEATURE_SHA2)
+    return 1;
+#else
+    return 0;
+#endif
 }
 
 __attribute__((noinline))
 int has_sha256(void) {
-    uint64_t isar0 = read_id_aa64isar0();
-    return ((isar0 >> 12) & 0xF) >= 1;
+#if defined(__ARM_FEATURE_SHA2)
+    return 1;
+#else
+    return 0;
+#endif
 }
 
 __attribute__((noinline))
 int has_crc32(void) {
-    uint64_t isar0 = read_id_aa64isar0();
-    return ((isar0 >> 16) & 0xF) >= 1;
+#if defined(__ARM_FEATURE_CRC32)
+    return 1;
+#else
+    return 0;
+#endif
 }
 
 __attribute__((noinline))
 int64_t arch_specific_test(void) {
     int64_t result = 0;
-
-    uint64_t midr = read_midr();
-    result += midr & 0xFFFF;
 
     result += has_aes() * 100;
     result += has_sha1() * 200;
