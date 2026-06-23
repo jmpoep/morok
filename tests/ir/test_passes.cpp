@@ -22540,7 +22540,9 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*CdProbe,
                                  "morok.trap.win.cd03.veh.handle") >= 1u);
     CHECK(countNamedInstructions(*CdProbe,
-                                 "morok.trap.win.cd03.resume.bad") >= 1u);
+                                 "morok.trap.win.cd03.resume.short") >= 1u);
+    CHECK(countNamedInstructions(*CdProbe,
+                                 "morok.trap.win.cd03.resume.bad") == 0u);
     CHECK(countNamedInstructions(*CdProbe, "morok.trap.win.cd03.missing") >=
           1u);
     CHECK(countNamedInstructions(*CdProbe,
@@ -22567,10 +22569,11 @@ define i32 @main() { ret i32 0 }
         findNamedInstruction(*Probe, "morok.trap.win.single_step.missing");
     REQUIRE(Missing != nullptr);
     CHECK(valueFeedsNamedInstruction(Missing, "morok.seal.fold.anti_debug"));
-    Instruction *BadResume =
-        findNamedInstruction(*CdProbe, "morok.trap.win.cd03.resume.bad");
-    REQUIRE(BadResume != nullptr);
-    CHECK(valueFeedsNamedInstruction(BadResume, "morok.seal.fold.anti_debug"));
+    Instruction *ShortResume =
+        findNamedInstruction(*CdProbe, "morok.trap.win.cd03.resume.short");
+    REQUIRE(ShortResume != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(ShortResume,
+                                           "morok.seal.fold.anti_debug"));
     Instruction *CdMissing =
         findNamedInstruction(*CdProbe, "morok.trap.win.cd03.missing");
     REQUIRE(CdMissing != nullptr);
@@ -22648,6 +22651,15 @@ define i32 @main() { ret i32 0 }
     REQUIRE(CdRegister != nullptr);
     CHECK(Register->getCallingConv() == CallingConv::X86_StdCall);
     CHECK(CdRegister->getCallingConv() == CallingConv::X86_StdCall);
+    CHECK(countNamedInstructions(*CdProbe,
+                                 "morok.trap.win.cd03.resume.short") >= 1u);
+    CHECK(countNamedInstructions(*CdProbe,
+                                 "morok.trap.win.cd03.resume.bad") == 0u);
+    Instruction *ShortResume =
+        findNamedInstruction(*CdProbe, "morok.trap.win.cd03.resume.short");
+    REQUIRE(ShortResume != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(ShortResume,
+                                           "morok.seal.fold.anti_debug"));
     checkSealEnforcement(*M, *Probe);
     checkSealEnforcement(*M, *CdProbe);
     CHECK_FALSE(verifyModule(*M, &errs()));

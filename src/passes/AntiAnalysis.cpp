@@ -33248,11 +33248,11 @@ Function *windowsLongInt3Probe(Module &M, GlobalVariable *State,
     verdict->setVolatile(true);
     foldState(SB, State, verdict, 0xC7A2D5410F6E83B9ULL,
               "morok.trap.win.cd03.verdict.final.mix");
-    Value *badResume =
+    Value *shortResume =
         SB.CreateICmpEQ(verdict, ConstantInt::get(i32, 2),
-                        "morok.trap.win.cd03.resume.bad");
-    foldEnforcedFlag(SB, State, badResume, 0x2E9A6C1374D58B0FULL,
-                     "morok.trap.win.cd03.resume.bad");
+                        "morok.trap.win.cd03.resume.short");
+    foldFlag(SB, State, shortResume, 0x2E9A6C1374D58B0FULL,
+             "morok.trap.win.cd03.resume.short");
     Value *missing =
         SB.CreateICmpEQ(verdict, ConstantInt::get(i32, 0),
                         "morok.trap.win.cd03.missing");
