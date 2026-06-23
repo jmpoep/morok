@@ -124,16 +124,17 @@ build*/                                          generated build trees
 - CMake 3.28 or newer.
 - Ninja.
 - A C11 and C++23 capable toolchain.
-- LLVM 18 or newer with the New-PM plugin API Morok targets; current vanilla
-  LLVM 22/23-style builds are the expected path.
+- LLVM 18 or newer with the New-PM plugin API Morok targets. The current
+  development toolchain uses the customized API-v2 plugin header at
+  `<llvm/Plugins/PassPlugin.h>`.
 
-Morok does not require a private LLVM fork. It does require the LLVM headers and
-the `clang`/`opt` binaries used at runtime to agree on the same New-PM pass
-plugin ABI. The build currently checks for `<llvm/Plugins/PassPlugin.h>` with
-`LLVM_PLUGIN_API_VERSION == 2`; older LLVM installs that only expose
-`<llvm/Passes/PassPlugin.h>` with API version 1 are a different plugin ABI and
-will be rejected by [`cmake/MorokLLVM.cmake`](cmake/MorokLLVM.cmake) instead of
-failing later with a cryptic plugin-load error.
+Morok requires the LLVM headers and the `clang`/`opt` binaries used at runtime
+to agree on the same New-PM pass plugin ABI. The build currently checks for
+`<llvm/Plugins/PassPlugin.h>` with `LLVM_PLUGIN_API_VERSION == 2`; upstream
+LLVM installs that expose only `<llvm/Passes/PassPlugin.h>` with API version 1
+are a different plugin ABI and are rejected by
+[`cmake/MorokLLVM.cmake`](cmake/MorokLLVM.cmake) instead of failing later with a
+cryptic plugin-load error.
 
 The test/build helper defaults to a local LLVM install under `/Users/int/local`.
 Override with `CC`, `CXX`, and `LLVM_DIR` when using another matching LLVM.
@@ -190,7 +191,7 @@ The full gate covers:
 | `config` | doctest suites | presets, merge precedence, policy resolution, TOML parsing, and error paths |
 | `ir` / `passes` | LLVM-linked IR tests | every pass emits verifier-clean IR and fires on representative shapes |
 | whole pipeline | clean-vs-obfuscated differentials | compiled binaries preserve output across presets/configs/seeds |
-| build/release hygiene | shell/Python e2e gates | static config layering, entropy-seeded cross-build default, pinned privileged GitHub Actions, release audit policy, and fail-closed unsealed behavior stay enforced |
+| build/release hygiene | shell/Python e2e gates | static config layering, entropy-seeded cross-build default, pinned privileged GitHub Actions, release audit policy, runtime false-positive guards, and fail-closed unsealed behavior stay enforced |
 | `programs/` corpus | compile and runtime sweeps, when present | real C/C++ programs compile at high/max intensity; curated deterministic programs also run byte-for-byte equal |
 
 Platform behavior in the e2e suite:
@@ -311,14 +312,20 @@ Common options:
 | `--no-linux`, `--no-macos` | Skip one platform family. |
 | `--no-strip` | Leave produced binaries unstripped. |
 | `--no-audit` | Skip the final `morok-audit` release gate. |
+| `--clean` | Wipe the output directory before building, after refusing unsafe paths outside the canonical build tree. |
+| `--dynamic` | Build Linux dynamically; the default Linux mode is static. |
+| `--extra-cflags FLAGS` | Extra compiler flags. |
+| `--extra-sources PATHS` | Extra source files compiled alongside the main source. |
+| `--libs FLAGS` | Extra link libraries. |
+| `--c-std STD` | Override the C/C++ language standard for the build command. |
 | `-h`, `--help` | Show the script help. |
 
 Recognized environment overrides include `BUILD_DIR`, `OUT_DIR`, `CLANG`,
 `CLANGXX`, `PLUGIN`, `PRESET`, `SEED`, `OPT_LEVEL`, `LINUX_TARGET`,
 `LINUX_CC`, `LINUX_STATIC`, `LINUX_SYSROOT`, `LINUX_STRIP`, `MACOS_ARCHES`,
-`MACOS_MIN`, `MACOS_SDK`, `SEAL_BINARIES`, `SEAL_WINDOW`, `SEAL_TOOL`,
-`AUDIT_BINARIES`, `AUDIT_TOOL`, `AUDIT_PROVENANCE`, `AUDIT_ALLOWLIST`,
-and `PYTHON`.
+`MACOS_MIN`, `MACOS_SDK`, `EXTRA_SOURCES`, `EXTRA_CFLAGS`, `LIBS`,
+`SEAL_BINARIES`, `SEAL_WINDOW`, `SEAL_TOOL`, `AUDIT_BINARIES`, `AUDIT_TOOL`,
+`AUDIT_PROVENANCE`, `AUDIT_ALLOWLIST`, and `PYTHON`.
 
 Important defaults:
 
@@ -843,9 +850,11 @@ cache_timing_oracles
 microarchitectural_canaries
 ```
 
-`anti_debugging` accepts `enabled` and `distribution_signed`. The
-`distribution_signed` key is also forced by `-mllvm -morok-distribution-signed`
-or `MOROK_DISTRIBUTION_SIGNED=1`.
+`anti_debugging` accepts `enabled`, `allow_self_trace`, and
+`distribution_signed`. `allow_self_trace` defaults on; set it false for
+configurations that prefer seal-enforced Linux `TracerPid` checks over
+`PTRACE_TRACEME` self-tracing. The `distribution_signed` key is also forced by
+`-mllvm -morok-distribution-signed` or `MOROK_DISTRIBUTION_SIGNED=1`.
 
 `platform_runtime` accepts `enabled`, `direct_syscalls` (`auto`, `always`,
 `never`), `windows_mode` (`documented_api`, `hashed_import`, `direct_syscall`),
