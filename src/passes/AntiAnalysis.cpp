@@ -11800,10 +11800,195 @@ Value *emitWrapperPid(IRBuilder<> &B, Module &M, FunctionCallee Callee,
     return B.CreateSExtOrTrunc(B.CreateCall(Callee), intPtrTy(M), Name);
 }
 
-Function *methodDivergenceProbe(Module &M, const Triple &TT) {
+struct LinuxDivergenceSyscalls {
+    std::uint32_t getpid = 0;
+    std::uint32_t getppid = 0;
+    std::uint32_t ptrace = 0;
+    std::uint32_t openat = 0;
+    std::uint32_t close = 0;
+    std::uint32_t fcntl = 0;
+    std::uint32_t mmap = 0;
+    std::uint32_t munmap = 0;
+};
+
+bool linuxDivergenceSyscalls(const Triple &TT, LinuxDivergenceSyscalls &Out) {
+    std::uint32_t prctl = 0;
+    std::uint32_t read = 0;
+    if (!linuxCoreSyscalls(TT, Out.ptrace, prctl, Out.openat, read, Out.close))
+        return false;
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        Out.getpid = 39;
+        Out.getppid = 110;
+        Out.fcntl = 72;
+        Out.mmap = 9;
+        Out.munmap = 11;
+        return true;
+    case Triple::aarch64:
+        Out.getpid = 172;
+        Out.getppid = 173;
+        Out.fcntl = 25;
+        Out.mmap = 222;
+        Out.munmap = 215;
+        return true;
+    case Triple::arm:
+        Out.getpid = 20;
+        Out.getppid = 64;
+        Out.fcntl = 55;
+        Out.mmap = 192; // mmap2(addr, len, prot, flags, fd, pgoffset)
+        Out.munmap = 91;
+        return true;
+    default:
+        return false;
+    }
+}
+
+void emitLinuxTracerPidPtraceDivergence(IRBuilder<> &B, Module &M,
+                                        Function *Fn, const Triple &TT,
+                                        ir::IRRandom &rng,
+                                        const LinuxDivergenceSyscalls &Sys,
+                                        AllocaInst *Diff) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    Function *statusFn = linuxStatusTracerCheck(M, rng, TT);
+    if (!statusFn)
+        return;
+
+    Value *status =
+        B.CreateCall(statusFn->getFunctionType(), statusFn, {},
+                     "morok.antihook.diverge.tracer.status");
+    Value *traced = B.CreateICmpNE(
+        status, ConstantInt::get(i32, 0),
+        "morok.antihook.diverge.tracer.status.traced");
+    BasicBlock *preBB = B.GetInsertBlock();
+    auto *ptraceBB =
+        BasicBlock::Create(ctx, "morok.antihook.diverge.tracer.ptrace", Fn);
+    auto *afterBB =
+        BasicBlock::Create(ctx, "morok.antihook.diverge.after.tracer", Fn);
+    B.CreateCondBr(traced, ptraceBB, afterBB);
+
+    IRBuilder<> PB(ptraceBB);
+    Value *rc = emitLinuxSyscall(
+        PB, M, TT, Sys.ptrace,
+        {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0),
+         ConstantPointerNull::get(ptr), ConstantInt::get(ip, 0)});
+    rc->setName("morok.antihook.diverge.tracer.ptrace.rc");
+    Value *ptraceSucceeded =
+        PB.CreateICmpEQ(rc, ConstantInt::get(ip, 0),
+                        "morok.antihook.diverge.tracer.ptrace.ok");
+    PB.CreateBr(afterBB);
+
+    IRBuilder<> AB(afterBB);
+    PHINode *incoherent =
+        AB.CreatePHI(Type::getInt1Ty(ctx), 2,
+                     "morok.antihook.diverge.tracer.incoherent");
+    incoherent->addIncoming(ConstantInt::getFalse(ctx), preBB);
+    incoherent->addIncoming(ptraceSucceeded, ptraceBB);
+    incrementDiff(AB, Diff, incoherent, "morok.antihook.diverge.tracer");
+    B.SetInsertPoint(afterBB);
+}
+
+void emitLinuxFcntlBadCmdDivergence(IRBuilder<> &B, Module &M, Function *Fn,
+                                    const Triple &TT, ir::IRRandom &rng,
+                                    const LinuxDivergenceSyscalls &Sys,
+                                    AllocaInst *Diff) {
+    LLVMContext &ctx = M.getContext();
+    auto *ip = intPtrTy(M);
+    Value *path = ir::emitCloakedSymbol(B, M, "/dev/null", rng);
+    Value *fd = emitLinuxSyscall(B, M, TT, Sys.openat,
+                                 {ConstantInt::getSigned(ip, -100), path,
+                                  ConstantInt::get(ip, 0),
+                                  ConstantInt::get(ip, 0)});
+    fd->setName("morok.antihook.diverge.fcntl.fd");
+    Value *fdOk =
+        B.CreateICmpSGE(fd, ConstantInt::getSigned(ip, 0),
+                        "morok.antihook.diverge.fcntl.fd.ok");
+    auto *fcntlBB =
+        BasicBlock::Create(ctx, "morok.antihook.diverge.fcntl.badcmd", Fn);
+    auto *afterBB =
+        BasicBlock::Create(ctx, "morok.antihook.diverge.after.fcntl", Fn);
+    B.CreateCondBr(fdOk, fcntlBB, afterBB);
+
+    IRBuilder<> FB(fcntlBB);
+    Value *rc = emitLinuxSyscall(
+        FB, M, TT, Sys.fcntl,
+        {fd, ConstantInt::get(ip, 0x7fffff7dU), ConstantInt::get(ip, 0)});
+    rc->setName("morok.antihook.diverge.fcntl.badcmd.rc");
+    Value *einval =
+        FB.CreateICmpEQ(rc, ConstantInt::getSigned(ip, -22),
+                        "morok.antihook.diverge.fcntl.badcmd.einval");
+    Value *eopnotsupp =
+        FB.CreateICmpEQ(rc, ConstantInt::getSigned(ip, -95),
+                        "morok.antihook.diverge.fcntl.badcmd.eopnotsupp");
+    Value *enotsup =
+        FB.CreateICmpEQ(rc, ConstantInt::getSigned(ip, -102),
+                        "morok.antihook.diverge.fcntl.badcmd.enotsup");
+    Value *expected =
+        FB.CreateOr(einval, FB.CreateOr(eopnotsupp, enotsup),
+                    "morok.antihook.diverge.fcntl.badcmd.expected");
+    Value *unexpected =
+        FB.CreateNot(expected,
+                     "morok.antihook.diverge.fcntl.badcmd.unexpected");
+    incrementDiff(FB, Diff, unexpected,
+                  "morok.antihook.diverge.fcntl.badcmd");
+    emitLinuxSyscall(FB, M, TT, Sys.close, {fd})
+        ->setName("morok.antihook.diverge.fcntl.close");
+    FB.CreateBr(afterBB);
+    B.SetInsertPoint(afterBB);
+}
+
+void emitLinuxMmapFixedDivergence(IRBuilder<> &B, Module &M, Function *Fn,
+                                  const Triple &TT,
+                                  const LinuxDivergenceSyscalls &Sys,
+                                  AllocaInst *Diff) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    Value *addr = ConstantInt::get(ip, 0);
+    Value *page = ConstantInt::get(ip, 4096);
+    Value *rc = emitLinuxSyscall(
+        B, M, TT, Sys.mmap,
+        {B.CreateIntToPtr(addr, ptr, "morok.antihook.diverge.mmap.fixed.addr"),
+         page, ConstantInt::get(i32, 1),
+         ConstantInt::get(i32, 0x02U | 0x10U | 0x20U),
+         ConstantInt::getSigned(i32, -1), ConstantInt::get(ip, 0)});
+    rc->setName("morok.antihook.diverge.mmap.fixed.rc");
+    Value *mappedRequested =
+        B.CreateICmpEQ(rc, addr,
+                       "morok.antihook.diverge.mmap.fixed.requested");
+    Value *nonNegative =
+        B.CreateICmpSGE(rc, ConstantInt::getSigned(ip, 0),
+                        "morok.antihook.diverge.mmap.fixed.nonneg");
+    Value *wrongSuccess =
+        B.CreateAnd(nonNegative, B.CreateNot(mappedRequested),
+                    "morok.antihook.diverge.mmap.fixed.mismatch");
+    incrementDiff(B, Diff, wrongSuccess, "morok.antihook.diverge.mmap.fixed");
+
+    auto *unmapBB =
+        BasicBlock::Create(ctx, "morok.antihook.diverge.mmap.unmap", Fn);
+    auto *afterBB =
+        BasicBlock::Create(ctx, "morok.antihook.diverge.after.mmap", Fn);
+    B.CreateCondBr(mappedRequested, unmapBB, afterBB);
+
+    IRBuilder<> UB(unmapBB);
+    emitLinuxSyscall(UB, M, TT, Sys.munmap, {addr, page})
+        ->setName("morok.antihook.diverge.mmap.fixed.unmap");
+    UB.CreateBr(afterBB);
+    B.SetInsertPoint(afterBB);
+}
+
+Function *methodDivergenceProbe(Module &M, const Triple &TT,
+                                ir::IRRandom &rng) {
     const bool linux = useDirectLinuxSyscalls(M, TT);
     const bool darwin = useDirectDarwinSyscalls(M, TT);
     if (!linux && !darwin)
+        return nullptr;
+    LinuxDivergenceSyscalls linuxSys;
+    const bool hasLinuxSys = linux && linuxDivergenceSyscalls(TT, linuxSys);
+    if (linux && !hasLinuxSys)
         return nullptr;
     if (Function *existing = M.getFunction("morok.antihook.diverge.posix"))
         return existing;
@@ -11834,8 +12019,14 @@ Function *methodDivergenceProbe(Module &M, const Triple &TT) {
                       Twine("morok.antihook.diverge.") + Stem);
     };
 
-    comparePidPrimitive("getpid", linux ? 39 : 20, getpidDecl(M));
-    comparePidPrimitive("getppid", linux ? 110 : 39, getppidDecl(M));
+    comparePidPrimitive("getpid", linux ? linuxSys.getpid : 20, getpidDecl(M));
+    comparePidPrimitive("getppid", linux ? linuxSys.getppid : 39,
+                        getppidDecl(M));
+    if (hasLinuxSys) {
+        emitLinuxTracerPidPtraceDivergence(B, M, fn, TT, rng, linuxSys, diff);
+        emitLinuxFcntlBadCmdDivergence(B, M, fn, TT, rng, linuxSys, diff);
+        emitLinuxMmapFixedDivergence(B, M, fn, TT, linuxSys, diff);
+    }
     emitRetDiff(B, diff);
     return fn;
 }
@@ -31358,7 +31549,7 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         foldEnforcedFlag(B, state, changed, 0xD8F31C6A4B927E50ULL,
                          "morok.antihook.wxorx.changed");
     }
-    if (Function *diverge = methodDivergenceProbe(M, tt)) {
+    if (Function *diverge = methodDivergenceProbe(M, tt, rng)) {
         Value *diff =
             B.CreateCall(diverge, {}, "morok.antihook.diverge.diff");
         Value *changed =

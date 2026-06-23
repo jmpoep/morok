@@ -17202,6 +17202,36 @@ entry:
                                  "morok.antihook.diverge.getpid.direct") >= 1u);
     CHECK(countNamedInstructions(
               *Diverge, "morok.antihook.diverge.getppid.wrapper") >= 1u);
+    CHECK(M->getFunction("morok.antidbg.linux.status") != nullptr);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.tracer.status") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.tracer.status.traced") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.tracer.ptrace.rc") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.tracer.incoherent") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.fcntl.badcmd.rc") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.fcntl.badcmd.expected") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.fcntl.badcmd.unexpected") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.mmap.fixed.rc") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.mmap.fixed.mismatch") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.mmap.fixed.unmap") >= 1u);
+    Instruction *DivergeChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.diverge.changed");
+    REQUIRE(DivergeChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(DivergeChanged,
+                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/self/status"));
+    CHECK_FALSE(hasReadableByteString(*M, "TracerPid"));
+    CHECK_FALSE(hasReadableByteString(*M, "/dev/null"));
     CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.flags.raw") >= 1u);
     CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.flags.masked") >= 1u);
     CHECK(countNamedInstructions(*Emu,
@@ -17960,6 +17990,8 @@ entry:
     REQUIRE(Clean != nullptr);
     Function *Loader = M->getFunction("morok.antihook.loader.auxv");
     REQUIRE(Loader != nullptr);
+    Function *Diverge = M->getFunction("morok.antihook.diverge.posix");
+    REQUIRE(Diverge != nullptr);
 
     CHECK(countNamedInstructions(*Clean, "morok.negative.text.brk0") >= 1u);
     CHECK(countNamedInstructions(*Clean, "morok.negative.text.int3.long") ==
@@ -17988,10 +18020,32 @@ entry:
     CHECK(countNamedInstructions(*Kernel58,
                                  "morok.antihook.mprotect.kernel58.gate") >=
           1u);
+    CHECK(hasInlineAsmCall(*Diverge));
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.getpid.direct") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.getppid.direct") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.tracer.status") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.tracer.ptrace.rc") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.fcntl.badcmd.rc") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.fcntl.badcmd.expected") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.mmap.fixed.rc") >= 1u);
+    CHECK(countNamedInstructions(
+              *Diverge, "morok.antihook.diverge.mmap.fixed.mismatch") >= 1u);
     Instruction *Changed =
         findNamedInstruction(*Ctor, "morok.corroborate.mprotect.changed");
     REQUIRE(Changed != nullptr);
     CHECK(valueFeedsNamedInstruction(Changed, "morok.seal.fold.anti_debug"));
+    Instruction *DivergeChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.diverge.changed");
+    REQUIRE(DivergeChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(DivergeChanged,
+                                     "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Ctor, "morok.gate.mprotect.hard") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
