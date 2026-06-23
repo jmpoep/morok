@@ -34673,7 +34673,7 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
                            "morok.corroborate.wxorx.changed");
         foldState(B, state, diff, 0x14E2B7C95A680D3FULL,
                   "morok.antihook.wxorx");
-        if (tt.isOSDarwin()) {
+        if (tt.isOSDarwin() || tt.isOSLinux()) {
             addSoftGateSignal(B, gate, changed, 1, 0x2C8B15D9F0476EA3ULL,
                               "morok.gate.wxorx");
             foldFlag(B, state, changed, 0xD8F31C6A4B927E50ULL,
@@ -34858,8 +34858,6 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
                         "morok.antihook.pow.aes.bits"),
             ConstantInt::get(B.getInt64Ty(), 0),
             "morok.corroborate.pow.changed");
-        Value *word = B.CreateLShr(sample, ConstantInt::get(B.getInt64Ty(), 8),
-                                   "morok.antihook.pow.kdf.word");
         // PoW sleep cross-clock disagreement is host/jitter-sensitive: on a
         // non-invariant/paravirt/steal-time TSC host (no constant_tsc/
         // nonstop_tsc, deep C-states, vCPU pause) a legitimate 5ms sleep yields
@@ -34877,9 +34875,6 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
                  "morok.antihook.pow.sleep.changed");
         foldFlag(B, state, powBad, 0xE39A10C7B65D42F8ULL,
                  "morok.antihook.pow.changed");
-        runtime_seal::foldWord(B, runtime_seal::kAntiDebugChannel, word,
-                               0x6C21F58A934DE0B7ULL,
-                               "morok.antihook.pow.kdf");
     }
     Function *stackCheck = stackOriginCheck(M);
     if (stackCheck) {
@@ -34896,7 +34891,7 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         Value *changed =
             B.CreateICmpEQ(ok, ConstantInt::get(i32, 0),
                            "morok.corroborate.ra.range.changed");
-        if (tt.isOSDarwin()) {
+        if (tt.isOSDarwin() || tt.isOSLinux()) {
             addSoftGateSignal(B, gate, changed, 1, 0xD86F21B49C0A753EULL,
                               "morok.gate.ra.range");
             foldFlag(B, state, changed, 0x3C791E5A6B20D48FULL,

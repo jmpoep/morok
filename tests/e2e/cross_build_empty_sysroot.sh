@@ -61,6 +61,7 @@ BUILD_DIR="$build" LINUX_CC="$cc" SEAL_BINARIES=0 "$script" \
   --source "$source" \
   --out-dir "$build/cross" \
   --clang "$clang" \
+  --linux-target x86_64-linux-musl \
   --plugin "$plugin" \
   --dynamic \
   --no-strip \

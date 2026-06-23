@@ -287,8 +287,9 @@ For `clang -fpass-plugin`, Morok also registers extension-point callbacks:
 
 The helper in [`cross_build.sh`](cross_build.sh) builds a source file through
 Morok for Linux and/or macOS. On Linux hosts, macOS builds are disabled by
-default and the helper uses the ELF plugin (`libMorok.so`); on macOS hosts, the
-default remains Linux plus macOS with the Mach-O plugin (`libMorok.dylib`):
+default and the helper uses the ELF plugin (`libMorok.so`) with the native GNU
+Linux target. On macOS hosts, the default remains Linux plus macOS with the
+Mach-O plugin (`libMorok.dylib`) and the musl cross target:
 
 ```sh
 ./cross_build.sh --source programs/cf_license_crackme.c --out-dir build/cross
@@ -341,7 +342,7 @@ seed:         0, which means per-build entropy
 optimization: -O3
 clang:        clang-23
 plugin:       build/src/pipeline/libMorok.so on Linux, libMorok.dylib on macOS
-Linux target: x86_64-linux-musl
+Linux target: native GNU triple on Linux hosts, x86_64-linux-musl elsewhere
 macOS min:    13.0, used only when macOS builds are enabled
 strip:        enabled
 sealing:      enabled

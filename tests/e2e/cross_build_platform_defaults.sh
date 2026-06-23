@@ -14,12 +14,15 @@ host="$(printf '%s\n' "$got" | awk -F= '$1 == "host" { print $2 }')"
 linux="$(printf '%s\n' "$got" | awk -F= '$1 == "linux" { print $2 }')"
 macos="$(printf '%s\n' "$got" | awk -F= '$1 == "macos" { print $2 }')"
 plugin="$(printf '%s\n' "$got" | awk -F= '$1 == "plugin" { print $2 }')"
+target="$(printf '%s\n' "$got" | awk -F= '$1 == "linux_target" { print $2 }')"
 
 [ "$linux" = "1" ] || fail "default linux build flag is '$linux', expected 1"
 
 case "$host" in
   Darwin)
     [ "$macos" = "1" ] || fail "Darwin default macOS build flag is '$macos', expected 1"
+    [ "$target" = "x86_64-linux-musl" ] ||
+      fail "Darwin default Linux target is '$target', expected x86_64-linux-musl"
     case "$plugin" in
       *.dylib) ;;
       *) fail "Darwin default plugin is '$plugin', expected .dylib suffix" ;;
@@ -27,6 +30,10 @@ case "$host" in
     ;;
   *)
     [ "$macos" = "0" ] || fail "$host default macOS build flag is '$macos', expected 0"
+    case "$target" in
+      *-linux-gnu) ;;
+      *) fail "$host default Linux target is '$target', expected a GNU Linux triple" ;;
+    esac
     case "$plugin" in
       *.so) ;;
       *) fail "$host default plugin is '$plugin', expected .so suffix" ;;

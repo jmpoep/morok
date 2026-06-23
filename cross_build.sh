@@ -12,14 +12,26 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 HOST_OS="$(uname -s)"
+HOST_ARCH="$(uname -m)"
 case "$HOST_OS" in
   Darwin)
     DEFAULT_BUILD_MACOS=1
     DEFAULT_PLUGIN_EXT="dylib"
+    DEFAULT_LINUX_TARGET="x86_64-linux-musl"
+    ;;
+  Linux)
+    DEFAULT_BUILD_MACOS=0
+    DEFAULT_PLUGIN_EXT="so"
+    case "$HOST_ARCH" in
+      x86_64|amd64) DEFAULT_LINUX_TARGET="x86_64-linux-gnu" ;;
+      aarch64|arm64) DEFAULT_LINUX_TARGET="aarch64-linux-gnu" ;;
+      *) DEFAULT_LINUX_TARGET="$HOST_ARCH-linux-gnu" ;;
+    esac
     ;;
   *)
     DEFAULT_BUILD_MACOS=0
     DEFAULT_PLUGIN_EXT="so"
+    DEFAULT_LINUX_TARGET="x86_64-linux-musl"
     ;;
 esac
 
@@ -69,7 +81,7 @@ CLEAN_OUT=0
 CHECK_CLEAN_DIR=0
 EMIT_PLATFORM_DEFAULTS=0
 
-LINUX_TARGET="${LINUX_TARGET:-x86_64-linux-musl}"
+LINUX_TARGET="${LINUX_TARGET:-$DEFAULT_LINUX_TARGET}"
 LINUX_CC="${LINUX_CC:-}"
 LINUX_STATIC="${LINUX_STATIC:-1}"
 
@@ -92,7 +104,7 @@ Options:
   --clangxx PATH         C++ compiler with the Morok pass ABI (default: clang++)
   --plugin PATH          Morok pass plugin (default: host suffix, .dylib on macOS,
                          .so elsewhere)
-  --linux-target TRIPLE  Linux target triple (default: x86_64-linux-musl)
+  --linux-target TRIPLE  Linux target triple (default: host-aware)
   --linux-cc PATH        GCC-compatible cross toolchain driver for crt/libgcc lookup
   --macos-arches LIST    Space-separated macOS arches: native, arm64, x86_64
                          (default: current host arch)
@@ -296,6 +308,7 @@ if [ "$EMIT_PLATFORM_DEFAULTS" -eq 1 ]; then
   printf 'linux=%s\n' "$BUILD_LINUX"
   printf 'macos=%s\n' "$BUILD_MACOS"
   printf 'plugin=%s\n' "$PLUGIN"
+  printf 'linux_target=%s\n' "$LINUX_TARGET"
   exit 0
 fi
 
