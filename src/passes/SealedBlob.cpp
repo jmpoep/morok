@@ -327,13 +327,15 @@ Function *defineAccessor(Module &M, const BlobPlan &Plan,
     IRBuilder<> EB(Entry);
     auto *I64 = EB.getInt64Ty();
     Value *Dynamic = ConstantInt::get(I64, 0);
+    Value *AntiDelta = nullptr;
     if (hasSource(Params, "runtime_seal")) {
-        Value *Delta = runtime_seal::emitChannelDelta(
+        AntiDelta = runtime_seal::emitChannelDelta(
             EB, runtime_seal::kAntiDebugChannel, "morok.sealed.anti.delta");
-        Dynamic = EB.CreateXor(Dynamic,
-                               runtime_seal::emitKdf64(EB, Delta, Plan.salt0,
-                                                       "morok.sealed.anti.kdf"),
-                               "morok.sealed.anti.key");
+        Dynamic = EB.CreateXor(
+            Dynamic,
+            runtime_seal::emitKdf64(EB, AntiDelta, Plan.salt0,
+                                    "morok.sealed.anti.kdf"),
+            "morok.sealed.anti.key");
     }
     if (hasSource(Params, "external_proof")) {
         Value *Delta = runtime_seal::emitChannelDelta(
@@ -387,7 +389,39 @@ Function *defineAccessor(Module &M, const BlobPlan &Plan,
         Plan.gv->getValueType(), Plan.gv,
         {ConstantInt::get(I64, 0), ConstantInt::get(I64, 0)},
         "morok.sealed.cipher.base");
-    EB.CreateBr(Loop);
+    BasicBlock *Withhold = nullptr;
+    BasicBlock *WithholdDone = nullptr;
+    if (AntiDelta) {
+        Withhold = BasicBlock::Create(Ctx, "withhold", Fn, Loop);
+        WithholdDone = BasicBlock::Create(Ctx, "withhold.done", Fn, Loop);
+        Value *WithholdFlag = EB.CreateICmpNE(
+            AntiDelta, ConstantInt::get(I64, 0), "morok.sealed.withhold");
+        EB.CreateCondBr(WithholdFlag, Withhold, Loop);
+    } else {
+        EB.CreateBr(Loop);
+    }
+
+    if (Withhold) {
+        IRBuilder<> WB(Withhold);
+        auto *WIdx = WB.CreatePHI(I64, 2, "morok.sealed.withhold.i");
+        WIdx->addIncoming(ConstantInt::get(I64, 0), Entry);
+        Value *DstPtr = WB.CreateInBoundsGEP(WB.getInt8Ty(), Fn->getArg(0),
+                                             WIdx,
+                                             "morok.sealed.withhold.dst");
+        auto *Store = WB.CreateStore(ConstantInt::get(WB.getInt8Ty(), 0),
+                                     DstPtr);
+        Store->setAlignment(Align(1));
+        Value *NextI = WB.CreateAdd(WIdx, ConstantInt::get(I64, 1),
+                                    "morok.sealed.withhold.next");
+        WIdx->addIncoming(NextI, Withhold);
+        WB.CreateCondBr(WB.CreateICmpULT(
+                            NextI, ConstantInt::get(I64, Plan.plain.size()),
+                            "morok.sealed.withhold.more"),
+                        Withhold, WithholdDone);
+
+        IRBuilder<> WDB(WithholdDone);
+        WDB.CreateRetVoid();
+    }
 
     IRBuilder<> LB(Loop);
     auto *Idx = LB.CreatePHI(I64, 2, "morok.sealed.i");

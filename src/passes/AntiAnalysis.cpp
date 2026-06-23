@@ -7085,6 +7085,151 @@ Value *emitLinuxStaticRawSyscall(IRBuilder<> &B, Module &M, const Triple &TT,
     return ConstantInt::getSigned(ip, -38);
 }
 
+bool responseLinuxExitSyscall(const Triple &TT, std::uint32_t &Exit) {
+    if (!TT.isOSLinux())
+        return false;
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        Exit = 60;
+        return true;
+    case Triple::x86:
+        Exit = 1;
+        return true;
+    case Triple::aarch64:
+        Exit = 93;
+        return true;
+    case Triple::arm:
+    case Triple::armeb:
+    case Triple::thumb:
+    case Triple::thumbeb:
+        Exit = 1;
+        return true;
+    default:
+        return false;
+    }
+}
+
+Value *mixResponseSite(IRBuilder<> &B, Value *Tier, Value *Site,
+                       std::uint64_t Salt, const Twine &Name) {
+    auto *i64 = B.getInt64Ty();
+    Value *x = B.CreateXor(Tier, Site, Name + ".seed");
+    x = B.CreateAdd(x, ConstantInt::get(i64, Salt), Name + ".add");
+    x = B.CreateXor(x, B.CreateLShr(x, ConstantInt::get(i64, 23)),
+                    Name + ".fold23");
+    x = B.CreateMul(x, ConstantInt::get(i64, (Salt ^ 0xA0761D6478BD642FULL) |
+                                             1ULL),
+                    Name + ".mul");
+    return B.CreateXor(x, B.CreateLShr(x, ConstantInt::get(i64, 31)),
+                       Name + ".fold31");
+}
+
+Function *responseActionFunction(Module &M, ir::IRRandom &rng,
+                                 const Triple &TT) {
+    if (Function *existing = M.getFunction("morok.gate.response.action"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx),
+                                                  {i64, i64}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.gate.response.action", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *tier = fn->getArg(0);
+    tier->setName("tier");
+    Argument *site = fn->getArg(1);
+    site->setName("site");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *rawExitBB = BasicBlock::Create(ctx, "morok.response.raw.exit", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "done", fn);
+
+    IRBuilder<> B(entry);
+    Value *tier4 =
+        B.CreateICmpUGE(tier, ConstantInt::get(i64, 4),
+                        "morok.response.tier4");
+    Value *tier7 =
+        B.CreateICmpUGE(tier, ConstantInt::get(i64, 7),
+                        "morok.response.tier7");
+    Value *opaque = mixResponseSite(B, tier, site, rng.next(),
+                                    "morok.response.opaque");
+    auto *opaqueSlot =
+        B.CreateAlloca(i64, nullptr, "morok.response.opaque.slot");
+    auto *opaqueStore = B.CreateStore(opaque, opaqueSlot);
+    opaqueStore->setVolatile(true);
+    opaqueStore->setAlignment(Align(8));
+    auto *opaqueA =
+        B.CreateLoad(i64, opaqueSlot, "morok.response.opaque.a");
+    opaqueA->setVolatile(true);
+    opaqueA->setAlignment(Align(8));
+    auto *opaqueB =
+        B.CreateLoad(i64, opaqueSlot, "morok.response.opaque.b");
+    opaqueB->setVolatile(true);
+    opaqueB->setAlignment(Align(8));
+    Value *opaqueReady = B.CreateICmpEQ(
+        B.CreateAnd(B.CreateXor(opaqueA, opaqueB,
+                                "morok.response.opaque.cancel"),
+                    ConstantInt::get(i64, 7), "morok.response.opaque.low"),
+        ConstantInt::get(i64, 0), "morok.response.opaque.ready");
+    Value *withhold =
+        B.CreateAnd(tier4, opaqueReady, "morok.response.withhold");
+    Value *terminate =
+        B.CreateAnd(tier7, withhold, "morok.response.terminate");
+    B.CreateCondBr(terminate, rawExitBB, doneBB);
+
+    IRBuilder<> XB(rawExitBB);
+    Value *code = XB.CreateZExtOrTrunc(
+        XB.CreateXor(site, ConstantInt::get(i64, rng.next()),
+                     "morok.response.exit.code.mix"),
+        ip, "morok.response.exit.code");
+    std::uint32_t exitNr = 0;
+    if (responseLinuxExitSyscall(TT, exitNr)) {
+        emitLinuxStaticRawSyscall(XB, M, TT, exitNr, {code},
+                                  "morok.response.raw.exit.syscall");
+        XB.CreateUnreachable();
+    } else if (TT.isOSDarwin()) {
+        if (auto *I =
+                dyn_cast<Instruction>(emitDarwinSyscall(XB, M, TT, 1, {code})))
+            I->setName("morok.response.raw.exit.svc");
+        XB.CreateUnreachable();
+    } else {
+        Value *unsupported = XB.CreateXor(code, ConstantInt::get(ip, 0),
+                                          "morok.response.raw.unsupported");
+        (void)unsupported;
+        XB.CreateBr(doneBB);
+    }
+
+    IRBuilder<> DB(doneBB);
+    DB.CreateRetVoid();
+    return fn;
+}
+
+Value *emitGateResponseTier(IRBuilder<> &B, GlobalVariable *State,
+                            const GateDecision &Decision, Value *Tier7,
+                            const Twine &Name) {
+    auto *i64 = B.getInt64Ty();
+    Value *softTier = B.CreateSelect(
+        Decision.softConfirmed, ConstantInt::get(i64, 4),
+        ConstantInt::get(i64, 0), Name + ".soft.tier");
+    Value *responseTier = B.CreateSelect(
+        Tier7, ConstantInt::get(i64, 7), softTier, Name + ".tier");
+    foldState(B, State, responseTier, 0xE31C749A52B806DFULL, Name);
+    runtime_seal::foldWord(B, runtime_seal::kAntiDebugChannel, responseTier,
+                           0x7C2D48E1B59A306FULL, Name + ".kdf");
+    return responseTier;
+}
+
+void emitGateResponseActionCall(IRBuilder<> &B, Module &M, ir::IRRandom &rng,
+                                const Triple &TT, Value *Tier) {
+    Function *action = responseActionFunction(M, rng, TT);
+    if (!action)
+        return;
+    B.CreateCall(action->getFunctionType(), action,
+                 {Tier, ConstantInt::get(B.getInt64Ty(), rng.next())});
+}
+
 Function *linuxStaticAtBaseProbe(Module &M, ir::IRRandom &rng,
                                  const Triple &TT) {
     std::uint32_t openatNr = 0;
@@ -32191,14 +32336,20 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
 
     if (tt.isOSDarwin()) {
         addGateCoherencePenalties(B, gate);
-        emitGateDecision(B, state, gate);
+        GateDecision decision = emitGateDecision(B, state, gate);
+        Value *responseTier = emitGateResponseTier(
+            B, state, decision, decision.confirmed, "morok.gate.response");
+        emitGateResponseActionCall(B, M, rng, tt, responseTier);
         B.CreateRetVoid();
         appendToGlobalCtors(M, ctor, 0);
         return true;
     }
     if (!tt.isOSLinux()) {
         addGateCoherencePenalties(B, gate);
-        emitGateDecision(B, state, gate);
+        GateDecision decision = emitGateDecision(B, state, gate);
+        Value *responseTier = emitGateResponseTier(
+            B, state, decision, decision.confirmed, "morok.gate.response");
+        emitGateResponseActionCall(B, M, rng, tt, responseTier);
         B.CreateRetVoid();
         appendToGlobalCtors(M, ctor, 0);
         return true;
@@ -32240,17 +32391,9 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
                                     "morok.gate.response.aggressive");
     foldPoisonFlag(B, aggressive, 0xA4F6C2E91B537D8BULL,
                    "morok.antihook.corroborated");
-    Value *softTier = B.CreateSelect(
-        decision.softConfirmed, ConstantInt::get(B.getInt64Ty(), 4),
-        ConstantInt::get(B.getInt64Ty(), 0), "morok.gate.response.soft.tier");
-    Value *responseTier = B.CreateSelect(
-        aggressive, ConstantInt::get(B.getInt64Ty(), 7), softTier,
-        "morok.gate.response.tier");
-    foldState(B, state, responseTier, 0xE31C749A52B806DFULL,
-              "morok.gate.response");
-    runtime_seal::foldWord(B, runtime_seal::kAntiDebugChannel, responseTier,
-                           0x7C2D48E1B59A306FULL,
-                           "morok.gate.response.kdf");
+    Value *responseTier = emitGateResponseTier(B, state, decision, aggressive,
+                                               "morok.gate.response");
+    emitGateResponseActionCall(B, M, rng, tt, responseTier);
     B.CreateRetVoid();
     appendToGlobalCtors(M, ctor, 0);
     return true;

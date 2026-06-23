@@ -11243,6 +11243,10 @@ entry:
     CHECK(countNamedInstructions(*Open, "morok.sealed.addr.zero") >= 1u);
     CHECK(countNamedInstructions(*Open, "morok.sealed.tag.window") >= 1u);
     CHECK(countNamedInstructions(*Open, "morok.sealed.tag.poison") >= 1u);
+    CHECK(countNamedInstructions(*Open, "morok.sealed.withhold") >= 1u);
+    CHECK(countNamedInstructions(*Open, "morok.sealed.withhold.i") >= 1u);
+    CHECK(countNamedInstructions(*Open, "morok.sealed.withhold.dst") >= 1u);
+    CHECK(countNamedInstructions(*Open, "morok.sealed.withhold.more") >= 1u);
     GlobalVariable *TagSink =
         M->getGlobalVariable("morok.sealed.tag.sink.0", true);
     REQUIRE(TagSink != nullptr);
@@ -17013,6 +17017,8 @@ entry:
     REQUIRE(Pow != nullptr);
     Function *Ctor = M->getFunction("morok.antihook");
     REQUIRE(Ctor != nullptr);
+    Function *Response = M->getFunction("morok.gate.response.action");
+    REQUIRE(Response != nullptr);
     GlobalVariable *Dynamic = M->getGlobalVariable("_DYNAMIC");
     REQUIRE(Dynamic != nullptr);
     Function *Work = M->getFunction("work");
@@ -17083,6 +17089,7 @@ entry:
     CHECK(hasInlineAsmCall(*Maps));
     CHECK(hasInlineAsmCall(*Wx));
     CHECK(hasInlineAsmCall(*AntiDump));
+    CHECK(hasInlineAsmCall(*Response));
     CHECK(M->getFunction("dlsym") != nullptr);
     CHECK(M->getFunction("dladdr") == nullptr);
     CHECK(M->getFunction("getauxval") != nullptr);
@@ -17684,8 +17691,15 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.gate.hook.symbol.hard") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.response.aggressive") >=
           1u);
+    CHECK(countCallsTo(*Ctor, "morok.gate.response.action") == 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.response.tier") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.response.kdf") >= 1u);
+    CHECK(countNamedInstructions(*Response, "morok.response.tier4") >= 1u);
+    CHECK(countNamedInstructions(*Response, "morok.response.tier7") >= 1u);
+    CHECK(countNamedInstructions(*Response, "morok.response.withhold") >= 1u);
+    CHECK(countNamedInstructions(*Response, "morok.response.terminate") >= 1u);
+    CHECK(countNamedInstructions(*Response,
+                                 "morok.response.raw.exit.syscall") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.sandbox.soft") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.negative.timing.soft") >=
           1u);
@@ -18194,6 +18208,8 @@ entry:
     REQUIRE(NegativeTiming != nullptr);
     Function *Ctor = M->getFunction("morok.antihook");
     REQUIRE(Ctor != nullptr);
+    Function *Response = M->getFunction("morok.gate.response.action");
+    REQUIRE(Response != nullptr);
     Function *Work = M->getFunction("work");
     REQUIRE(Work != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
@@ -18209,6 +18225,7 @@ entry:
     CHECK(M->getFunction("morok.antihook.got.plt") == nullptr);
     CHECK(hasInlineAsmCall(*Clean));
     CHECK(hasInlineAsmCall(*Sandbox));
+    CHECK(hasInlineAsmCall(*Response));
     CHECK(M->getFunction("dlopen") == nullptr);
     CHECK(M->getFunction("dlsym") == nullptr);
     CHECK(M->getFunction("open") == nullptr);
@@ -18340,6 +18357,15 @@ entry:
     CHECK(countNamedInstructions(
               *DbiOverhead, "morok.antihook.dbi.overhead.branch.delta") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.dbi.overhead.soft") >= 1u);
+    CHECK(countCallsTo(*Ctor, "morok.gate.response.action") == 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.response.tier") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.response.kdf") >= 1u);
+    CHECK(countNamedInstructions(*Response, "morok.response.tier4") >= 1u);
+    CHECK(countNamedInstructions(*Response, "morok.response.tier7") >= 1u);
+    CHECK(countNamedInstructions(*Response, "morok.response.withhold") >= 1u);
+    CHECK(countNamedInstructions(*Response, "morok.response.terminate") >= 1u);
+    CHECK(countNamedInstructions(*Response, "morok.response.raw.exit.svc") >=
+          1u);
     CHECK(countNamedInstructions(*NegativeTiming,
                                  "morok.negative.timing.slow") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.negative.modules.extra") >= 1u);
@@ -18483,6 +18509,8 @@ entry:
     REQUIRE(NegativeTiming != nullptr);
     Function *Ctor = M->getFunction("morok.antihook");
     REQUIRE(Ctor != nullptr);
+    Function *Response = M->getFunction("morok.gate.response.action");
+    REQUIRE(Response != nullptr);
     Function *Work = M->getFunction("work");
     REQUIRE(Work != nullptr);
     checkSealEnforcement(*M, *Ctor);
@@ -18646,6 +18674,15 @@ entry:
     CHECK(countNamedInstructions(
               *DbiOverhead, "morok.antihook.dbi.overhead.sample.anomaly") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.dbi.overhead.soft") >= 1u);
+    CHECK(countCallsTo(*Ctor, "morok.gate.response.action") == 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.response.tier") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.response.kdf") >= 1u);
+    CHECK(countNamedInstructions(*Response, "morok.response.tier4") >= 1u);
+    CHECK(countNamedInstructions(*Response, "morok.response.tier7") >= 1u);
+    CHECK(countNamedInstructions(*Response, "morok.response.withhold") >= 1u);
+    CHECK(countNamedInstructions(*Response, "morok.response.terminate") >= 1u);
+    CHECK(countNamedInstructions(*Response,
+                                 "morok.response.raw.unsupported") >= 1u);
     CHECK(countNamedInstructions(*NegativeTiming,
                                  "morok.negative.timing.slow") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.negative.modules.extra") >= 1u);
