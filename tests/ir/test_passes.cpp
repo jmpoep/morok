@@ -20030,6 +20030,31 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("memfd re-exec ctor is x86_64-only — aarch64 skips it instead of "
+          "firing x86_64 syscall numbers (#260)") {
+    LLVMContext ctx;
+    auto parseRun = [&](const char *triple) {
+        auto M = parse(ctx, (std::string("target triple = \"") + triple +
+                             "\"\ndefine i32 @main() { ret i32 0 }\n")
+                                .c_str());
+        auto engine = morok::core::Xoshiro256pp::fromSeed(2601);
+        morok::ir::IRRandom rng(engine);
+        CHECK(morok::passes::antiDebuggingModule(*M, rng,
+                                                 /*allowSelfTrace=*/false));
+        bool hasMemfd = M->getFunction("morok.antidbg.memfd") != nullptr;
+        CHECK_FALSE(verifyModule(*M, &errs()));
+        return hasMemfd;
+    };
+    // #260: the memfd re-exec ctor hardcodes x86_64 syscall numbers (read=0,
+    // execve=59, openat=257, memfd_create=319, ...). d930dbd widened the direct
+    // -syscall predicate to aarch64/arm without per-arch translation, so on
+    // those arches the ctor fired unrelated/out-of-range syscalls that silently
+    // failed open. It must now emit ONLY on x86_64.
+    CHECK(parseRun("x86_64-unknown-linux-gnu"));      // emitted on x86_64
+    CHECK_FALSE(parseRun("aarch64-unknown-linux-gnu")); // skipped on aarch64
+    CHECK_FALSE(parseRun("armv7-unknown-linux-gnueabihf")); // skipped on arm
+}
+
 TEST_CASE("antiDebuggingModule emits aarch64 Linux seccomp TSYNC arch filter") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

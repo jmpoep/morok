@@ -1579,7 +1579,13 @@ Value *emitPosixAnonMmapAddr(IRBuilder<> &B, Module &M, const Triple &TT,
     auto *I32 = Type::getInt32Ty(Ctx);
     auto *IP = platformWordTy(M);
     auto *Ptr = PointerType::getUnqual(Ctx);
-    if (TT.isOSLinux() && useDirectLinuxSyscalls(M, TT))
+    // #260: the hardcoded mmap number 9 is the x86_64 number; aarch64 mmap=222
+    // and arm mmap=192, so firing 9 on those arches invoked an unrelated/out-of
+    // -range syscall (a silent fail-open). Gate the direct path to x86_64 (like
+    // the clean-copy helpers' per-arch table) so aarch64/arm fall back to the
+    // correct libc mmap() below instead of a wrong raw syscall number.
+    if (TT.isOSLinux() && useDirectLinuxSyscalls(M, TT) &&
+        TT.getArch() == Triple::x86_64)
         return emitLinuxSyscall(B, M, TT, 9,
                                 {ConstantPointerNull::get(Ptr), Size, Prot,
                                  Flags, ConstantInt::getSigned(I32, -1),

@@ -1718,7 +1718,15 @@ ReadFileIR emitReadPathValue(IRBuilder<> &B, Module &M, Function *Fn,
 }
 
 void emitLinuxMemfdReexecCtor(Module &M, ir::IRRandom &rng, const Triple &TT) {
-    if (!useDirectLinuxSyscalls(M, TT) ||
+    // #260: every syscall number below (read=0, write=1, close=3, execve=59,
+    // openat=257, dup3=292, memfd_create=319, execveat=322, ...) is the x86_64
+    // number. d930dbd widened the direct-syscall predicate to aarch64/arm but
+    // added no per-arch translation, so on those arches this ctor fired
+    // unrelated/out-of-range syscalls that failed and bailed (a silent
+    // fail-open). Gate it to x86_64 (matching the clean-copy helpers' table
+    // guard); aarch64/arm simply skip the direct memfd re-exec rather than
+    // emit wrong syscalls.
+    if (!useDirectLinuxSyscalls(M, TT) || TT.getArch() != Triple::x86_64 ||
         M.getFunction("morok.antidbg.memfd"))
         return;
 
