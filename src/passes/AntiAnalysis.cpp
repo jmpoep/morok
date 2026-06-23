@@ -12996,6 +12996,18 @@ Value *emitSandboxCpuidExitLatency(IRBuilder<> &B, Module &M,
         "morok.antihook.sandbox.cpuid.hvleaf.slow");
     Value *latency = B.CreateAnd(varianceSlow, hvLeafSlow,
                                  "morok.antihook.sandbox.cpuid.latency");
+    // #245: restore a STANDALONE identity contribution to the base score, in
+    // addition to the fused identity+latency composite below. #139 asked to
+    // FUSE the new exit-latency bit with the EXISTING leaf-identity score, not
+    // to drop identity's own contribution; the consolidation overshot, so a VM
+    // exposing normal hypervisor/vendor CPUID identity that does not trip the
+    // latency heuristic (e.g. -cpu host with a near-native vmexit, or any host
+    // below the variance/HV-leaf-slow thresholds) scored 0. This rides the soft
+    // gate (Score -> addSoftGateSignal/foldState telemetry), NOT the consumed
+    // seal, so legit cloud VMs are scored but never refuse-to-run (the bare
+    // hypervisor bit fires on every cloud VM — zero-on-clean preserved).
+    incrementWeightedGate(B, Score, IdentityEvidence, 2, 0x7C3A91E5D2B40F86ULL,
+                          "morok.antihook.sandbox.cpuid.identity");
     Value *composite =
         B.CreateAnd(latency, IdentityEvidence,
                     "morok.antihook.sandbox.cpuid.identity.latency");

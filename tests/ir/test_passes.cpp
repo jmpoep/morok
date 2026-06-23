@@ -17434,6 +17434,14 @@ entry:
                                  "morok.antihook.sandbox.qemu.brand") >= 1u);
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.cpuid.leaf.identity") >= 1u);
+    // #245: IdentityEvidence (the OR of leaf-identity / vendor matches) must
+    // once again contribute to the base sandbox score on its OWN — in addition
+    // to the fused identity+latency composite — so an identity-only VM (normal
+    // hypervisor/vendor CPUID, no exit-latency anomaly) still reaches the
+    // threshold. The standalone increment is distinct from the .identity.latency
+    // composite. (Routed to the soft gate / telemetry, never the seal.)
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.identity.next") >= 1u);
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor.next") == 0u);
     CHECK(countNamedInstructions(
