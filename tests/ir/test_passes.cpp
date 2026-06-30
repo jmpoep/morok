@@ -2628,6 +2628,70 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("MorokPass obfuscates imports before CKD live-byte sealing") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+declare i32 @puts(ptr)
+@.s = private constant [3 x i8] c"hi\00"
+
+define internal i32 @leaf(i32 %x) {
+entry:
+  %r = add i32 %x, 9
+  ret i32 %r
+}
+
+define i32 @caller(i32 %x) {
+entry:
+  %p = call i32 @puts(ptr @.s)
+  %r = call i32 @leaf(i32 %x)
+  ret i32 %r
+}
+)ir");
+    Function *Caller = M->getFunction("caller");
+    REQUIRE(Caller);
+
+    morok::config::Config cfg;
+    cfg.seed = 42420;
+    cfg.passes.bcf.enabled = true;
+    cfg.passes.bcf.probability = 100;
+    cfg.passes.bcf.iterations = 1;
+    cfg.passes.bcf.complexity = 1;
+    cfg.passes.fco.enabled = true;
+    cfg.passes.caller_keyed_dispatch.enabled = true;
+    cfg.passes.caller_keyed_dispatch.probability = 100;
+    cfg.passes.caller_keyed_dispatch.max_calls = 16;
+    cfg.passes.caller_keyed_dispatch.region_bytes = 8;
+
+    ModuleAnalysisManager AM;
+    morok::pipeline::MorokPass(std::move(cfg)).run(*M, AM);
+
+    Function *Dispatch = M->getFunction("morok.ckd.dispatch");
+    REQUIRE(Dispatch != nullptr);
+    CHECK(countCallsTo(*Caller, "puts") == 0u);
+    CHECK(countCallsTo(*Caller, "leaf") == 0u);
+    CHECK(countCallsThroughOperand(*Caller, Dispatch) == 1u);
+    CHECK(countCallsToPrefix(*Caller, "morok.fco.resolve.elf.") >= 1u);
+    CHECK(countGlobals(*M, "morok.ckd.enc") == 1u);
+
+    // FCO's x86_64 Linux fault/resume path is only eligible before CKD adds its
+    // global constructor.  Keeping that path alive makes the pass order explicit:
+    // FCO mutates the import callsites first, then CKD seals the final bytes.
+    Function *FcoInstall = M->getFunction("morok.fco.ex.install");
+    Function *CkdInit = M->getFunction("morok.ckd.init");
+    REQUIRE(FcoInstall != nullptr);
+    REQUIRE(CkdInit != nullptr);
+    std::vector<std::string> Ctors = ctorNamesInOrder(*M);
+    const std::string FcoName = FcoInstall->getName().str();
+    const std::string CkdName = CkdInit->getName().str();
+    auto FcoIt = std::find(Ctors.begin(), Ctors.end(), FcoName);
+    auto CkdIt = std::find(Ctors.begin(), Ctors.end(), CkdName);
+    REQUIRE(FcoIt != Ctors.end());
+    REQUIRE(CkdIt != Ctors.end());
+    CHECK(FcoIt < CkdIt);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("MorokPass forwards string encryption content filters") {
     {
         LLVMContext ctx;
@@ -14174,9 +14238,12 @@ entry:
     CHECK(countCallsTo(*Caller, "inc") == 0u);
     CHECK(countCallsTo(*Caller, "mix") == 0u);
     CHECK(countCallsThroughOperand(*Caller, Dispatch) == 2u);
-    CHECK(countInlineAsmConstraints(*Caller, "={x19}") == 2u);
-    CHECK(countInlineAsmConstraints(*Caller, "{x19}") == 4u);
+    CHECK(countInlineAsmConstraints(*Caller, "={x19}") == 4u);
+    CHECK(countInlineAsmConstraints(*Caller, "{x19}") == 6u);
     CHECK(countInlineAsmConstraints(*Caller, "~{x19}") == 0u);
+    CHECK(countNamedInstructions(*Caller, "morok.ckd.carrier.saved") == 2u);
+    CHECK(countNamedInstructions(*Caller, "morok.ckd.carrier.restored") == 2u);
+    CHECK(countInlineAsmBodies(*Caller, "mov $0, x19") == 2u);
     CHECK(countGlobals(*M, "morok.ckd.enc") == 2u);
     CHECK(countGlobals(*M, "morok.ckd.cache") == 2u);
     CHECK(countGlobals(*M, "morok.ckd.code.size") == 2u);

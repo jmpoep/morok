@@ -1447,12 +1447,21 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         changed |= passes::adversarialFunctionMergingModule(M, p, rng);
     }
 
+    // Hide surviving library imports after the CFG/body mutation wave, but
+    // before caller-keyed dispatch records live code-byte hashes.  CKD skips the
+    // generated `morok.fco.*` resolver edges and then seals the final user-code
+    // shape, including FCO's per-callsite resolver/cache material.
+    if (InitialModuleGrowthOk && config_.passes.fco.enabled.value_or(false)) {
+        passes::FcoParams fp;
+        changed |= passes::functionCallObfuscateModule(M, fp, rng);
+    }
+
     // Collapse surviving direct user calls through one shared native dispatch
     // hub.  Run before returnless dispatch so direct tail-position calls are
     // sealed while they are still direct; returnless will skip the generated
-    // `morok.ckd.*` dispatcher edges.  Keep this after merge/tuning and before
-    // FunctionWrapper; otherwise wrappers would consume user edges first and
-    // leave only generated `morok.wrap` callees for this pass to skip.
+    // `morok.ckd.*` dispatcher edges.  Keep this after merge/tuning/FCO and
+    // before FunctionWrapper; otherwise wrappers would consume user edges first
+    // and leave only generated `morok.wrap` callees for this pass to skip.
     if (InitialModuleGrowthOk &&
         config_.passes.caller_keyed_dispatch.enabled.value_or(false) &&
         dispatchModuleOk(measureUserModule(M))) {
@@ -1498,15 +1507,6 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         wp.probability = config_.passes.func_wrap.probability.value_or(50);
         wp.times = config_.passes.func_wrap.times.value_or(1);
         changed |= passes::functionWrapModule(M, wp, rng);
-    }
-
-    // Hide surviving library imports after the CFG/body mutation wave.  FCO
-    // emits resolver caches and, on simple Linux x86_64 modules, deliberate
-    // fault/resume callsites; running it late keeps later obfuscation passes
-    // from cloning or reshaping those callsite protocols.
-    if (InitialModuleGrowthOk && config_.passes.fco.enabled.value_or(false)) {
-        passes::FcoParams fp;
-        changed |= passes::functionCallObfuscateModule(M, fp, rng);
     }
 
     // Final seed-driven diversity layer: reorder the emitted IR layout and add

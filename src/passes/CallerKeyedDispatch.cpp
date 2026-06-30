@@ -63,9 +63,13 @@ constexpr std::uint32_t kPostlinkVersion = 2;
 struct ArchLayout {
     std::string dispatcher_asm;
     std::string dispatcher_constraints;
+    std::string carrier_save_asm;
+    std::string carrier_save_constraints;
     std::string carrier_def_asm;
     std::string carrier_def_constraints;
     std::string carrier_anchor_constraints;
+    std::string carrier_restore_asm;
+    std::string carrier_restore_constraints;
 };
 
 enum class Arch { AArch64, X86_64 };
@@ -102,9 +106,11 @@ std::optional<Arch> archOf(const Triple &TT) {
 }
 
 // Callee-saved registers that the C convention never uses for argument passing,
-// so the carried jump target survives the dispatcher call's argument setup.  The
-// legacy register (x19 / r14) is first so `carriers == 1` reproduces the
-// original single-dispatcher behaviour exactly.
+// so the carried jump target survives the dispatcher call's argument setup.  CKD
+// saves/restores the chosen physical register around each dispatched call; the
+// target callee preserves the temporary branch target, not the caller's original
+// register contents.  The legacy register (x19 / r14) is first so
+// `carriers == 1` keeps the original dispatcher identity.
 std::vector<std::string> carrierPool(Arch A) {
     if (A == Arch::AArch64)
         return {"x19", "x20", "x21", "x22", "x23",
@@ -117,18 +123,27 @@ ArchLayout layoutForRegister(Arch A, StringRef Reg) {
     if (A == Arch::AArch64) {
         L.dispatcher_asm = (Twine("br ") + Reg).str();
         L.dispatcher_constraints = "~{memory}";
+        L.carrier_save_asm = (Twine("mov $0, ") + Reg).str();
+        L.carrier_save_constraints = "=r,~{memory}";
         L.carrier_def_asm = "mov $0, $1";
         L.carrier_def_constraints = (Twine("={") + Reg + "},r,~{memory}").str();
         L.carrier_anchor_constraints = (Twine("{") + Reg + "},~{memory}").str();
+        L.carrier_restore_asm = L.carrier_def_asm;
+        L.carrier_restore_constraints = L.carrier_def_constraints;
     } else {
         L.dispatcher_asm = (Twine("jmpq *%") + Reg).str();
         L.dispatcher_constraints = "~{memory},~{dirflag},~{fpsr},~{flags}";
+        L.carrier_save_asm = (Twine("movq %") + Reg + ", $0").str();
+        L.carrier_save_constraints =
+            "=r,~{memory},~{dirflag},~{fpsr},~{flags}";
         L.carrier_def_asm = "movq $1, $0";
         L.carrier_def_constraints =
             (Twine("={") + Reg + "},r,~{memory},~{dirflag},~{fpsr},~{flags}")
                 .str();
         L.carrier_anchor_constraints =
             (Twine("{") + Reg + "},~{memory},~{dirflag},~{fpsr},~{flags}").str();
+        L.carrier_restore_asm = L.carrier_def_asm;
+        L.carrier_restore_constraints = L.carrier_def_constraints;
     }
     return L;
 }
@@ -423,6 +438,15 @@ Value *emitCarrierDefine(IRBuilder<> &B, Value *Target,
     return B.CreateCall(FTy, IA, {Target}, "morok.ckd.carrier");
 }
 
+Value *emitCarrierSave(IRBuilder<> &B, Type *CarrierTy,
+                       const ArchLayout &Layout) {
+    auto *FTy = FunctionType::get(CarrierTy, false);
+    InlineAsm *IA = InlineAsm::get(FTy, Layout.carrier_save_asm,
+                                   Layout.carrier_save_constraints,
+                                   /*hasSideEffects=*/true);
+    return B.CreateCall(FTy, IA, {}, "morok.ckd.carrier.saved");
+}
+
 void emitCarrierAnchor(IRBuilder<> &B, Value *Carrier,
                        const ArchLayout &Layout) {
     auto *FTy = FunctionType::get(Type::getVoidTy(B.getContext()),
@@ -430,6 +454,15 @@ void emitCarrierAnchor(IRBuilder<> &B, Value *Carrier,
     InlineAsm *IA = InlineAsm::get(FTy, "", Layout.carrier_anchor_constraints,
                                    /*hasSideEffects=*/true);
     B.CreateCall(FTy, IA, {Carrier});
+}
+
+Value *emitCarrierRestore(IRBuilder<> &B, Value *Saved,
+                          const ArchLayout &Layout) {
+    auto *FTy = FunctionType::get(Saved->getType(), {Saved->getType()}, false);
+    InlineAsm *IA = InlineAsm::get(FTy, Layout.carrier_restore_asm,
+                                   Layout.carrier_restore_constraints,
+                                   /*hasSideEffects=*/true);
+    return B.CreateCall(FTy, IA, {Saved}, "morok.ckd.carrier.restored");
 }
 
 void emitInit(Module &M, ArrayRef<Site> Sites, std::uint32_t RegionBytes,
@@ -602,6 +635,7 @@ void rewriteSite(Module &M, const Site &S, Arch A,
         TargetInt, PointerType::getUnqual(M.getContext()), "morok.ckd.target");
 
     IRBuilder<> SideB(Old);
+    Value *SavedCarrier = emitCarrierSave(SideB, Target->getType(), Layout);
     Value *Carrier = emitCarrierDefine(SideB, Target, Layout);
 
     SmallVector<Value *, 16> Args;
@@ -616,6 +650,7 @@ void rewriteSite(Module &M, const Site &S, Arch A,
     New->copyMetadata(*Old);
     IRBuilder<> AnchorB(Old);
     emitCarrierAnchor(AnchorB, Carrier, Layout);
+    emitCarrierRestore(AnchorB, SavedCarrier, Layout);
 
     if (!Old->getType()->isVoidTy())
         Old->replaceAllUsesWith(New);
